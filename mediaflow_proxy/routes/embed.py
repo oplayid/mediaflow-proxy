@@ -32,11 +32,12 @@ from mediaflow_proxy.utils.http_utils import (
 logger = logging.getLogger(__name__)
 gateway_router = APIRouter()
 
-# Bound a slow/dead host so a provider can never leave StreamFlix hanging.
-PROBE_TIMEOUT = 6.0
-AUTO_TOTAL_TIMEOUT = 15.0
-AUTO_FIRST_WAVE = 2
-NEGATIVE_CACHE_TTL = 60.0
+# Only two hosts are resolved, so each gets a generous budget while the total
+# stays bounded. Hosts are tried in order: VidCore first, VSEmbed fallback.
+PROBE_TIMEOUT = 10.0
+AUTO_TOTAL_TIMEOUT = 25.0
+AUTO_FIRST_WAVE = 1
+NEGATIVE_CACHE_TTL = 30.0
 # Resolve the provider once, then serve the cached result for at most 6 hours
 # (or less when the upstream URL advertises its own expiry).
 RESOLVE_CACHE_TTL = 6 * 60 * 60.0
@@ -271,6 +272,34 @@ class EmbedUnavailable(Exception):
         self.detail = detail
 
 
+def _error_reason(exc: Exception) -> str:
+    """Turn upstream exception text into a stable, loggable reason code."""
+    text = str(exc).lower()
+    if any(
+        marker in text
+        for marker in (
+            "movie not found",
+            "episode not found",
+            "no vidora link found",
+            "stream unavailable",
+        )
+    ):
+        return "content_unavailable"
+    if "ad-filter" in text:
+        return "ad_filter_blocked"
+    if "config missing" in text or "config object not found" in text:
+        return "upstream_changed"
+    if "invalid api token" in text or "403" in text:
+        return "token_invalid"
+    if "name or service not known" in text or "name resolution" in text:
+        return "dns"
+    if "ssl" in text or "certificate" in text or "tls" in text:
+        return "tls"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    return "extract_failed"
+
+
 def _normalise_media(
     media_type: str,
     media_id: str,
@@ -310,8 +339,9 @@ async def _probe_gateway(
                 timeout=PROBE_TIMEOUT,
             )
         except Exception as exc:
-            logger.warning("[gateway] %s failed: %s", config.canonical, exc)
-            return config, None, f"{config.canonical}: {exc}"
+            reason = _error_reason(exc)
+            logger.warning("[gateway] %s failed (%s): %s", config.canonical, reason, exc)
+            return config, None, f"{config.canonical}: {reason}: {exc}"
         await _cache_set(key, result)
 
     ttl = await _cache_ttl(key)
@@ -327,6 +357,8 @@ async def _probe_gateway(
         return config, None, f"{config.canonical}: {exc}"
 
     audit = dict(result.get("ad_filter") or {})
+    if result.get("sandbox_used"):
+        audit["sandbox_used"] = True
     audit["hls_filter_enabled"] = settings.filter_hls_ads
     if any(value for key, value in audit.items() if key != "hls_filter_enabled"):
         logger.info(

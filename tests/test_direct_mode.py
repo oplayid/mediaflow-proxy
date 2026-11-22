@@ -164,6 +164,21 @@ async def test_gateway_never_exposes_api_password(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sandbox_usage_is_reported_in_audit(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    async def fake_extract(*_args, **_kwargs):
+        result = _result()
+        result["sandbox_used"] = True
+        return result
+
+    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
+    _, body = await _resolve(_request())
+
+    assert body["audit"]["sandbox_used"] is True
+
+
+@pytest.mark.asyncio
 async def test_server_query_cannot_select_a_provider(monkeypatch):
     from mediaflow_proxy.routes import embed as embed_routes
 

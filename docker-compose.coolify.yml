@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.7.0.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.7.0}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.7.1.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.7.1}
     restart: unless-stopped
     ports:
       - "8888:8888"

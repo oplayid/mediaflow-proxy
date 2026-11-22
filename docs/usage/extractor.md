@@ -124,7 +124,7 @@ MediaFlow is **not** a player and does not serve a provider list, a relay page, 
 | `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. `auto` selection probes VidCore and VSEmbed first, fans the remaining hosts out in parallel, and cancels slower probes once one host returns a clean stream. Each probe has a 6 second timeout and selection is capped at 15 seconds; failed hosts are skipped for 60 seconds. If every host fails the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The gateway resolves exactly two hosts, in order: **VidCore first, VSEmbed as fallback**. Each probe has a 10 second timeout and selection is capped at 25 seconds; failed hosts are skipped for 30 seconds. Historical hosts remain in the extractor registry for backwards-compatible `host=` lookups but are never probed by this gateway. If both hosts fail the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
 
 Example:
 

@@ -49,11 +49,10 @@ def test_vidspark_api_base_includes_v1():
     assert VIDSPARK_API_BASE == "https://vidspark.to/api/vidora/v1"
 
 
-def test_auto_host_order_prefers_vidcore_and_includes_every_host():
-    assert AUTO_HOST_ORDER[0] == "VidCore"
-    assert AUTO_HOST_ORDER[1] == "VSEmbed"
-    assert set(AUTO_HOST_ORDER) == set(EMBED_HOSTS)
+def test_auto_host_order_only_uses_vidcore_and_vsembed():
+    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed")
     assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
+    assert set(AUTO_HOST_ORDER) <= set(EMBED_HOSTS)
 
 
 def test_gateway_does_not_serve_a_player_or_provider_registry():
@@ -256,6 +255,114 @@ async def test_vsembed_chain():
 
 
 @pytest.mark.asyncio
+async def test_vsembed_tv_uses_stream_base_and_preserves_stream_urls_flag():
+    config = EMBED_HOSTS["VSEmbed"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://stream.oplay.id/embed/tv/293610/1/1"
+    gate_url = "https://stream.oplay.id/vs_src.php?type=tv&id=293610"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html"
+    api_url = (
+        "https://vsapi.example/api.php?type=tv&tmdb=293610&stream_urls=&api_token=tok"
+    )
+    destination = "https://cdn.example/master.m3u8"
+    subtitle_url = "https://cdn.example/id.vtt"
+
+    _mock_requests(
+        extractor,
+        {
+            gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+            nested_url: _response(
+                nested_url,
+                text=f'<script>window.CFG={{"playerUrl":"{player_url}"}};</script>',
+            ),
+            player_url: _response(
+                player_url,
+                text=(
+                    '<script>window.CONFIG={"streamBase":'
+                    '"https://vsapi.example/api.php?type=tv&tmdb=293610",'
+                    '"apiToken":"tok"};</script>'
+                ),
+            ),
+            api_url: _response(
+                api_url,
+                text=json.dumps(
+                    {
+                        "data": {
+                            "stream_urls": [destination],
+                            "default_subs": [
+                                {"url": subtitle_url, "label": "Indonesian"}
+                            ],
+                        }
+                    }
+                ),
+            ),
+        },
+    )
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == destination
+    assert [sub["url"] for sub in result["subtitles"]] == [subtitle_url]
+    assert result["subtitles"][0]["language"] == "id"
+    assert result.get("sandbox_used") is not True
+
+
+@pytest.mark.asyncio
+async def test_vsembed_cast_playlist_falls_back_to_browser_sandbox(monkeypatch):
+    config = EMBED_HOSTS["VSEmbed"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://stream.oplay.id/embed/movie/550"
+    gate_url = "https://stream.oplay.id/vs_src.php?type=movie&id=550"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html"
+    api_url = "https://vsapi.example/api.php?id=550&api_token=tok"
+    cast_url = "https://pool.example/plc/abc"
+    playlist_url = "https://pool.example/pl/abc"
+
+    _mock_requests(
+        extractor,
+        {
+            gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+            nested_url: _response(
+                nested_url,
+                text=f'<script>window.CFG={{"playerUrl":"{player_url}"}};</script>',
+            ),
+            player_url: _response(
+                player_url,
+                text=(
+                    '<script>window.CONFIG={"api":"https://vsapi.example/api.php?id=550",'
+                    '"apiToken":"tok"};</script>'
+                ),
+            ),
+            api_url: _response(
+                api_url,
+                text=json.dumps(
+                    {
+                        "data": {
+                            "stream_urls": "encrypted",
+                            "cast_urls": [cast_url],
+                        }
+                    }
+                ),
+            ),
+            playlist_url: _response(playlist_url, text="<html>challenge</html>"),
+        },
+    )
+
+    async def fake_browser_fetch(url: str, referer: str):
+        assert url == playlist_url
+        return "#EXTM3U\n#EXT-X-VERSION:3\n"
+
+    monkeypatch.setattr(extractor, "_browser_fetch_playlist", fake_browser_fetch)
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == playlist_url
+    assert result["sandbox_used"] is True
+
+
+@pytest.mark.asyncio
 async def test_generic_iframe_flow():
     config = EMBED_HOSTS["VidKing"]
     extractor = GenericEmbedExtractor({}, config)
@@ -341,6 +448,24 @@ def test_sanitize_html_removes_ad_scripts_iframes_and_redirects():
     assert report.sanitized_redirects == 1
 
 
+def test_sanitize_html_preserves_config_scripts_with_ad_words_in_payload():
+    from mediaflow_proxy.gateway.ad_filter import AdFilterReport, sanitize_html
+
+    config_script = (
+        '<script>window.CFG={"AdTag":"keep","popundersPerIP":"0",'
+        '"playerUrl":"https://cdn.example/player"};</script>'
+    )
+    loader_script = "<script>aclib.runPop({zoneId:'9257962'});</script>"
+    html = config_script + loader_script
+    report = AdFilterReport()
+
+    clean = sanitize_html(html, "https://provider.example/", report)
+
+    assert config_script in clean
+    assert "aclib.runPop" not in clean
+    assert report.sanitized_scripts == 1
+
+
 def test_filter_candidate_url_rejects_ad_and_non_http_urls():
     from mediaflow_proxy.gateway.ad_filter import AdFilterReport, filter_candidate_url
 
@@ -400,6 +525,26 @@ async def test_vidspark_ad_stream_is_rejected():
     )
 
     with pytest.raises(Exception, match="ad-filter"):
+        await extractor.extract(embed_url)
+
+
+@pytest.mark.asyncio
+async def test_vidspark_content_gap_is_reported_as_content_unavailable():
+    config = EMBED_HOSTS["VidCore"]
+    extractor = GenericEmbedExtractor({}, config)
+    api_url = f"{VIDSPARK_API_BASE}/tv/293610/1/1"
+    embed_url = "https://vidcore.org/embed/tv/293610/1/1?autoplay=true&lang=id&theme=FCC217"
+    _mock_requests(
+        extractor,
+        {
+            api_url: _response(
+                api_url,
+                text=json.dumps({"result": False, "message": "Episode not found"}),
+            )
+        },
+    )
+
+    with pytest.raises(Exception, match="content_unavailable"):
         await extractor.extract(embed_url)
 
 

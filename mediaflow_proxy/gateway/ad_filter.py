@@ -93,9 +93,19 @@ _LOCATION_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _QUOTED_URL_RE = re.compile(r"['\"](https?://[^'\"]+)['\"]", re.IGNORECASE)
+# Match executable ad loader calls, not arbitrary ad-related words embedded in
+# player configuration payloads. A config script may legitimately contain
+# strings such as "AdTag" or "popundersPerIP"; deleting it would break the
+# stream extraction. The trailing boundary requires the token to be used as
+# code (`.`, `(`, or `=`), not quoted data.
 _AD_TEXT_RE = re.compile(
-    r"ads?by|adsterra|popunder|doubleclick|googletag|adsense|adtag|"
-    r"preroll|midroll|show_?ad|display_?ad|ad_?break|advertisement",
+    r"(?:^|[^\w.])(?:adsbygoogle|adsterra|popunder|doubleclick|googletag|"
+    r"adsense|adtag|preroll|midroll|show_?ad|display_?ad|ad_?break|"
+    r"advertisement)\s*(?:\.|\(|=)",
+    re.IGNORECASE,
+)
+_AD_LOADER_RE = re.compile(
+    r"\b(?:aclib|atlib|adlib)\.runPop\s*\(",
     re.IGNORECASE,
 )
 
@@ -159,7 +169,7 @@ def is_ad_url(url: str) -> bool:
 
 
 def _looks_like_ad_text(text: str) -> bool:
-    return bool(_AD_TEXT_RE.search(text or ""))
+    return bool(_AD_TEXT_RE.search(text or "") or _AD_LOADER_RE.search(text or ""))
 
 
 def _attr_urls(tag: str) -> list[str]:

@@ -183,7 +183,7 @@ def _normalise_subtitles(items, referer: str, base_headers: dict) -> list[dict]:
 def _collect_api_subtitles(payload: dict) -> list:
     """Collect subtitles from the common `subtitles`/`captions`/`tracks` shapes."""
     collected: list = []
-    for key in ("subtitles", "captions", "tracks"):
+    for key in ("subtitles", "captions", "tracks", "default_subs"):
         value = payload.get(key)
         if isinstance(value, list):
             collected.extend(value)
@@ -252,6 +252,47 @@ class GenericEmbedExtractor(BaseExtractor):
         self.config = config
         self.mediaflow_endpoint = config.endpoint
         self._ad_report = AdFilterReport()
+
+    async def _browser_fetch_playlist(self, url: str, referer: str) -> str | None:
+        """Fetch a challenge-protected playlist in an isolated browser context.
+
+        This is a tightly scoped sandbox: a fresh curl_cffi session with a real
+        Chrome TLS fingerprint, no shared cookies, and media-only validation.
+        It never executes page JavaScript and is only used for URLs that have
+        already passed the gateway ad/SSRF filters.
+        """
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError:
+            logger.debug("[%s] curl_cffi unavailable; browser probe skipped", self.config.canonical)
+            return None
+
+        proxy = self._get_proxy(url)
+        try:
+            async with AsyncSession() as session:
+                response = await session.get(
+                    url,
+                    headers={
+                        "User-Agent": self.base_headers.get("user-agent", ""),
+                        "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+                        "Referer": referer,
+                    },
+                    impersonate="chrome131",
+                    timeout=8,
+                    **({"proxy": proxy} if proxy else {}),
+                )
+                text = response.text or ""
+                if response.status_code == 200 and "#EXTM3U" in text:
+                    return text
+                logger.debug(
+                    "[%s] browser probe returned no playlist (status=%s) for %s",
+                    self.config.canonical,
+                    response.status_code,
+                    url,
+                )
+        except Exception as exc:
+            logger.debug("[%s] browser probe failed for %s: %s", self.config.canonical, url, exc)
+        return None
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         if not is_public_http_url(url):
@@ -345,7 +386,12 @@ class GenericEmbedExtractor(BaseExtractor):
 
         if not isinstance(payload, dict) or not payload.get("result"):
             message = payload.get("message") if isinstance(payload, dict) else None
-            raise ExtractorError(f"{self.config.canonical}: {message or 'stream unavailable'}")
+            unavailable = any(
+                marker in str(message).lower()
+                for marker in ("not found", "no vidora link", "unavailable")
+            )
+            reason = "content_unavailable" if unavailable else "stream_unavailable"
+            raise ExtractorError(f"{self.config.canonical}: {reason}: {message or reason}")
 
         sources = payload.get("sources") or []
         if not isinstance(sources, list):
@@ -421,10 +467,18 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={"Referer": nested_url, "Accept": "text/html"},
         )
         player_cfg = _extract_json_object(_CONFIG_RE, player.text, self.config.canonical)
-        api_url = player_cfg.get("api")
+        # Movie pages still expose `api`; TV pages now expose `streamBase`.
+        api_url = player_cfg.get("api") or player_cfg.get("streamBase")
         api_token = player_cfg.get("apiToken")
         if not api_url or not api_token:
             raise ExtractorError(f"{self.config.canonical}: stream API config missing")
+
+        # The stream API only returns decrypted/cast URLs when the bare
+        # `stream_urls` flag is present. keep_blank_values in _set_query_param
+        # preserves it; do not add season/episode because the token is already
+        # bound to the requested media identity.
+        if player_cfg.get("streamBase"):
+            api_url = _set_query_param(api_url, "stream_urls", "")
 
         # The player first reads metadata to learn which pool host serves the
         # stream_urls API for this request. Mirror that before calling the API.
@@ -454,7 +508,9 @@ class GenericEmbedExtractor(BaseExtractor):
 
         data = stream_payload.get("data") or {}
         stream_urls = data.get("stream_urls") or []
+        cast_urls = data.get("cast_urls") or []
         destination: Optional[str] = None
+        browser_used = False
 
         if isinstance(stream_urls, list):
             destination = next(
@@ -467,10 +523,12 @@ class GenericEmbedExtractor(BaseExtractor):
                 ),
                 None,
             )
-        elif isinstance(stream_urls, str):
-            # Encrypted responses carry plaintext cast URLs. The public /pl/
-            # route is often playable without the cast token.
-            for cast_url in data.get("cast_urls") or []:
+
+        # Encrypted responses carry plaintext cast URLs. The public /pl/ route
+        # is often playable without the cast token; when it is behind a bot
+        # challenge, retry in the isolated browser-fingerprint sandbox.
+        if not destination and cast_urls:
+            for cast_url in cast_urls:
                 candidate = filter_candidate_url(
                     str(cast_url).replace("/plc/", "/pl/"), player_url, self._ad_report
                 )
@@ -487,17 +545,27 @@ class GenericEmbedExtractor(BaseExtractor):
                         destination = candidate
                         break
                 except Exception:
-                    continue
-            if not destination:
+                    pass
+
+                if await self._browser_fetch_playlist(candidate, player_url):
+                    destination = candidate
+                    browser_used = True
+                    break
+
+        if not destination:
+            if isinstance(stream_urls, str) or cast_urls:
                 raise ExtractorError(
                     f"{self.config.canonical}: stream URLs are WASM-encrypted and no plaintext "
                     "cast playlist was available"
                 )
-        if not destination:
             raise ExtractorError(f"{self.config.canonical}: no playable source returned")
 
         logger.info("[%s] resolved %s -> %s", self.config.canonical, url, destination)
-        return self._result(destination, player_url)
+        subtitles = _collect_api_subtitles(stream_payload) + _collect_api_subtitles(data)
+        result = self._result(destination, player_url, subtitles=subtitles)
+        if browser_used:
+            result["sandbox_used"] = True
+        return result
 
     # ------------------------------------------------------------------
     # Generic HTML / iframe hosts

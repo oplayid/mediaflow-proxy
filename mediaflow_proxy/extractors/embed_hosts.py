@@ -215,12 +215,12 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
     ]
 }
 
-# Order used by ``/embed/auto/...``. VidCore and VSEmbed are tried first;
-# the remaining historical hosts are kept as a last-resort fallback chain.
+# The gateway resolves exactly two hosts: VidCore first, VSEmbed as fallback.
+# Historical hosts stay in the registry for backwards-compatible lookups, but
+# they are never probed by the StreamFlix gateway.
 AUTO_HOST_ORDER: Tuple[str, ...] = (
     "VidCore",
     "VSEmbed",
-    *tuple(name for name in EMBED_HOSTS if name not in ("VidCore", "VSEmbed")),
 )
 
 # Every lower-case spelling accepted as ``host`` / embed slug.
