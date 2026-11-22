@@ -20,6 +20,7 @@ from mediaflow_proxy.extractors.embed_hosts import (
     is_public_http_url,
     parse_media_path,
 )
+from mediaflow_proxy.extractors import generic_embed
 from mediaflow_proxy.extractors.factory import ExtractorFactory
 from mediaflow_proxy.extractors.generic_embed import GenericEmbedExtractor
 from mediaflow_proxy.schemas import ExtractorURLParams
@@ -52,8 +53,8 @@ def test_vidspark_api_base_includes_v1():
     assert VIDSPARK_API_BASE == "https://vidspark.to/api/vidora/v1"
 
 
-def test_auto_host_order_only_uses_vidcore_and_vsembed():
-    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed")
+def test_auto_host_order_uses_all_three_supported_hosts():
+    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed", "VidLink")
     assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
     assert set(AUTO_HOST_ORDER) <= set(EMBED_HOSTS)
 
@@ -183,8 +184,10 @@ async def test_vidspark_flow():
     assert result["request_headers"]["Referer"] == "https://vidspark.to/"
     assert [source["url"] for source in result["sources"]] == [destination, hd_url]
     assert result["sources"][1]["label"] == "1080p"
-    assert [sub["language"] for sub in result["subtitles"]] == ["id", "en"]
-    assert [sub["url"] for sub in result["subtitles"]] == [id_url, en_url]
+    assert result["subtitles"] == []
+    assert [sub["language"] for sub in result["provider_subtitles"]] == ["id", "en"]
+    assert [sub["url"] for sub in result["provider_subtitles"]] == [id_url, en_url]
+    assert all(sub["origin"] == "provider" for sub in result["provider_subtitles"])
     assert result["capabilities"]["quality_from_api"] is True
     assert result["capabilities"]["subtitles_from_api"] is True
 
@@ -217,7 +220,7 @@ async def test_vidspark_rejects_unsafe_subtitle_urls():
 
     result = await extractor.extract(embed_url)
 
-    assert [sub["url"] for sub in result["subtitles"]] == [
+    assert [sub["url"] for sub in result["provider_subtitles"]] == [
         "https://paretocdn.site/id.vtt"
     ]
 
@@ -477,12 +480,12 @@ async def test_host_allowlist_is_enforced():
 # ---------------------------------------------------------------------------
 
 
-def test_vidlink_is_registry_only_not_in_auto_order():
+def test_vidlink_is_a_resolvable_auto_host():
     config = EMBED_HOSTS["VidLink"]
     assert config.slug == "vidlink"
     assert config.flow == "vidlink_api"
     assert config.endpoint == "proxy_stream_endpoint"
-    assert "VidLink" not in AUTO_HOST_ORDER
+    assert "VidLink" in AUTO_HOST_ORDER
 
 
 def test_vidlink_embed_url_templates():
@@ -597,12 +600,18 @@ async def test_vidlink_tv_playback_api_uses_season_episode():
 
 
 @pytest.mark.asyncio
-async def test_vidlink_missing_adv_token_fails_closed():
+async def test_vidlink_generates_adv_token_when_missing(monkeypatch):
     config = EMBED_HOSTS["VidLink"]
     extractor = GenericEmbedExtractor({}, config)
+    token = "A" * 64
+    api_url = f"https://vidlink.pro/api/b/movie/{token}?multiLang=0"
+    monkeypatch.setattr(generic_embed, "generate_adv_token", lambda media_id: token)
+    _mock_requests(extractor, {api_url: _vidlink_api_response(api_url)})
 
-    with pytest.raises(Exception, match="content_unavailable"):
-        await extractor.extract("https://vidlink.pro/movie/786892")
+    result = await extractor.extract("https://vidlink.pro/movie/786892")
+
+    assert result["destination_url"] == "https://cdn.example/video-1080.mp4?sign=abc"
+    assert [sub["origin"] for sub in result["subtitles"]] == ["host", "host"]
 
 
 @pytest.mark.asyncio
@@ -877,3 +886,51 @@ async def test_gateway_retry_clears_negative_cache(monkeypatch):
     )
     assert payload["stream_url"] == "ok"
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_gateway_auto_falls_back_to_vidlink(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    embed_routes._negative_cache.clear()
+    embed_routes._resolved_cache.clear()
+    monkeypatch.setattr(
+        embed_routes, "AUTO_HOST_ORDER", ["VidCore", "VSEmbed", "VidLink"]
+    )
+    probed: list[str] = []
+
+    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
+        probed.append(config.canonical)
+        if config.canonical == "VidLink":
+            return config, {"host": config.canonical, "stream_url": "vidlink-stream", "audit": {}}, None
+        return config, None, f"{config.canonical}: unavailable"
+
+    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
+    payload = await embed_routes._resolve_gateway(
+        _embed_request(), "tv", "1399", "1", "1"
+    )
+
+    assert probed == ["VidCore", "VSEmbed", "VidLink"]
+    assert payload["host"] == "VidLink"
+    assert payload["stream_url"] == "vidlink-stream"
+
+
+@pytest.mark.asyncio
+async def test_gateway_explicit_host_probes_only_that_host(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    embed_routes._negative_cache.clear()
+    embed_routes._resolved_cache.clear()
+    probed: list[str] = []
+
+    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
+        probed.append(config.canonical)
+        return config, {"host": config.canonical, "stream_url": "vidlink-stream", "audit": {}}, None
+
+    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
+    payload = await embed_routes._resolve_gateway(
+        _embed_request(), "movie", "786892", None, None, host="vidlink"
+    )
+
+    assert probed == ["VidLink"]
+    assert payload["host"] == "VidLink"

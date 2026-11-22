@@ -19,6 +19,7 @@ from mediaflow_proxy.extractors.embed_hosts import (
     is_public_http_url,
     parse_media_path,
 )
+from mediaflow_proxy.extractors.vidlink_token import generate_adv_token
 from mediaflow_proxy.gateway.ad_filter import (
     AdFilterReport,
     filter_candidate_url,
@@ -143,7 +144,15 @@ def _normalise_sources(items, referer: str, base_headers: dict) -> list[dict]:
     return normalised
 
 
-def _normalise_subtitles(items, referer: str, base_headers: dict) -> list[dict]:
+def _normalise_subtitles(
+    items, referer: str, base_headers: dict, origin: str = "host"
+) -> list[dict]:
+    """Normalise subtitle URLs and tag their origin.
+
+    ``host`` tracks belong to the player itself (native captions exposed by
+    the stream page). ``provider`` tracks come from a separate subtitle API
+    and must never be auto-enabled in the client.
+    """
     normalised: list[dict] = []
     seen: set[str] = set()
     for index, item in enumerate(items or []):
@@ -173,6 +182,7 @@ def _normalise_subtitles(items, referer: str, base_headers: dict) -> list[dict]:
                 "label": str(label or language or f"Subtitle {index + 1}").strip(),
                 "format": str(raw.get("format") or raw.get("type") or "vtt").lower(),
                 "url": url,
+                "origin": str(raw.get("origin") or origin),
                 "request_headers": _asset_headers(raw, referer, base_headers),
             }
         )
@@ -390,6 +400,7 @@ class GenericEmbedExtractor(BaseExtractor):
         subtitles=None,
         audio=None,
         capabilities=None,
+        provider_subtitles=None,
     ) -> Dict[str, Any]:
         if not is_public_http_url(destination_url):
             raise ExtractorError(f"{self.config.canonical}: resolved unsafe stream URL")
@@ -410,6 +421,9 @@ class GenericEmbedExtractor(BaseExtractor):
                 },
             )
         normalised_subtitles = _normalise_subtitles(subtitles, referer, base_headers)
+        normalised_provider_subtitles = _normalise_subtitles(
+            provider_subtitles, referer, base_headers, origin="provider"
+        )
         normalised_audio = _normalise_audio(audio)
 
         default_capabilities = {
@@ -417,6 +431,8 @@ class GenericEmbedExtractor(BaseExtractor):
             "subtitles_from_api": self.config.subtitles_from_api,
             "audio_from_api": self.config.audio_from_api,
             "audio_from_manifest": True,
+            "host_subtitles": bool(normalised_subtitles),
+            "provider_subtitles": bool(normalised_provider_subtitles),
         }
         if capabilities:
             default_capabilities.update(capabilities)
@@ -428,7 +444,9 @@ class GenericEmbedExtractor(BaseExtractor):
             "expiration": 120,
             "force_playlist_proxy": True,
             "sources": normalised_sources,
+            # Host captions only. Provider API subtitles are exposed separately.
             "subtitles": normalised_subtitles,
+            "provider_subtitles": normalised_provider_subtitles,
             "audio": normalised_audio,
             "capabilities": default_capabilities,
         }
@@ -497,7 +515,7 @@ class GenericEmbedExtractor(BaseExtractor):
             destination,
             "https://vidspark.to/",
             sources=sources,
-            subtitles=subtitles,
+            provider_subtitles=subtitles,
             audio=audio,
         )
 
@@ -669,9 +687,13 @@ class GenericEmbedExtractor(BaseExtractor):
                         candidates.append({"url": item, "label": label})
             elif isinstance(qualities, list):
                 candidates.extend(qualities)
-            for key in ("url", "src", "file"):
+            for key in ("url", "src", "file", "playlist", "playlist_url"):
                 if stream.get(key):
-                    candidates.append({"url": stream[key], "label": "Auto"})
+                    raw = {"url": stream[key], "label": "Auto"}
+                    headers = stream.get("playlistHeaders") or stream.get("headers")
+                    if isinstance(headers, dict):
+                        raw["headers"] = headers
+                    candidates.append(raw)
         for key in ("sources", "stream_urls"):
             value = payload.get(key) if isinstance(payload, dict) else None
             if isinstance(value, list):
@@ -695,10 +717,10 @@ class GenericEmbedExtractor(BaseExtractor):
     async def _extract_vidlink(self, url: str) -> Dict[str, Any]:
         """Resolve a VidLink embed URL to a signed, ad-filtered stream.
 
-        VidLink's ``/api/b/`` endpoint expects a per-title token minted in the
-        browser by an Adcash WASM module. The token is accepted as the
-        ``adv_token`` query parameter on the embed URL; if it is missing the
-        flow reports ``content_unavailable`` so the gateway can fall back.
+        VidLink's ``/api/b/`` endpoint expects a per-title ``adv_token``. The
+        browser mints it with a WASM module; the gateway generates the same
+        token server-side. An explicit ``adv_token`` query parameter still wins
+        (useful for debugging), but it is no longer required.
 
         Anime pages expose both ``/sub`` and ``/dub`` variants. Each variant is
         tried in order (requested first, then the alternative) so a missing
@@ -706,8 +728,8 @@ class GenericEmbedExtractor(BaseExtractor):
         """
         parsed = urlparse(url)
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        api_token = query.get("adv_token")
         media_type, media_id, season, episode, variant = parse_media_path(url)
+        api_token = query.get("adv_token")
 
         if media_type == "anime":
             for candidate_variant in anime_variant_candidates(variant):
@@ -744,9 +766,12 @@ class GenericEmbedExtractor(BaseExtractor):
             )
 
         if not api_token:
-            raise ExtractorError(
-                f"{self.config.canonical}: content_unavailable: missing adv_token for playback"
-            )
+            try:
+                api_token = generate_adv_token(media_id)
+            except ValueError as exc:
+                raise ExtractorError(
+                    f"{self.config.canonical}: content_unavailable: {exc}"
+                ) from exc
 
         api_base = f"{parsed.scheme}://{parsed.netloc}/api/b"
         if media_type == "tv":
@@ -759,7 +784,7 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={
                 "Referer": url,
                 "Accept": "application/json",
-                "X-Playback-Environment": "standard",
+                "X-Playback-Environment": "dash-hevc",
             },
         )
         try:
@@ -779,7 +804,10 @@ class GenericEmbedExtractor(BaseExtractor):
 
         destination = cleaned[0][0]
         stream = payload.get("stream") or {}
-        subtitles = stream.get("captions") if isinstance(stream, dict) else None
+        subtitles = []
+        if isinstance(stream, dict):
+            subtitles.extend(_collect_api_subtitles(stream))
+        subtitles.extend(_collect_api_subtitles(payload))
         logger.info(
             "[%s] resolved %s -> %s (%s sources)",
             self.config.canonical,

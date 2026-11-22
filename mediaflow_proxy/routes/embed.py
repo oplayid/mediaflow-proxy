@@ -32,10 +32,10 @@ from mediaflow_proxy.utils.http_utils import (
 logger = logging.getLogger(__name__)
 gateway_router = APIRouter()
 
-# Only two hosts are resolved, so each gets a generous budget while the total
-# stays bounded. Hosts are tried in order: VidCore first, VSEmbed fallback.
+# Three hosts are resolved sequentially, so each gets a generous budget while
+# the total stays bounded. Failover order: VidCore -> VSEmbed -> VidLink.
 PROBE_TIMEOUT = 10.0
-AUTO_TOTAL_TIMEOUT = 25.0
+AUTO_TOTAL_TIMEOUT = 40.0
 AUTO_FIRST_WAVE = 1
 NEGATIVE_CACHE_TTL = 30.0
 # Resolve the provider once, then serve the cached result for at most 6 hours
@@ -205,12 +205,48 @@ def _sign_asset_url(
     )
 
 
+def _signed_subtitles(
+    request: Request,
+    result: dict,
+    proxy_headers: ProxyRequestHeaders,
+    items: list[dict],
+    expiration: int | None,
+    *,
+    origin: str,
+) -> list[dict]:
+    signed: list[dict] = []
+    for subtitle in items:
+        url = subtitle.get("url")
+        if not url:
+            continue
+        signed.append(
+            {
+                "id": f"{origin}-{subtitle.get('id') or len(signed)}",
+                "label": subtitle.get("label") or subtitle.get("language") or "Subtitle",
+                "language": subtitle.get("language") or "",
+                "format": subtitle.get("format") or "vtt",
+                "origin": origin,
+                "url": _sign_asset_url(
+                    request,
+                    result,
+                    proxy_headers,
+                    url,
+                    endpoint="hls_segment_proxy",
+                    request_headers=subtitle.get("request_headers"),
+                    force_playlist_proxy=False,
+                    expiration=expiration,
+                ),
+            }
+        )
+    return signed
+
+
 def _signed_metadata(
     request: Request,
     result: dict,
     proxy_headers: ProxyRequestHeaders,
     expiration: int | None = None,
-) -> tuple[list[dict], list[dict], dict]:
+) -> tuple[list[dict], list[dict], list[dict], dict]:
     sources: list[dict] = []
     for source in result.get("sources") or []:
         url = source.get("url")
@@ -232,31 +268,19 @@ def _signed_metadata(
             }
         )
 
-    subtitles: list[dict] = []
-    for subtitle in result.get("subtitles") or []:
-        url = subtitle.get("url")
-        if not url:
-            continue
-        subtitles.append(
-            {
-                "id": subtitle.get("id") or f"sub-{len(subtitles)}",
-                "label": subtitle.get("label") or subtitle.get("language") or "Subtitle",
-                "language": subtitle.get("language") or "",
-                "format": subtitle.get("format") or "vtt",
-                "url": _sign_asset_url(
-                    request,
-                    result,
-                    proxy_headers,
-                    url,
-                    endpoint="hls_segment_proxy",
-                    request_headers=subtitle.get("request_headers"),
-                    force_playlist_proxy=False,
-                    expiration=expiration,
-                ),
-            }
-        )
+    host_subtitles = _signed_subtitles(
+        request, result, proxy_headers, result.get("subtitles") or [], expiration, origin="host"
+    )
+    provider_subtitles = _signed_subtitles(
+        request,
+        result,
+        proxy_headers,
+        result.get("provider_subtitles") or [],
+        expiration,
+        origin="provider",
+    )
 
-    return sources, subtitles, dict(result.get("capabilities") or {})
+    return sources, host_subtitles, provider_subtitles, dict(result.get("capabilities") or {})
 
 
 def _quality_id(label) -> str:
@@ -351,7 +375,7 @@ async def _probe_gateway(
         stream_url = _sign_asset_url(
             request, result, proxy_headers, result["destination_url"], expiration=ttl
         )
-        sources, subtitles, capabilities = _signed_metadata(
+        sources, subtitles, provider_subtitles, capabilities = _signed_metadata(
             request, result, proxy_headers, expiration=ttl
         )
     except Exception as exc:
@@ -375,9 +399,13 @@ async def _probe_gateway(
     return (
         config,
         {
+            "host": config.canonical,
             "stream_url": stream_url,
             "sources": sources,
+            # Native/host captions: safe to auto-enable.
             "subtitles": subtitles,
+            # Subtitles from a separate provider API: opt-in only.
+            "provider_subtitles": provider_subtitles,
             "capabilities": capabilities,
             "expires_in": ttl,
             "audit": audit,
@@ -396,6 +424,7 @@ async def _resolve_gateway(
     media_id: str,
     season: str | None,
     episode: str | None,
+    host: str | None = None,
 ) -> dict:
     media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
     proxy_headers = get_proxy_headers(request)
@@ -403,8 +432,12 @@ async def _resolve_gateway(
     if retry:
         await _clear_failures(media_type, media_id, season, episode)
 
-    configs = [get_config(name) for name in AUTO_HOST_ORDER]
-    configs = [config for config in configs if config]
+    if host:
+        selected = get_config(host)
+        configs = [selected] if selected else []
+    else:
+        configs = [get_config(name) for name in AUTO_HOST_ORDER]
+        configs = [config for config in configs if config]
 
     errors: list[str] = []
     loop = asyncio.get_running_loop()
@@ -468,9 +501,14 @@ async def _gateway_response(
     media_id: str,
     season: str | None,
     episode: str | None,
+    host: str | None = None,
 ) -> JSONResponse:
+    if host and get_config(host) is None:
+        raise HTTPException(status_code=400, detail=f"unknown embed host: {host}")
     try:
-        payload = await _resolve_gateway(request, media_type, media_id, season, episode)
+        payload = await _resolve_gateway(
+            request, media_type, media_id, season, episode, host=host
+        )
     except EmbedUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.detail) from exc
 
@@ -507,20 +545,24 @@ async def gateway_cache_stats():
 
 
 @gateway_router.get("/resolve/movie/{media_id}")
-async def resolve_movie(request: Request, media_id: str):
-    return await _gateway_response(request, "movie", media_id, None, None)
+async def resolve_movie(request: Request, media_id: str, host: str | None = None):
+    return await _gateway_response(request, "movie", media_id, None, None, host=host)
 
 
 @gateway_router.get("/resolve/tv/{media_id}")
-async def resolve_tv(request: Request, media_id: str):
-    return await _gateway_response(request, "tv", media_id, None, None)
+async def resolve_tv(request: Request, media_id: str, host: str | None = None):
+    return await _gateway_response(request, "tv", media_id, None, None, host=host)
 
 
 @gateway_router.get("/resolve/tv/{media_id}/{season}")
-async def resolve_tv_season(request: Request, media_id: str, season: str):
-    return await _gateway_response(request, "tv", media_id, season, None)
+async def resolve_tv_season(
+    request: Request, media_id: str, season: str, host: str | None = None
+):
+    return await _gateway_response(request, "tv", media_id, season, None, host=host)
 
 
 @gateway_router.get("/resolve/tv/{media_id}/{season}/{episode}")
-async def resolve_tv_episode(request: Request, media_id: str, season: str, episode: str):
-    return await _gateway_response(request, "tv", media_id, season, episode)
+async def resolve_tv_episode(
+    request: Request, media_id: str, season: str, episode: str, host: str | None = None
+):
+    return await _gateway_response(request, "tv", media_id, season, episode, host=host)

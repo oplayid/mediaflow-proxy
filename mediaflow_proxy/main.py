@@ -10,7 +10,9 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import RedirectResponse
 from starlette.staticfiles import StaticFiles
 
+from mediaflow_proxy import __version__
 from mediaflow_proxy.configs import settings
+from mediaflow_proxy.extractors.embed_hosts import AUTO_HOST_ORDER
 from mediaflow_proxy.middleware import UIAccessControlMiddleware
 from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
@@ -114,7 +116,12 @@ async def verify_api_key(api_key: str = Security(api_password_query), api_key_al
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Status endpoint; the version/hosts make deployed images easy to verify."""
+    return {
+        "status": "healthy",
+        "version": __version__,
+        "gateway_hosts": list(AUTO_HOST_ORDER),
+    }
 
 
 @app.get("/favicon.ico")

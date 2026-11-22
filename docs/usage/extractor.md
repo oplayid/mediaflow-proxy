@@ -45,6 +45,7 @@ These hosts are also accepted as `host` values. They are handled by the config-d
 |---|---|---|
 | `VSEmbed` | `vsembed` | `stream.oplay.id`, `vsembed.su`, `vsembed.ru`, `stellarconductornexus.com` |
 | `VidCore` | `vidcore` | `vidcore.org`, `vidspark.to`, `paretocdn.site` |
+| `VidLink` | `vidlink` | `vidlink.pro`, `www.vidlink.pro` |
 | `VidKing` | `vidking` | `www.vidking.net`, `vidking.ws`, `www.vidking.ws` |
 | `AutoEmbed` | `autoembed` | `player.autoembed.cc` |
 | `TwoEmbed` | `2embed` | `www.2embed.cc`, `2embed.cc` |
@@ -124,7 +125,7 @@ MediaFlow is **not** a player and does not serve a provider list, a relay page, 
 | `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The gateway resolves exactly two hosts, in order: **VidCore first, VSEmbed as fallback**. Each probe has a 10 second timeout and selection is capped at 25 seconds; failed hosts are skipped for 30 seconds. Historical hosts remain in the extractor registry for backwards-compatible `host=` lookups but are never probed by this gateway. If both hosts fail the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The gateway resolves three hosts, in order: **VidCore, VSEmbed, then VidLink**. Add `?host=vidcore`, `?host=vsembed`, or `?host=vidlink` to force one host (useful for diagnostics). Each probe has a 10 second timeout and selection is capped at 40 seconds; failed hosts are skipped for 30 seconds. Historical hosts remain in the extractor registry for backwards-compatible `host=` lookups but are never probed by this gateway. If all three hosts fail the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
 
 Example:
 
@@ -134,22 +135,25 @@ GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1
 
 ```json
 {
+  "host": "VidCore",
   "stream_url": "https://mfp.oplay.id/proxy/hls/manifest.m3u8?d=...&exp=...",
   "sources": [{"id": "auto", "label": "Auto", "url": "..."}],
   "subtitles": [
-    {"id": "sub-id-0", "label": "Indonesian", "language": "id", "format": "vtt", "url": "..."},
-    {"id": "sub-en-1", "label": "English", "language": "en", "format": "vtt", "url": "..."}
+    {"id": "host-sub-id-0", "label": "Indonesian", "language": "id", "format": "vtt", "url": "...", "origin": "host"}
   ],
-  "capabilities": {"subtitles_from_api": true},
+  "provider_subtitles": [
+    {"id": "provider-sub-en-1", "label": "English", "language": "en", "format": "vtt", "url": "...", "origin": "provider"}
+  ],
+  "capabilities": {"host_subtitles": true, "provider_subtitles": true},
   "expires_in": 21600,
   "audit": {"blocked_domains": [], "blocked_urls": 0, "hls_filter_enabled": true},
   "media": {"type": "tv", "id": "94997", "season": "1", "episode": "1"}
 }
 ```
 
-`stream_url` and every URL in `sources`/`subtitles` is signed: upstream headers, query parameters, and `api_password` are encrypted into the token, so the browser never sees `api_password` in plaintext. `expires_in` is the token lifetime in seconds. Streamflix should re-fetch the gateway when the token approaches expiry (or when the user retries) instead of contacting the provider again.
+`stream_url` and every URL in `sources`/`subtitles`/`provider_subtitles` is signed: upstream headers, query parameters, and `api_password` are encrypted into the token, so the browser never sees `api_password` in plaintext. `expires_in` is the token lifetime in seconds. Streamflix should re-fetch the gateway when the token approaches expiry (or when the user retries) instead of contacting the provider again.
 
-Subtitles are ordered Indonesian first, English second. Streamflix selects the Indonesian track by default and falls back to English if no Indonesian track exists.
+`subtitles` are the host's own captions and are safe to auto-enable. `provider_subtitles` come from a separate subtitle API (for example VidCore's subtitle list) and must stay opt-in. Both lists are ordered Indonesian first, English second; Streamflix selects the Indonesian host track by default and falls back to English.
 
 ### Caching and retry
 
