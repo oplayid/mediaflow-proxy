@@ -38,7 +38,9 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Features: features.md
-  - Installation: installation.md
+  - Installation:
+      - Overview: installation.md
+      - Coolify & GitHub Actions: installation/coolify.md
   - Configuration:
       - Environment variables: configuration/environment.md
       - Docker, Gunicorn & Redis: configuration/runtime.md

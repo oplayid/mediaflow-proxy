@@ -15,6 +15,7 @@ from mediaflow_proxy.middleware import UIAccessControlMiddleware
 from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
+from mediaflow_proxy.routes.embed import embed_router
 from mediaflow_proxy.routes.speedtest import speedtest_router
 from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
 from mediaflow_proxy.routes.xtream import xtream_root_router
@@ -314,6 +315,9 @@ if settings.enable_telegram:
 
     app.include_router(telegram_router, prefix="/proxy", tags=["telegram"], dependencies=[Depends(verify_api_key)])
 app.include_router(extractor_router, prefix="/extractor", tags=["extractors"], dependencies=[Depends(verify_api_key)])
+# Public embed endpoints: they sign their own short-lived proxy URLs internally,
+# so StreamFlix only has to point its existing <iframe> at MediaFlow.
+app.include_router(embed_router, prefix="/embed", tags=["embed"])
 app.include_router(speedtest_router, prefix="/speedtest", tags=["speedtest"], dependencies=[Depends(verify_api_key)])
 app.include_router(
     playlist_builder_router, prefix="/playlist", tags=["playlist"], dependencies=[Depends(verify_api_key)]

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query, HTTPException, Request, Depends, Backgroun
 from fastapi.responses import RedirectResponse
 
 from mediaflow_proxy.extractors.base import ExtractorError
+from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS
 from mediaflow_proxy.extractors.factory import ExtractorFactory
 from mediaflow_proxy.schemas import ExtractorURLParams
 from mediaflow_proxy.utils.cache_utils import (
@@ -34,7 +35,9 @@ _REFRESH_COOLDOWN = 120
 _NO_BACKGROUND_REFRESH_HOSTS = frozenset(
     {
         "Vidoza",
-        # Add other hosts here that generate unique per-extraction URLs
+        # Embed hosts mint short-lived, per-extraction CDN URLs. Refreshing
+        # those in the background invalidates URLs already handed to players.
+        *EMBED_HOSTS.keys(),
     }
 )
 

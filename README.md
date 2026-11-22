@@ -14,6 +14,8 @@ MediaFlow Proxy is a streaming proxy for HTTP(S), HLS (M3U8), and MPEG-DASH—in
 docker run -p 8888:8888 -e API_PASSWORD=your_password mhdzumair/mediaflow-proxy
 ```
 
+> Deploying with Coolify via a GitHub Actions-built image? See the [Coolify guide](docs/installation/coolify.md).
+
 > Prefer not to self-host? A managed MediaFlow Proxy instance is available via [ElfHosted](https://store.elfhosted.com/product/mediaflow-proxy-2x4k-booster/?utm_source=github&utm_medium=readme&utm_campaign=mediaflow-proxy-readme), bundled with debrid and Stremio addons in their streaming personal-stacks (7-day trial).
 
 ## Highlights

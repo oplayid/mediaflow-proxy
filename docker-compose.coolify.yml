@@ -1,0 +1,50 @@
+# Coolify-ready deployment for an image built by .github/workflows/main.yml.
+# In Coolify: New Resource -> Docker Compose -> pick this file from the repo.
+services:
+  mfp:
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:latest}
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      # Set this in Coolify's environment variables section (required).
+      API_PASSWORD: ${API_PASSWORD:?API_PASSWORD must be set in Coolify}
+      # Coolify sits behind Traefik; without this the client IP is read as 127.0.0.1
+      # and IP-bound encrypted URLs will fail.
+      FORWARDED_ALLOW_IPS: "*"
+      # Pin the bind address so a platform-injected PORT cannot change it.
+      GUNICORN_BIND: "0.0.0.0:8888"
+      REDIS_URL: redis://redis:6379
+      # Optional overrides — uncomment and set in Coolify as needed:
+      # WEB_CONCURRENCY: "1"          # use 1 if using Telegram interactive login
+      # ENABLE_TRANSCODE: "false"
+      # ENABLE_HLS_PREBUFFER: "false"
+      # ENABLE_DASH_PREBUFFER: "false"
+      # DISABLE_HOME_PAGE: "false"
+      # DISABLE_DOCS: "false"
+      # DISABLE_SPEEDTEST: "false"
+      # PUBLIC_IP: "1.2.3.4"
+      # TRANSPORT_CONFIG: '{"proxy_url":"http://user:pass@proxy:8080","all_proxy":true}'
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis_data:

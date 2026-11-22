@@ -1,8 +1,10 @@
 import json
 import re
-from typing import Annotated, Literal, Dict, Any, Optional
+from typing import Annotated, Dict, Any, Optional
 
 from pydantic import BaseModel, Field, IPvAnyAddress, ConfigDict, field_validator
+
+from mediaflow_proxy.extractors.embed_hosts import canonicalize_host
 
 
 def validate_resolution_format(value: str) -> str:
@@ -290,33 +292,28 @@ class MPDInitParams(GenericParams):
 
 
 class ExtractorURLParams(GenericParams):
-    host: Literal[
-        "City",
-        "Doodstream",
-        "FileLions",
-        "FileMoon",
-        "F16Px",
-        "Mixdrop",
-        "Gupload",
-        "Uqload",
-        "Streamtape",
-        "StreamWish",
-        "Supervideo",
-        "VixCloud",
-        "Okru",
-        "Maxstream",
-        "LiveTV",
-        "LuluStream",
-        "Fastream",
-        "TurboVidPlay",
-        "Vidmoly",
-        "Vidoza",
-        "Voe",
-        "Sportsonline",
-        "Vavoo",
-        "VidFast",
-        "StreamHG",
-    ] = Field(..., description="The host to extract the URL from.")
+    host: str = Field(..., description="The host to extract the URL from (case-insensitive).")
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def normalize_host(cls, value: str) -> str:
+        """Normalize slugs/domains/mixed case to the canonical host name.
+
+        Keeping this as ``str`` + validator instead of a ``Literal`` means a new
+        embed host only has to be added to ``embed_hosts.py`` and ``factory.py``.
+        """
+        if not isinstance(value, str):
+            return value
+        canonical = canonicalize_host(value)
+        if canonical:
+            return canonical
+        # Lazy import avoids a module cycle at import time.
+        from mediaflow_proxy.extractors.factory import ExtractorFactory
+
+        for name in ExtractorFactory._extractors:
+            if name.lower() == value.strip().lower():
+                return name
+        return value
     destination: Annotated[str, Field(description="The URL of the stream.", alias="d")]
     redirect_stream: bool = Field(False, description="Whether to redirect to the stream endpoint automatically.")
     extra_params: Dict[str, Any] = Field(

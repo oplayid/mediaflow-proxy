@@ -26,6 +26,8 @@ from mediaflow_proxy.extractors.fastream import FastreamExtractor
 from mediaflow_proxy.extractors.voe import VoeExtractor
 from mediaflow_proxy.extractors.vidfast import VidFastExtractor
 from mediaflow_proxy.extractors.streamhg import StreamHGExtractor
+from mediaflow_proxy.extractors.embed_hosts import canonicalize_host, get_config
+from mediaflow_proxy.extractors.generic_embed import GenericEmbedExtractor
 
 
 class ExtractorFactory:
@@ -59,10 +61,26 @@ class ExtractorFactory:
         "StreamHG": StreamHGExtractor,
     }
 
+    # Lower-cased lookup for the built-in extractors, so ``vidfast`` and
+    # ``VidFast`` resolve identically (docs promise case-insensitive hosts).
+    _extractors_lower: Dict[str, Type[BaseExtractor]] = {
+        name.lower(): extractor for name, extractor in _extractors.items()
+    }
+
     @classmethod
     def get_extractor(cls, host: str, request_headers: dict) -> BaseExtractor:
-        """Get appropriate extractor instance for the given host."""
-        extractor_class = cls._extractors.get(host)
+        """Get appropriate extractor instance for the given host.
+
+        Hosts declared in ``embed_hosts.py`` are handled by the config-driven
+        GenericEmbedExtractor; everything else uses the original class registry.
+        Both paths are case-insensitive.
+        """
+        config = get_config(host)
+        if config:
+            return GenericEmbedExtractor(request_headers, config)
+
+        canonical = canonicalize_host(host)
+        extractor_class = cls._extractors_lower.get((canonical or str(host)).lower())
         if not extractor_class:
             raise ExtractorError(f"Unsupported host: {host}")
         return extractor_class(request_headers)
