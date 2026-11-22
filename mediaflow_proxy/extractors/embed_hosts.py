@@ -41,6 +41,12 @@ class EmbedHostConfig:
     api_headers: Dict[str, str] = field(default_factory=dict)
     endpoint: str = "hls_manifest_proxy"
     max_iframe_hops: int = 3
+    # Capabilities consumed by the player. API metadata is only trusted for
+    # hosts whose response shape we normalise explicitly; every host can still
+    # expose quality/audio/subtitle tracks from the HLS manifest itself.
+    quality_from_api: bool = False
+    subtitles_from_api: bool = False
+    audio_from_api: bool = False
 
     def allowed_host(self, hostname: str | None) -> bool:
         """Case-insensitive suffix match against this host's domains."""
@@ -90,6 +96,9 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
             flow=FLOW_VIDSPARK,
             api_base=VIDSPARK_API_BASE,
             api_headers={"x-player-key": VIDSPARK_PLAYER_KEY, "Referer": "https://vidspark.to/"},
+            quality_from_api=True,
+            subtitles_from_api=True,
+            audio_from_api=True,
         ),
         _cfg(
             "VidKing",

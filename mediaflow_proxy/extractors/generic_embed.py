@@ -30,6 +30,190 @@ _M3U8_PATTERNS = [
     r"sources\s*:\s*\[\s*[\"']([^\"']+)[\"']",
 ]
 
+# Indonesian is the default subtitle language, English is the fallback. Codes
+# here are normalised from the many labels embed hosts use.
+LANGUAGE_ALIASES = {
+    "id": "id",
+    "id-id": "id",
+    "ind": "id",
+    "indonesian": "id",
+    "bahasa": "id",
+    "in": "id",
+    "en": "en",
+    "en-us": "en",
+    "en-gb": "en",
+    "eng": "en",
+    "english": "en",
+}
+PREFERRED_LANGUAGES = ("id", "en")
+
+
+def _language_code(*values) -> str | None:
+    """Normalise a host-provided language label to a canonical code."""
+    text = " ".join(str(value) for value in values if value).strip().lower()
+    if not text:
+        return None
+    cleaned = re.sub(r"[\(\)\[\]]", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    for candidate in (cleaned, cleaned.split(" ")[0], cleaned.split("-")[0]):
+        if candidate in LANGUAGE_ALIASES:
+            return LANGUAGE_ALIASES[candidate]
+    for token in re.split(r"[\s\-_,/]+", cleaned):
+        if token in LANGUAGE_ALIASES:
+            return LANGUAGE_ALIASES[token]
+    if "indonesia" in cleaned:
+        return "id"
+    if "english" in cleaned or "inggris" in cleaned:
+        return "en"
+    return cleaned.split(" ")[0] or None
+
+
+def _language_rank(code: str | None) -> int:
+    try:
+        return PREFERRED_LANGUAGES.index(code or "")
+    except ValueError:
+        return len(PREFERRED_LANGUAGES)
+
+
+def _quality_id(label, index: int) -> str:
+    if not label:
+        return f"source-{index + 1}"
+    slug = re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")
+    return slug or f"source-{index + 1}"
+
+
+def _asset_headers(raw: dict, referer: str, base_headers: dict) -> dict:
+    headers = dict(base_headers)
+    extra = raw.get("headers") if isinstance(raw.get("headers"), dict) else {}
+    headers.update({str(key): str(value) for key, value in extra.items()})
+    headers["Referer"] = str(raw.get("referer") or raw.get("Referer") or referer)
+    return headers
+
+
+def _normalise_sources(items, referer: str, base_headers: dict) -> list[dict]:
+    normalised: list[dict] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items or []):
+        if isinstance(item, str):
+            url, raw = item, {}
+        elif isinstance(item, dict):
+            raw = item
+            url = (
+                item.get("url")
+                or item.get("src")
+                or item.get("file")
+                or item.get("playlist")
+            )
+        else:
+            continue
+        if not isinstance(url, str) or not is_public_http_url(url) or url in seen:
+            continue
+        seen.add(url)
+
+        label = (
+            raw.get("label")
+            or raw.get("name")
+            or raw.get("quality")
+            or raw.get("resolution")
+            or raw.get("height")
+            or ""
+        )
+        if isinstance(label, (int, float)) and label < 10000:
+            label = f"{int(label)}p"
+        label = str(label).strip()
+        if not label and raw.get("width") and raw.get("height"):
+            label = f"{raw['height']}p"
+        normalised.append(
+            {
+                "id": _quality_id(label or raw.get("quality"), index),
+                "label": label or f"Source {index + 1}",
+                "url": url,
+                "request_headers": _asset_headers(raw, referer, base_headers),
+            }
+        )
+    return normalised
+
+
+def _normalise_subtitles(items, referer: str, base_headers: dict) -> list[dict]:
+    normalised: list[dict] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items or []):
+        if isinstance(item, str):
+            raw = {"url": item}
+        elif isinstance(item, dict):
+            raw = item
+        else:
+            continue
+        url = (
+            raw.get("url")
+            or raw.get("src")
+            or raw.get("file")
+            or raw.get("path")
+        )
+        if not isinstance(url, str) or not is_public_http_url(url) or url in seen:
+            continue
+        seen.add(url)
+
+        label = raw.get("label") or raw.get("name") or raw.get("title") or ""
+        language = _language_code(
+            raw.get("language"), raw.get("lang"), raw.get("code"), label
+        )
+        normalised.append(
+            {
+                "language": language or "",
+                "label": str(label or language or f"Subtitle {index + 1}").strip(),
+                "format": str(raw.get("format") or raw.get("type") or "vtt").lower(),
+                "url": url,
+                "request_headers": _asset_headers(raw, referer, base_headers),
+            }
+        )
+
+    normalised.sort(key=lambda entry: _language_rank(entry["language"]))
+    for index, entry in enumerate(normalised):
+        entry["id"] = f"sub-{entry['language'] or index}-{index}"
+    return normalised
+
+
+def _collect_api_subtitles(payload: dict) -> list:
+    """Collect subtitles from the common `subtitles`/`captions`/`tracks` shapes."""
+    collected: list = []
+    for key in ("subtitles", "captions", "tracks"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            collected.extend(value)
+        elif isinstance(value, dict):
+            for label, item in value.items():
+                if isinstance(item, str):
+                    collected.append({"url": item, "label": label})
+                elif isinstance(item, dict):
+                    merged = dict(item)
+                    merged.setdefault("label", label)
+                    collected.append(merged)
+    return collected
+
+
+def _normalise_audio(items) -> list[dict]:
+    normalised: list[dict] = []
+    for index, item in enumerate(items or []):
+        if isinstance(item, str):
+            label, url = item, None
+        elif isinstance(item, dict):
+            label = item.get("label") or item.get("name") or item.get("language") or ""
+            url = item.get("url") or item.get("src") or None
+        else:
+            continue
+        if not label and not url:
+            continue
+        normalised.append(
+            {
+                "id": f"audio-{index + 1}",
+                "label": str(label or f"Audio {index + 1}").strip(),
+                "language": _language_code(label) or "",
+                "url": url if isinstance(url, str) and is_public_http_url(url) else None,
+            }
+        )
+    return normalised
+
 
 def _extract_json_object(pattern: re.Pattern, html: str, name: str) -> Dict[str, Any]:
     match = pattern.search(html)
@@ -78,18 +262,55 @@ class GenericEmbedExtractor(BaseExtractor):
             return await self._extract_vsembed(url)
         return await self._extract_generic(url)
 
-    def _result(self, destination_url: str, referer: str) -> Dict[str, Any]:
+    def _result(
+        self,
+        destination_url: str,
+        referer: str,
+        sources=None,
+        subtitles=None,
+        audio=None,
+        capabilities=None,
+    ) -> Dict[str, Any]:
         if not is_public_http_url(destination_url):
             raise ExtractorError(f"{self.config.canonical}: resolved unsafe stream URL")
+
+        base_headers = {
+            "User-Agent": self.base_headers.get("user-agent", ""),
+            "Referer": referer,
+        }
+        normalised_sources = _normalise_sources(sources, referer, base_headers)
+        if not any(source["url"] == destination_url for source in normalised_sources):
+            normalised_sources.insert(
+                0,
+                {
+                    "id": "auto",
+                    "label": "Auto",
+                    "url": destination_url,
+                    "request_headers": dict(base_headers),
+                },
+            )
+        normalised_subtitles = _normalise_subtitles(subtitles, referer, base_headers)
+        normalised_audio = _normalise_audio(audio)
+
+        default_capabilities = {
+            "quality_from_api": self.config.quality_from_api,
+            "subtitles_from_api": self.config.subtitles_from_api,
+            "audio_from_api": self.config.audio_from_api,
+            "audio_from_manifest": True,
+        }
+        if capabilities:
+            default_capabilities.update(capabilities)
+
         return {
             "destination_url": destination_url,
-            "request_headers": {
-                "User-Agent": self.base_headers.get("user-agent", ""),
-                "Referer": referer,
-            },
+            "request_headers": base_headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
             "expiration": 120,
             "force_playlist_proxy": True,
+            "sources": normalised_sources,
+            "subtitles": normalised_subtitles,
+            "audio": normalised_audio,
+            "capabilities": default_capabilities,
         }
 
     # ------------------------------------------------------------------
@@ -117,12 +338,44 @@ class GenericEmbedExtractor(BaseExtractor):
             raise ExtractorError(f"{self.config.canonical}: {message or 'stream unavailable'}")
 
         sources = payload.get("sources") or []
-        destination = next((s.get("url") for s in sources if s.get("url")), None)
+        if not isinstance(sources, list):
+            sources = [sources]
+        destination = next(
+            (
+                candidate
+                for candidate in (
+                    (s.get("url") or s.get("src") or s.get("file"))
+                    if isinstance(s, dict)
+                    else s
+                    for s in sources
+                )
+                if isinstance(candidate, str) and is_public_http_url(candidate)
+            ),
+            None,
+        )
         if not destination:
             raise ExtractorError(f"{self.config.canonical}: no playable source returned")
 
-        logger.info("[%s] resolved %s -> %s", self.config.canonical, url, destination)
-        return self._result(destination, "https://vidspark.to/")
+        subtitles = _collect_api_subtitles(payload)
+        audio = payload.get("audio") or payload.get("audioTracks") or []
+        if isinstance(audio, dict):
+            audio = list(audio.values())
+
+        logger.info(
+            "[%s] resolved %s -> %s (%s sources, %s subtitles)",
+            self.config.canonical,
+            url,
+            destination,
+            len(sources),
+            len(subtitles),
+        )
+        return self._result(
+            destination,
+            "https://vidspark.to/",
+            sources=sources,
+            subtitles=subtitles,
+            audio=audio,
+        )
 
     # ------------------------------------------------------------------
     # VSEmbed gate chain

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mediaflow_proxy.extractors.base import HttpResponse
@@ -52,9 +54,29 @@ def test_auto_host_order_prefers_vidcore_and_includes_every_host():
     assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
 
 
-def test_player_html_emits_server_and_error_messages():
-    from mediaflow_proxy.routes.embed import _player_html
+def test_player_html_emits_server_track_controls_and_error_messages():
+    from mediaflow_proxy.routes.embed import _player_html, PLAYER_LANGUAGE_PRIORITY
 
+    sources = [
+        {"id": "auto", "label": "Auto", "url": "https://mfp.example/proxy/master.m3u8"},
+        {"id": "1080p", "label": "1080p", "url": "https://mfp.example/proxy/1080.m3u8"},
+    ]
+    subtitles = [
+        {
+            "id": "sub-id-0",
+            "label": "Indonesian",
+            "language": "id",
+            "format": "vtt",
+            "url": "https://mfp.example/proxy/hls/segment.vtt?d=id",
+        },
+        {
+            "id": "sub-en-1",
+            "label": "English",
+            "language": "en",
+            "format": "vtt",
+            "url": "https://mfp.example/proxy/hls/segment.vtt?d=en",
+        },
+    ]
     player = _player_html(
         "https://mfp.example/proxy/playlist.m3u8",
         "550",
@@ -68,11 +90,24 @@ def test_player_html_emits_server_and_error_messages():
                 "active": False,
             }
         ],
+        sources=sources,
+        subtitles=subtitles,
+        capabilities={"quality_from_api": True, "subtitles_from_api": True},
     )
     assert "OPLAY_EMBED_SERVER" in player
     assert "OPLAY_EMBED_ERROR" in player
     assert "OPLAY_EMBED_READY" in player
+    assert "OPLAY_EMBED_TRACKS" in player
+    assert "OPLAY_EMBED_QUALITY" in player
+    assert "OPLAY_EMBED_SUBTITLE" in player
     assert '"id": "vidcore"' in player
+    for control in ("server", "quality", "subtitle", "audio", "speed"):
+        assert f'id="{control}"' in player
+    assert '"language": "id"' in player
+    assert '"language": "en"' in player
+    assert "api_password" not in player
+    assert PLAYER_LANGUAGE_PRIORITY[0] == "id"
+    assert PLAYER_LANGUAGE_PRIORITY[5] == "en"
 
 
 def test_all_historical_embed_hosts_are_registered():
@@ -150,15 +185,30 @@ def test_factory_resolves_embed_host_case_insensitively(host: str):
 async def test_vidspark_flow():
     config = EMBED_HOSTS["VidCore"]
     extractor = GenericEmbedExtractor({}, config)
-    api_url = "https://vidspark.to/api/vidora/movie/550"
+    api_url = f"{VIDSPARK_API_BASE}/movie/550"
     destination = "https://paretocdn.site/hls2/x/master.m3u8?t=1"
+    hd_url = "https://paretocdn.site/hls2/x/1080.m3u8?t=1"
+    en_url = "https://paretocdn.site/subtitles/en.vtt"
+    id_url = "https://paretocdn.site/subtitles/id.vtt"
     embed_url = "https://vidcore.org/embed/movie/550?autoplay=true&lang=id&theme=FCC217"
     _mock_requests(
         extractor,
         {
             api_url: _response(
                 api_url,
-                text=f'{{"result":true,"sources":[{{"url":"{destination}"}}]}}',
+                text=json.dumps(
+                    {
+                        "result": True,
+                        "sources": [
+                            {"url": destination, "quality": "auto"},
+                            {"url": hd_url, "quality": "1080p"},
+                        ],
+                        "subtitles": [
+                            {"url": en_url, "label": "English"},
+                            {"url": id_url, "label": "Indonesian"},
+                        ],
+                    }
+                ),
             )
         },
     )
@@ -168,6 +218,45 @@ async def test_vidspark_flow():
     assert result["destination_url"] == destination
     assert result["mediaflow_endpoint"] == "hls_manifest_proxy"
     assert result["request_headers"]["Referer"] == "https://vidspark.to/"
+    assert [source["url"] for source in result["sources"]] == [destination, hd_url]
+    assert result["sources"][1]["label"] == "1080p"
+    assert [sub["language"] for sub in result["subtitles"]] == ["id", "en"]
+    assert [sub["url"] for sub in result["subtitles"]] == [id_url, en_url]
+    assert result["capabilities"]["quality_from_api"] is True
+    assert result["capabilities"]["subtitles_from_api"] is True
+
+
+@pytest.mark.asyncio
+async def test_vidspark_rejects_unsafe_subtitle_urls():
+    config = EMBED_HOSTS["VidCore"]
+    extractor = GenericEmbedExtractor({}, config)
+    api_url = f"{VIDSPARK_API_BASE}/movie/550"
+    destination = "https://paretocdn.site/hls2/x/master.m3u8?t=1"
+    embed_url = "https://vidcore.org/embed/movie/550"
+    _mock_requests(
+        extractor,
+        {
+            api_url: _response(
+                api_url,
+                text=json.dumps(
+                    {
+                        "result": True,
+                        "sources": [{"url": destination}],
+                        "subtitles": [
+                            {"url": "http://127.0.0.1/id.vtt", "label": "Indonesian"},
+                            {"url": "https://paretocdn.site/id.vtt", "label": "Indonesian"},
+                        ],
+                    }
+                ),
+            )
+        },
+    )
+
+    result = await extractor.extract(embed_url)
+
+    assert [sub["url"] for sub in result["subtitles"]] == [
+        "https://paretocdn.site/id.vtt"
+    ]
 
 
 @pytest.mark.asyncio

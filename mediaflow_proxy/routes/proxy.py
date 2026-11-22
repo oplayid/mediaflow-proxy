@@ -238,6 +238,7 @@ HLS_SEGMENT_MIME_TYPES = {
     "m4a": "audio/mp4",  # Audio-only fMP4 segment
     "m4v": "video/mp4",  # Video fMP4 segment (alternative)
     "aac": "audio/aac",  # AAC audio segment
+    "vtt": "text/vtt",  # WebVTT subtitle track
 }
 
 
@@ -258,6 +259,7 @@ async def hls_segment_proxy(
     - /hls/segment.mp4 - fMP4 segments (alternative)
     - /hls/segment.m4a - Audio fMP4 segments
     - /hls/segment.aac - AAC audio segments
+    - /hls/segment.vtt - WebVTT subtitle tracks
 
     Uses event-based coordination to prevent duplicate downloads between
     player requests and background prebuffering.
