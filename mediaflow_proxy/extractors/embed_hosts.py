@@ -23,7 +23,7 @@ FLOW_VIDSPARK = "vidspark_api"
 FLOW_VSEMBED = "vsembed_chain"
 FLOW_GENERIC = "generic_html"
 
-VIDSPARK_API_BASE = "https://vidspark.to/api/vidora"
+VIDSPARK_API_BASE = "https://vidspark.to/api/vidora/v1"
 VIDSPARK_PLAYER_KEY = "3a67e8866ae1d2bb9e81fe7f73315a56eb3bdf5e3e755c7554c8be6910aa6b13"
 
 
@@ -205,6 +205,14 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
         ),
     ]
 }
+
+# Order used by ``/embed/auto/...``. VidCore and VSEmbed are tried first;
+# the remaining historical hosts are kept as a last-resort fallback chain.
+AUTO_HOST_ORDER: Tuple[str, ...] = (
+    "VidCore",
+    "VSEmbed",
+    *tuple(name for name in EMBED_HOSTS if name not in ("VidCore", "VSEmbed")),
+)
 
 # Every lower-case spelling accepted as ``host`` / embed slug.
 HOST_ALIASES: Dict[str, str] = {}

@@ -114,20 +114,32 @@ This redirects to the proxied HLS manifest URL, and because the request URL cont
 
 ## StreamFlix iframe embed endpoints
 
-For StreamFlix, MediaFlow can replace the remote embed host entirely. The endpoints below return a small HTML player that speaks StreamFlix's existing `OPLAY_EMBED_*` postMessage contract, so StreamFlix only needs to point its four embed URL templates at MediaFlow:
+MediaFlow owns the iframe player, the embed-host registry, host selection, and failover. Streamflix only needs two URL templates and keeps its existing `OPLAY_EMBED_*` postMessage handling.
 
 | Endpoint | Description |
 |---|---|
-| `/embed/<slug>/movie/<tmdb_id>` | Movie player |
-| `/embed/<slug>/tv/<tmdb_id>/<season>/<episode>` | TV episode player |
+| `/embed/auto/movie/<tmdb_id>` | Movie player with automatic host selection |
+| `/embed/auto/tv/<tmdb_id>/<season>/<episode>` | TV episode player with automatic host selection |
+| `/embed/<slug>/movie/<tmdb_id>` | Force one host (for debugging) |
+| `/embed/<slug>/tv/<tmdb_id>/<season>/<episode>` | Force one host (for debugging) |
+| `/embed/servers` | JSON list of available servers and priorities |
 
-`<slug>` is any embed slug from the table above (`vsembed`, `vidcore`, ...). Add `?autoplay=true` to start muted autoplay.
+`auto` tries hosts in priority order — VidCore, VSEmbed, then the remaining historical hosts — and skips hosts that recently failed (5 minute negative cache). The generated player includes a small server switcher inside the iframe, so Streamflix does not need a server picker of its own.
 
 Examples:
 
 ```
-https://mfp.oplay.id/embed/vsembed/movie/550
-https://mfp.oplay.id/embed/vidcore/tv/1399/1/1?autoplay=true
+https://mfp.oplay.id/embed/auto/movie/550
+https://mfp.oplay.id/embed/auto/tv/1399/1/1?autoplay=true
+```
+
+Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route.
+
+In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:
+
+```js
+{ type: "OPLAY_EMBED_SERVER", id: "vidcore", name: "VidCore" }
+{ type: "OPLAY_EMBED_ERROR", message: "..." }
 ```
 
 These endpoints are intentionally public: they resolve the upstream stream and sign a short-lived MediaFlow proxy URL internally, so `api_password` is never exposed to the browser.

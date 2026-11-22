@@ -6,7 +6,9 @@ import pytest
 
 from mediaflow_proxy.extractors.base import HttpResponse
 from mediaflow_proxy.extractors.embed_hosts import (
+    AUTO_HOST_ORDER,
     EMBED_HOSTS,
+    VIDSPARK_API_BASE,
     build_embed_url,
     canonicalize_host,
     is_public_http_url,
@@ -38,6 +40,40 @@ def _mock_requests(extractor: GenericEmbedExtractor, responses: dict[str, HttpRe
 # ---------------------------------------------------------------------------
 # Registry / canonicalization
 # ---------------------------------------------------------------------------
+
+def test_vidspark_api_base_includes_v1():
+    assert VIDSPARK_API_BASE == "https://vidspark.to/api/vidora/v1"
+
+
+def test_auto_host_order_prefers_vidcore_and_includes_every_host():
+    assert AUTO_HOST_ORDER[0] == "VidCore"
+    assert AUTO_HOST_ORDER[1] == "VSEmbed"
+    assert set(AUTO_HOST_ORDER) == set(EMBED_HOSTS)
+    assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
+
+
+def test_player_html_emits_server_and_error_messages():
+    from mediaflow_proxy.routes.embed import _player_html
+
+    player = _player_html(
+        "https://mfp.example/proxy/playlist.m3u8",
+        "550",
+        True,
+        {"id": "vidcore", "name": "VidCore"},
+        [
+            {
+                "id": "auto",
+                "name": "Auto",
+                "url": "https://mfp.example/embed/auto/movie/550",
+                "active": False,
+            }
+        ],
+    )
+    assert "OPLAY_EMBED_SERVER" in player
+    assert "OPLAY_EMBED_ERROR" in player
+    assert "OPLAY_EMBED_READY" in player
+    assert '"id": "vidcore"' in player
+
 
 def test_all_historical_embed_hosts_are_registered():
     expected = {
