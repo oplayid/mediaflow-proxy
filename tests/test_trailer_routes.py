@@ -121,8 +121,22 @@ def test_banner_html_shows_poster_then_delayed_trailer():
     assert ">3000<" in page or ", 3000)" in page
     assert "/trailer/movie/550" in page
     assert 'target="_top"' in page
+    assert 'id="play"' in page
     assert "/embed/auto/movie/550?autoplay=true" in page
     assert "api_key" not in page
+
+
+def test_banner_router_registers_path_params_without_query_conflict():
+    """Regression: FastAPI rejects Query defaults for path params at import time."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(trailer_routes.banner_router, prefix="/banner")
+    paths = {route.path for route in app.routes}
+
+    assert "/banner/movie/{tmdb_id}" in paths
+    assert "/banner/tv/{tmdb_id}" in paths
+    assert "/banner/tv/{tmdb_id}/{season}/{episode}" in paths
 
 
 def test_banner_html_without_trailer_keeps_poster_clickable():
@@ -137,7 +151,7 @@ def test_banner_html_without_trailer_keeps_poster_clickable():
     assert "w1280/backdrop.jpg" in page
     assert "/trailer/" not in page
     assert "/embed/auto/tv/1399/1/1?autoplay=true" in page
-    assert "Klik untuk memutar penuh" in page
+    assert "Klik tombol putar untuk menonton penuh" in page
 
 
 @pytest.mark.asyncio

@@ -334,7 +334,13 @@ html,body{margin:0;height:100%;background:#111;overflow:hidden}
         background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.55))}
 #stage{position:absolute;inset:0;z-index:1}
 #stage iframe{border:0;width:100%;height:100%;display:block}
-#hit{position:absolute;inset:0;z-index:2;display:block}
+#hit{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;text-decoration:none}
+#play{width:64px;height:64px;border-radius:50%;background:rgba(0,0,0,.55);border:2px solid rgba(255,255,255,.9);
+      display:flex;align-items:center;justify-content:center;box-shadow:0 4px 18px rgba(0,0,0,.45);
+      transition:transform .15s,background .15s}
+#hit:hover #play{transform:scale(1.08);background:rgba(0,0,0,.78)}
+#play i{display:block;width:0;height:0;margin-left:5px;border-top:12px solid transparent;
+        border-bottom:12px solid transparent;border-left:20px solid #fff}
 #hint{position:absolute;left:12px;bottom:10px;z-index:2;color:#fff;pointer-events:none;
       font:12px/1.4 system-ui,-apple-system,Arial,sans-serif;text-shadow:0 1px 3px #000}
 </style>
@@ -342,8 +348,10 @@ html,body{margin:0;height:100%;background:#111;overflow:hidden}
 <body>
 <div id="poster"></div>
 <div id="stage"></div>
-<a id="hit" href="__MFP_TARGET__" target="_top" aria-label="Putar penuh"></a>
-<div id="hint">Klik untuk memutar penuh</div>
+<a id="hit" href="__MFP_TARGET__" target="_top" aria-label="Putar penuh">
+<div id="play"><i></i></div>
+</a>
+<div id="hint">Klik tombol putar untuk menonton penuh</div>
 <script>
 (function () {
   if (!__MFP_HAS_TRAILER__) return;
@@ -418,28 +426,30 @@ def banner_options(
     delay: int = Query(3000, ge=0, le=30000),
     autoplay_trailer: bool = Query(True),
     mute: bool = Query(True),
-    season: str = Query("1"),
-    episode: str = Query("1"),
 ) -> dict:
+    """Only query options live here; path params are supplied by each handler.
+
+    Declaring ``season``/``episode`` as Query in a shared dependency breaks
+    FastAPI route registration for ``/tv/{tmdb_id}/{season}/{episode}`` because
+    they are path params there (AssertionError at import time).
+    """
     return {
         "delay": delay,
         "autoplay_trailer": autoplay_trailer,
         "mute": mute,
-        "season": season,
-        "episode": episode,
     }
 
 
 @banner_router.get("/movie/{tmdb_id}", response_class=HTMLResponse)
 async def movie_banner(tmdb_id: str, options: dict = Depends(banner_options)):
     """Poster-first banner for a movie; click opens the full MediaFlow player."""
-    return await _render_banner("movie", tmdb_id, **options)
+    return await _render_banner("movie", tmdb_id, **options, season="1", episode="1")
 
 
 @banner_router.get("/tv/{tmdb_id}", response_class=HTMLResponse)
 async def tv_banner(tmdb_id: str, options: dict = Depends(banner_options)):
     """Poster-first banner for a show; click opens the full MediaFlow player."""
-    return await _render_banner("tv", tmdb_id, **options)
+    return await _render_banner("tv", tmdb_id, **options, season="1", episode="1")
 
 
 @banner_router.get("/tv/{tmdb_id}/{season}/{episode}", response_class=HTMLResponse)
@@ -450,5 +460,4 @@ async def tv_episode_banner(
     options: dict = Depends(banner_options),
 ):
     """TV banner variant carrying season/episode for the full-player target."""
-    options = {**options, "season": season, "episode": episode}
-    return await _render_banner("tv", tmdb_id, **options)
+    return await _render_banner("tv", tmdb_id, **options, season=season, episode=episode)
