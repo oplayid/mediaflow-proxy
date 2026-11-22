@@ -146,6 +146,18 @@ MediaFlow can also own trailer selection. Set `TMDB_API_KEY` (TMDB v3 key) on th
 
 Query parameters for the player pages: `autoplay` (default `true`), `mute` (default `true`, required for autoplay), `controls` (default `false`), `loop` (default `true`). MediaFlow picks a YouTube trailer from TMDB `/videos` with Indonesian first, English second; if none exists it renders a small "Trailer tidak tersedia" placeholder. The YouTube stream itself stays in the viewer's browser, so the gateway only performs a small cached TMDB JSON lookup.
 
+### Poster-first banner endpoints
+
+For a film detail page, Streamflix only needs one iframe — MediaFlow owns the whole banner experience:
+
+| Endpoint | Description |
+|---|---|
+| `/banner/movie/<tmdb_id>` | Poster → delayed muted trailer → click to full player |
+| `/banner/tv/<tmdb_id>` | Same for a show |
+| `/banner/tv/<tmdb_id>/<season>/<episode>` | Same, with a specific full-player target |
+
+Query parameters: `delay` in milliseconds (default `3000`), `autoplay_trailer` (default `true`), `mute` (default `true`), plus `season`/`episode` for TV. MediaFlow fetches the TMDB backdrop, shows it immediately, swaps in the trailer iframe after the delay, and places a transparent `target="_top"` link over the whole banner pointing at `/embed/auto/...` so a click opens the full player. No player logic, YouTube parsing, or host registry is needed in Streamflix.
+
 Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route.
 
 In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:

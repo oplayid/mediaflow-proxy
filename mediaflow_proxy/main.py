@@ -16,7 +16,7 @@ from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
 from mediaflow_proxy.routes.embed import embed_router
-from mediaflow_proxy.routes.trailer import trailer_router
+from mediaflow_proxy.routes.trailer import banner_router, trailer_router
 from mediaflow_proxy.routes.speedtest import speedtest_router
 from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
 from mediaflow_proxy.routes.xtream import xtream_root_router
@@ -322,6 +322,8 @@ app.include_router(embed_router, prefix="/embed", tags=["embed"])
 # Public trailer pages: MediaFlow selects the YouTube trailer from TMDB and
 # renders an iframe; no API password is needed in the browser.
 app.include_router(trailer_router, prefix="/trailer", tags=["trailer"])
+# Poster-first banner pages for StreamFlix: one iframe, no player wrapper.
+app.include_router(banner_router, prefix="/banner", tags=["banner"])
 app.include_router(speedtest_router, prefix="/speedtest", tags=["speedtest"], dependencies=[Depends(verify_api_key)])
 app.include_router(
     playlist_builder_router, prefix="/playlist", tags=["playlist"], dependencies=[Depends(verify_api_key)]
