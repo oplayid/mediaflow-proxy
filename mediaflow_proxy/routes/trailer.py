@@ -315,11 +315,14 @@ async def tv_episode_trailer(
 def _banner_html(
     poster: str,
     trailer_src: str | None,
-    target: str,
     title: str,
     delay: int,
 ) -> HTMLResponse:
-    """Poster-first banner that swaps in a muted trailer after a short delay."""
+    """Poster-first banner that swaps in a muted trailer after a short delay.
+
+    The banner is purely visual: StreamFlix owns the Play button and all
+    navigation, so no clickable overlay or player controls live here.
+    """
     template = """<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -333,25 +336,12 @@ html,body{margin:0;height:100%;background:#111;overflow:hidden}
 #poster:after{content:"";position:absolute;inset:0;
         background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.55))}
 #stage{position:absolute;inset:0;z-index:1}
-#stage iframe{border:0;width:100%;height:100%;display:block}
-#hit{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;text-decoration:none}
-#play{width:64px;height:64px;border-radius:50%;background:rgba(0,0,0,.55);border:2px solid rgba(255,255,255,.9);
-      display:flex;align-items:center;justify-content:center;box-shadow:0 4px 18px rgba(0,0,0,.45);
-      transition:transform .15s,background .15s}
-#hit:hover #play{transform:scale(1.08);background:rgba(0,0,0,.78)}
-#play i{display:block;width:0;height:0;margin-left:5px;border-top:12px solid transparent;
-        border-bottom:12px solid transparent;border-left:20px solid #fff}
-#hint{position:absolute;left:12px;bottom:10px;z-index:2;color:#fff;pointer-events:none;
-      font:12px/1.4 system-ui,-apple-system,Arial,sans-serif;text-shadow:0 1px 3px #000}
+#stage iframe{border:0;width:100%;height:100%;display:block;pointer-events:none}
 </style>
 </head>
 <body>
 <div id="poster"></div>
 <div id="stage"></div>
-<a id="hit" href="__MFP_TARGET__" target="_top" aria-label="Putar penuh">
-<div id="play"><i></i></div>
-</a>
-<div id="hint">Klik tombol putar untuk menonton penuh</div>
 <script>
 (function () {
   if (!__MFP_HAS_TRAILER__) return;
@@ -371,7 +361,6 @@ html,body{margin:0;height:100%;background:#111;overflow:hidden}
     replacements = {
         "__MFP_TITLE__": html.escape(title or "Banner", quote=True),
         "__MFP_POSTER__": json.dumps(poster) if poster else '""',
-        "__MFP_TARGET__": html.escape(target, quote=True),
         "__MFP_HAS_TRAILER__": "true" if trailer_src else "false",
         "__MFP_TRAILER_SRC__": json.dumps(trailer_src or ""),
         "__MFP_DELAY__": str(max(0, delay)),
@@ -388,8 +377,6 @@ async def _render_banner(
     delay: int,
     autoplay_trailer: bool,
     mute: bool,
-    season: str,
-    episode: str,
 ) -> HTMLResponse:
     _validate(media_type, tmdb_id)
     trailer, detail = await asyncio.gather(
@@ -407,16 +394,10 @@ async def _render_banner(
         }
         trailer_src = f"/trailer/{media_type}/{tmdb_id}?{urlencode(params)}"
 
-    if media_type == "tv":
-        target = f"/embed/auto/tv/{tmdb_id}/{season}/{episode}?autoplay=true"
-    else:
-        target = f"/embed/auto/movie/{tmdb_id}?autoplay=true"
-
     title = detail.get("title") or f"Banner {tmdb_id}"
     return _banner_html(
         detail.get("backdrop") or "",
         trailer_src,
-        target,
         title,
         delay,
     )
@@ -442,14 +423,14 @@ def banner_options(
 
 @banner_router.get("/movie/{tmdb_id}", response_class=HTMLResponse)
 async def movie_banner(tmdb_id: str, options: dict = Depends(banner_options)):
-    """Poster-first banner for a movie; click opens the full MediaFlow player."""
-    return await _render_banner("movie", tmdb_id, **options, season="1", episode="1")
+    """Poster-first, click-through-free movie banner for StreamFlix."""
+    return await _render_banner("movie", tmdb_id, **options)
 
 
 @banner_router.get("/tv/{tmdb_id}", response_class=HTMLResponse)
 async def tv_banner(tmdb_id: str, options: dict = Depends(banner_options)):
-    """Poster-first banner for a show; click opens the full MediaFlow player."""
-    return await _render_banner("tv", tmdb_id, **options, season="1", episode="1")
+    """Poster-first, click-through-free show banner for StreamFlix."""
+    return await _render_banner("tv", tmdb_id, **options)
 
 
 @banner_router.get("/tv/{tmdb_id}/{season}/{episode}", response_class=HTMLResponse)
@@ -459,5 +440,5 @@ async def tv_episode_banner(
     episode: str,
     options: dict = Depends(banner_options),
 ):
-    """TV banner variant carrying season/episode for the full-player target."""
-    return await _render_banner("tv", tmdb_id, **options, season=season, episode=episode)
+    """TV URL variant kept for symmetry; navigation stays in StreamFlix."""
+    return await _render_banner("tv", tmdb_id, **options)

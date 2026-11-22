@@ -107,6 +107,9 @@ def test_player_html_emits_server_track_controls_and_error_messages():
     assert '"language": "en"' in player
     assert "api_password" not in player
     assert PLAYER_LANGUAGE_PRIORITY[0] == "id"
+    # MediaFlow controls sit below the video, never over StreamFlix's top header.
+    assert "bottom:52px" in player
+    assert "top:6px" not in player
     assert PLAYER_LANGUAGE_PRIORITY[5] == "en"
 
 

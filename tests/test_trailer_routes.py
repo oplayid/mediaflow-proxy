@@ -107,11 +107,10 @@ async def _async_result(value):
     return value
 
 
-def test_banner_html_shows_poster_then_delayed_trailer():
+def test_banner_html_shows_poster_then_delayed_trailer_without_controls():
     page = trailer_routes._banner_html(
         "https://image.tmdb.org/t/p/w1280/backdrop.jpg",
         "/trailer/movie/550?autoplay=1&mute=1&controls=0&loop=1",
-        "/embed/auto/movie/550?autoplay=true",
         "Fight Club",
         3000,
     ).body.decode()
@@ -120,9 +119,10 @@ def test_banner_html_shows_poster_then_delayed_trailer():
     assert "setTimeout" in page
     assert ">3000<" in page or ", 3000)" in page
     assert "/trailer/movie/550" in page
-    assert 'target="_top"' in page
-    assert 'id="play"' in page
-    assert "/embed/auto/movie/550?autoplay=true" in page
+    assert "pointer-events:none" in page
+    assert 'target="_top"' not in page
+    assert 'id="play"' not in page
+    assert "/embed/auto/" not in page
     assert "api_key" not in page
 
 
@@ -139,19 +139,18 @@ def test_banner_router_registers_path_params_without_query_conflict():
     assert "/banner/tv/{tmdb_id}/{season}/{episode}" in paths
 
 
-def test_banner_html_without_trailer_keeps_poster_clickable():
+def test_banner_html_without_trailer_shows_poster_only():
     page = trailer_routes._banner_html(
         "https://image.tmdb.org/t/p/w1280/backdrop.jpg",
         None,
-        "/embed/auto/tv/1399/1/1?autoplay=true",
         "Game of Thrones",
         3000,
     ).body.decode()
 
     assert "w1280/backdrop.jpg" in page
     assert "/trailer/" not in page
-    assert "/embed/auto/tv/1399/1/1?autoplay=true" in page
-    assert "Klik tombol putar untuk menonton penuh" in page
+    assert "/embed/auto/" not in page
+    assert "Klik" not in page
 
 
 @pytest.mark.asyncio
@@ -179,8 +178,6 @@ async def test_render_banner_uses_trailer_and_tmdb_backdrop(monkeypatch):
         delay=2500,
         autoplay_trailer=True,
         mute=True,
-        season="1",
-        episode="1",
     )
     body = response.body.decode()
 

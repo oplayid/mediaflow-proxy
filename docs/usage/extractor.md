@@ -152,11 +152,13 @@ For a film detail page, Streamflix only needs one iframe — MediaFlow owns the 
 
 | Endpoint | Description |
 |---|---|
-| `/banner/movie/<tmdb_id>` | Poster → delayed muted trailer → click to full player |
+| `/banner/movie/<tmdb_id>` | Poster → delayed muted trailer |
 | `/banner/tv/<tmdb_id>` | Same for a show |
-| `/banner/tv/<tmdb_id>/<season>/<episode>` | Same, with a specific full-player target |
+| `/banner/tv/<tmdb_id>/<season>/<episode>` | Same URL shape, for route symmetry |
 
-Query parameters: `delay` in milliseconds (default `3000`), `autoplay_trailer` (default `true`), `mute` (default `true`). The TV episode variant carries `season`/`episode` in the **path**, not the query string. MediaFlow fetches the TMDB backdrop, shows it immediately, swaps in the trailer iframe after the delay, and overlays a visible Play button inside a full-area `target="_top"` link pointing at `/embed/auto/...`, so a click navigates the whole page to the full player. No player logic, YouTube parsing, or host registry is needed in Streamflix.
+Query parameters: `delay` in milliseconds (default `3000`), `autoplay_trailer` (default `true`), `mute` (default `true`). MediaFlow fetches the TMDB backdrop, shows it immediately, and swaps in a muted trailer iframe after the delay. The banner is **purely visual and click-through-free**: it has no Play button and no navigation overlay, because StreamFlix's own Play button is the only entry point to `/watch/...`. No player logic, YouTube parsing, or host registry is needed in Streamflix.
+
+The embed player keeps its controls inside the iframe, positioned at the bottom so they never overlap StreamFlix's top navigation/player header.
 
 Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route.
 

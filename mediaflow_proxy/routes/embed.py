@@ -172,8 +172,8 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden}
 video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
 #err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
       color:#bbb;font:14px/1.5 system-ui,-apple-system,Arial,sans-serif;text-align:center;padding:24px}
-#panel{position:absolute;top:6px;right:6px;z-index:2;display:flex;flex-direction:column;
-       gap:4px;align-items:flex-end;max-width:60%}
+#panel{position:absolute;bottom:52px;right:8px;z-index:2;display:flex;flex-direction:row;
+       flex-wrap:wrap;gap:4px;align-items:center;justify-content:flex-end;max-width:calc(100% - 16px)}
 #panel select{max-width:190px;color:#fff;background:rgba(0,0,0,.68);
        border:1px solid rgba(255,255,255,.25);border-radius:6px;
        font:12px/1.4 system-ui,-apple-system,Arial,sans-serif;padding:4px 6px}
