@@ -1,3 +1,5 @@
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 from starlette.datastructures import URL
 
@@ -50,3 +52,44 @@ async def test_proxy_url_keeps_force_playlist_proxy_for_nested_playlists():
 
     assert "force_playlist_proxy=1" in playlist_url
     assert "force_playlist_proxy=1" not in segment_url
+
+
+@pytest.mark.asyncio
+async def test_proxy_url_inherits_upstream_token_for_same_host_children():
+    request = DummyRequest({"api_password": "devpass"})
+    processor = M3U8Processor(request)
+    base_url = "https://pool.example/pl/master?token=playback-token"
+
+    variant_url = await processor.proxy_url(
+        "https://pool.example/pl/master/variant.m3u8",
+        base_url,
+        use_full_url=True,
+        is_playlist=True,
+    )
+    segment_url = await processor.proxy_url(
+        "/content/hash/page-0.ts",
+        "https://pool.example/pl/master/variant.m3u8?token=playback-token",
+        is_playlist=False,
+    )
+
+    assert parse_qs(urlparse(variant_url).query)["d"] == [
+        "https://pool.example/pl/master/variant.m3u8?token=playback-token"
+    ]
+    assert parse_qs(urlparse(segment_url).query)["d"] == [
+        "https://pool.example/content/hash/page-0.ts?token=playback-token"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_proxy_url_does_not_leak_upstream_token_to_other_hosts():
+    request = DummyRequest({"api_password": "devpass"})
+    processor = M3U8Processor(request)
+
+    url = await processor.proxy_url(
+        "https://ads.example/segment.ts",
+        "https://pool.example/pl/master?token=playback-token",
+        use_full_url=True,
+        is_playlist=False,
+    )
+
+    assert parse_qs(urlparse(url).query)["d"] == ["https://ads.example/segment.ts"]

@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 # Flow identifiers used by GenericEmbedExtractor.
 FLOW_VIDSPARK = "vidspark_api"
 FLOW_VSEMBED = "vsembed_chain"
+FLOW_VIDLINK = "vidlink_api"
 FLOW_GENERIC = "generic_html"
 
 VIDSPARK_API_BASE = "https://vidspark.to/api/vidora/v1"
@@ -37,6 +38,8 @@ class EmbedHostConfig:
     movie_url: str
     tv_url: str
     flow: str = FLOW_GENERIC
+    # Optional template for anime players that use `/anime/{id}/{episode}/{variant}`.
+    anime_url: Optional[str] = None
     api_base: Optional[str] = None
     api_headers: Dict[str, str] = field(default_factory=dict)
     endpoint: str = "hls_manifest_proxy"
@@ -99,6 +102,17 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
             quality_from_api=True,
             subtitles_from_api=True,
             audio_from_api=True,
+        ),
+        _cfg(
+            "VidLink",
+            "vidlink",
+            ("vidlink.pro", "www.vidlink.pro"),
+            "https://vidlink.pro/movie/{id}",
+            "https://vidlink.pro/tv/{id}/{season}/{episode}",
+            anime_url="https://vidlink.pro/anime/{id}/{episode}/{variant}",
+            flow=FLOW_VIDLINK,
+            # VidLink's playback API returns direct MP4 files, not HLS playlists.
+            endpoint="proxy_stream_endpoint",
         ),
         _cfg(
             "VidKing",
@@ -249,26 +263,62 @@ def build_embed_url(
     media_id: str,
     season: Optional[int | str] = None,
     episode: Optional[int | str] = None,
+    variant: Optional[str] = None,
 ) -> str:
-    """Build the original embed URL from TMDB id and optional season/episode."""
-    template = config.tv_url if media_type == "tv" else config.movie_url
+    """Build the original embed URL from TMDB id and optional season/episode.
+
+    Anime URLs use ``config.anime_url`` and a ``sub``/``dub`` variant. When a
+    host has no anime template, ``anime`` falls back to its movie template.
+    """
+    if media_type == "anime":
+        template = config.anime_url or config.movie_url
+    else:
+        template = config.tv_url if media_type == "tv" else config.movie_url
     return (
         template.replace("{id}", str(media_id))
         .replace("{season}", str(season or 1))
         .replace("{episode}", str(episode or 1))
+        .replace("{variant}", str(variant or "sub"))
     )
 
 
+ANIME_VARIANTS = ("sub", "dub")
+
+
+def anime_variant_candidates(variant: Optional[str]) -> Tuple[str, ...]:
+    """Return the requested anime variant first, then the alternative.
+
+    VidLink exposes both ``/anime/{id}/{episode}/sub`` and ``/dub``. When one
+    variant is unavailable the gateway can try the other automatically.
+    """
+    requested = (variant or "sub").strip().lower()
+    if requested not in ANIME_VARIANTS:
+        requested = "sub"
+    fallback = "dub" if requested == "sub" else "sub"
+    return (requested, fallback)
+
+
 _MEDIA_PATH_RE = re.compile(r"/(movie|tv)/(\d+)(?:/(\d+)/(\d+))?")
+_ANIME_PATH_RE = re.compile(r"/anime/(\d+)/(\d+)(?:/(sub|dub))?", re.I)
 
 
-def parse_media_path(url: str) -> Tuple[str, str, Optional[str], Optional[str]]:
-    """Extract (type, tmdb_id, season, episode) from an embed URL path."""
-    match = _MEDIA_PATH_RE.search(urlparse(url).path)
+def parse_media_path(url: str) -> Tuple[str, str, Optional[str], Optional[str], Optional[str]]:
+    """Extract (type, id, season, episode, anime_variant) from an embed URL path.
+
+    Anime paths (``/anime/{id}/{episode}/sub|dub``) are mapped to media type
+    ``anime`` with ``episode`` populated and ``season`` left as ``None``.
+    """
+    path = urlparse(url).path
+    anime = _ANIME_PATH_RE.search(path)
+    if anime:
+        anime_id, episode, variant = anime.groups()
+        return "anime", anime_id, None, episode, (variant or "sub").lower()
+
+    match = _MEDIA_PATH_RE.search(path)
     if not match:
         raise ValueError(f"Cannot determine media type/id from URL: {url}")
     media_type, media_id, season, episode = match.groups()
-    return media_type, media_id, season, episode
+    return media_type, media_id, season, episode, None
 
 
 def is_public_http_url(url: str) -> bool:

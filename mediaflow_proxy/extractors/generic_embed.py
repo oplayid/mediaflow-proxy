@@ -6,13 +6,16 @@ import json
 import logging
 import re
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
 from mediaflow_proxy.extractors.embed_hosts import (
+    FLOW_VIDLINK,
     FLOW_VIDSPARK,
     FLOW_VSEMBED,
     EmbedHostConfig,
+    anime_variant_candidates,
+    build_embed_url,
     is_public_http_url,
     parse_media_path,
 )
@@ -238,12 +241,38 @@ def _set_query_param(url: str, key: str, value: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+def _parse_stream_token(text: str) -> str | None:
+    """Read the per-host playback token returned by /generate.php."""
+    value = (text or "").strip()
+    if not value:
+        return None
+    if value.startswith(("{", "[")):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, str):
+            value = payload
+        elif isinstance(payload, dict):
+            value = str(
+                payload.get("token")
+                or payload.get("data")
+                or payload.get("string")
+                or payload.get("result")
+                or ""
+            )
+        else:
+            return None
+    return value.strip() or None
+
+
 class GenericEmbedExtractor(BaseExtractor):
     """One extractor for every host declared in ``embed_hosts.py``.
 
     The concrete upstream strategy is selected by ``config.flow``:
       * ``vidspark_api`` — VidCore iframe -> VidSpark JSON API
       * ``vsembed_chain`` — VSEmbed gate -> player -> stream API
+      * ``vidlink_api`` — VidLink embed -> signed playback API (anime sub/dub)
       * ``generic_html`` — follow iframes and look for a direct playlist URL
     """
 
@@ -294,6 +323,44 @@ class GenericEmbedExtractor(BaseExtractor):
             logger.debug("[%s] browser probe failed for %s: %s", self.config.canonical, url, exc)
         return None
 
+    async def _tokenize_cast_playlist(
+        self, cast_url: str, api_token: str | None, referer: str
+    ) -> str | None:
+        """Convert a cast `/plc/` URL into a token-stamped `/pl/` playlist.
+
+        The stream host mints a per-host `token` at /generate.php. The player
+        stamps it on every master/segment request; without it Cloudflare serves
+        an interactive challenge instead of the manifest.
+        """
+        candidate = filter_candidate_url(
+            str(cast_url).replace("/plc/", "/pl/"), referer, self._ad_report
+        )
+        if not candidate or not api_token:
+            return candidate
+
+        parsed = urlparse(candidate)
+        token_url = f"{parsed.scheme}://{parsed.netloc}/generate.php?api_token={quote(api_token)}"
+        try:
+            response = await self._make_request(
+                url=token_url,
+                headers={"Referer": referer, "Accept": "text/plain"},
+                retries=1,
+                timeout=8,
+                raise_on_status=False,
+            )
+            token = _parse_stream_token(response.text)
+            if token:
+                separator = "&" if "?" in candidate else "?"
+                candidate = f"{candidate}{separator}token={quote(token)}"
+        except Exception as exc:
+            logger.debug(
+                "[%s] stream token lookup failed for %s: %s",
+                self.config.canonical,
+                token_url,
+                exc,
+            )
+        return candidate
+
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         if not is_public_http_url(url):
             raise ExtractorError(f"{self.config.canonical}: unsafe destination URL")
@@ -309,6 +376,8 @@ class GenericEmbedExtractor(BaseExtractor):
             result = await self._extract_vidspark(url)
         elif self.config.flow == FLOW_VSEMBED:
             result = await self._extract_vsembed(url)
+        elif self.config.flow == FLOW_VIDLINK:
+            result = await self._extract_vidlink(url)
         else:
             result = await self._extract_generic(url)
         return filter_extractor_result(result, self._ad_report)
@@ -368,7 +437,7 @@ class GenericEmbedExtractor(BaseExtractor):
     # VidCore -> VidSpark
     # ------------------------------------------------------------------
     async def _extract_vidspark(self, url: str) -> Dict[str, Any]:
-        media_type, media_id, season, episode = parse_media_path(url)
+        media_type, media_id, season, episode, _variant = parse_media_path(url)
         season = season or "1"
         episode = episode or "1"
 
@@ -438,9 +507,14 @@ class GenericEmbedExtractor(BaseExtractor):
     async def _extract_vsembed(self, url: str) -> Dict[str, Any]:
         parsed = urlparse(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        media_type, media_id, _season, _episode = parse_media_path(url)
+        media_type, media_id, season, episode, _variant = parse_media_path(url)
 
+        # TV gates must be episode-bound. Without season/episode the token's
+        # `fid` is only `tv:<id>` and the stream API keeps serving S01E01 for
+        # every requested episode.
         gate_url = f"{origin}/vs_src.php?type={media_type}&id={media_id}"
+        if media_type == "tv":
+            gate_url += f"&season={season or '1'}&episode={episode or '1'}"
         gate = await self._make_request(
             url=gate_url,
             headers={"Referer": url, "Accept": "application/json"},
@@ -473,12 +547,15 @@ class GenericEmbedExtractor(BaseExtractor):
         if not api_url or not api_token:
             raise ExtractorError(f"{self.config.canonical}: stream API config missing")
 
-        # The stream API only returns decrypted/cast URLs when the bare
-        # `stream_urls` flag is present. keep_blank_values in _set_query_param
-        # preserves it; do not add season/episode because the token is already
-        # bound to the requested media identity.
+        # The player's apiFor(s, e) appends `season`/`episode` plus the bare
+        # `stream_urls` flag. keep_blank_values in _set_query_param preserves
+        # the flag. `s`/`e` are not valid here and yield `403 invalid api token`
+        # with an episode-bound token.
         if player_cfg.get("streamBase"):
             api_url = _set_query_param(api_url, "stream_urls", "")
+            if media_type == "tv":
+                api_url = _set_query_param(api_url, "season", season or "1")
+                api_url = _set_query_param(api_url, "episode", episode or "1")
 
         # The player first reads metadata to learn which pool host serves the
         # stream_urls API for this request. Mirror that before calling the API.
@@ -524,13 +601,14 @@ class GenericEmbedExtractor(BaseExtractor):
                 None,
             )
 
-        # Encrypted responses carry plaintext cast URLs. The public /pl/ route
-        # is often playable without the cast token; when it is behind a bot
-        # challenge, retry in the isolated browser-fingerprint sandbox.
+        # Encrypted responses carry plaintext cast URLs. Trade the API token
+        # for a per-host playback token at /generate.php and stamp it onto the
+        # /pl/ manifest. Only if that still returns a challenge do we fall back
+        # to the isolated browser-fingerprint probe.
         if not destination and cast_urls:
             for cast_url in cast_urls:
-                candidate = filter_candidate_url(
-                    str(cast_url).replace("/plc/", "/pl/"), player_url, self._ad_report
+                candidate = await self._tokenize_cast_playlist(
+                    str(cast_url), api_token, player_url
                 )
                 if not candidate:
                     continue
@@ -555,8 +633,8 @@ class GenericEmbedExtractor(BaseExtractor):
         if not destination:
             if isinstance(stream_urls, str) or cast_urls:
                 raise ExtractorError(
-                    f"{self.config.canonical}: stream URLs are WASM-encrypted and no plaintext "
-                    "cast playlist was available"
+                    f"{self.config.canonical}: stream URLs are WASM-encrypted and no playable "
+                    "tokenized cast playlist was available"
                 )
             raise ExtractorError(f"{self.config.canonical}: no playable source returned")
 
@@ -566,6 +644,155 @@ class GenericEmbedExtractor(BaseExtractor):
         if browser_used:
             result["sandbox_used"] = True
         return result
+
+    # ------------------------------------------------------------------
+    # VidLink signed playback API
+    # ------------------------------------------------------------------
+    def _vidlink_sources_from_payload(self, payload: dict, api_url: str) -> list:
+        """Collect candidate stream URLs from a VidLink playback response.
+
+        VidLink returns ``stream.qualities`` as an object keyed by resolution
+        with ``url``/``headers`` per entry (direct MP4 files). Older payloads
+        expose a single ``stream.url`` or a ``sources`` list instead.
+        """
+        stream = payload.get("stream") if isinstance(payload, dict) else None
+        candidates: list = []
+        if isinstance(stream, dict):
+            qualities = stream.get("qualities")
+            if isinstance(qualities, dict):
+                for label, item in qualities.items():
+                    if isinstance(item, dict):
+                        merged = dict(item)
+                        merged.setdefault("label", label)
+                        candidates.append(merged)
+                    elif isinstance(item, str):
+                        candidates.append({"url": item, "label": label})
+            elif isinstance(qualities, list):
+                candidates.extend(qualities)
+            for key in ("url", "src", "file"):
+                if stream.get(key):
+                    candidates.append({"url": stream[key], "label": "Auto"})
+        for key in ("sources", "stream_urls"):
+            value = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(value, list):
+                candidates.extend(value)
+            elif isinstance(value, dict):
+                candidates.extend(value.values())
+
+        cleaned: list = []
+        seen: set[str] = set()
+        for item in candidates:
+            raw = item if isinstance(item, dict) else {"url": item}
+            url = raw.get("url") or raw.get("src") or raw.get("file")
+            if not isinstance(url, str):
+                continue
+            candidate = filter_candidate_url(urljoin(api_url, url), api_url, self._ad_report)
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                cleaned.append((candidate, raw))
+        return cleaned
+
+    async def _extract_vidlink(self, url: str) -> Dict[str, Any]:
+        """Resolve a VidLink embed URL to a signed, ad-filtered stream.
+
+        VidLink's ``/api/b/`` endpoint expects a per-title token minted in the
+        browser by an Adcash WASM module. The token is accepted as the
+        ``adv_token`` query parameter on the embed URL; if it is missing the
+        flow reports ``content_unavailable`` so the gateway can fall back.
+
+        Anime pages expose both ``/sub`` and ``/dub`` variants. Each variant is
+        tried in order (requested first, then the alternative) so a missing
+        dub/sub track falls back automatically.
+        """
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        api_token = query.get("adv_token")
+        media_type, media_id, season, episode, variant = parse_media_path(url)
+
+        if media_type == "anime":
+            for candidate_variant in anime_variant_candidates(variant):
+                candidate_url = build_embed_url(
+                    self.config, "anime", media_id, episode=episode, variant=candidate_variant
+                )
+                try:
+                    page = await self._make_request(
+                        url=candidate_url,
+                        headers={"Referer": f"{parsed.scheme}://{parsed.netloc}/", "Accept": "text/html"},
+                        raise_on_status=False,
+                        retries=1,
+                    )
+                    html = sanitize_html(page.text, candidate_url, self._ad_report)
+                    for pattern in _M3U8_PATTERNS:
+                        for match in re.finditer(pattern, html, re.I | re.S):
+                            destination = filter_candidate_url(
+                                urljoin(candidate_url, match.group(1)), candidate_url, self._ad_report
+                            )
+                            if destination:
+                                logger.info(
+                                    "[%s] resolved anime %s/%s (%s) -> %s",
+                                    self.config.canonical,
+                                    media_id,
+                                    episode,
+                                    candidate_variant,
+                                    destination,
+                                )
+                                return self._result(destination, candidate_url)
+                except ExtractorError:
+                    pass
+            raise ExtractorError(
+                f"{self.config.canonical}: content_unavailable: no playable sub/dub stream"
+            )
+
+        if not api_token:
+            raise ExtractorError(
+                f"{self.config.canonical}: content_unavailable: missing adv_token for playback"
+            )
+
+        api_base = f"{parsed.scheme}://{parsed.netloc}/api/b"
+        if media_type == "tv":
+            api_url = f"{api_base}/tv/{api_token}/{season or '1'}/{episode or '1'}?multiLang=0"
+        else:
+            api_url = f"{api_base}/movie/{api_token}?multiLang=0"
+
+        response = await self._make_request(
+            url=api_url,
+            headers={
+                "Referer": url,
+                "Accept": "application/json",
+                "X-Playback-Environment": "standard",
+            },
+        )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise ExtractorError(f"{self.config.canonical}: invalid playback API response") from exc
+        if not isinstance(payload, dict) or not payload.get("stream"):
+            raise ExtractorError(
+                f"{self.config.canonical}: content_unavailable: playback API returned no stream"
+            )
+
+        cleaned = self._vidlink_sources_from_payload(payload, api_url)
+        if not cleaned:
+            raise ExtractorError(
+                f"{self.config.canonical}: stream_unavailable: no playable source returned"
+            )
+
+        destination = cleaned[0][0]
+        stream = payload.get("stream") or {}
+        subtitles = stream.get("captions") if isinstance(stream, dict) else None
+        logger.info(
+            "[%s] resolved %s -> %s (%s sources)",
+            self.config.canonical,
+            url,
+            destination,
+            len(cleaned),
+        )
+        return self._result(
+            destination,
+            url,
+            sources=[raw for _url, raw in cleaned],
+            subtitles=subtitles,
+        )
 
     # ------------------------------------------------------------------
     # Generic HTML / iframe hosts

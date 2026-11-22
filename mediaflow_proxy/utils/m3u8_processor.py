@@ -990,6 +990,36 @@ class M3U8Processor:
                     segment_urls.append(parse.urljoin(base_url, line))
         return segment_urls
 
+    @staticmethod
+    def _inherit_upstream_token(full_url: str, base_url: str) -> str:
+        """Carry an upstream auth `token` onto same-host child playlist URLs.
+
+        Some hosts (notably VSEmbed's `/pl/` playlists) stamp a token on the
+        manifest URL and require it on every variant/segment request. HLS URIs
+        are often absolute paths, so ``urljoin`` drops the parent query string.
+        Only same-origin children inherit it, to avoid leaking the token to an
+        unrelated host referenced by the manifest.
+        """
+        base_parts = parse.urlparse(base_url)
+        child_parts = parse.urlparse(full_url)
+        if (
+            not base_parts.netloc
+            or (base_parts.scheme, base_parts.netloc)
+            != (child_parts.scheme, child_parts.netloc)
+        ):
+            return full_url
+
+        base_query = parse.parse_qs(base_parts.query, keep_blank_values=True)
+        token = base_query.get("token", [None])[0]
+        if not token:
+            return full_url
+
+        child_query = parse.parse_qs(child_parts.query, keep_blank_values=True)
+        if "token" in child_query:
+            return full_url
+        child_query["token"] = [token]
+        return child_parts._replace(query=parse.urlencode(child_query, doseq=True)).geturl()
+
     async def proxy_url(
         self,
         url: str,
@@ -1015,6 +1045,7 @@ class M3U8Processor:
             full_url = url
         else:
             full_url = parse.urljoin(base_url, url)
+        full_url = self._inherit_upstream_token(full_url, base_url)
 
         query_params = dict(self.request.query_params)
         has_encrypted = query_params.pop("has_encrypted", False)
