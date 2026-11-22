@@ -170,7 +170,7 @@ async def test_extraction_failure_falls_back_to_gateway_player(monkeypatch):
     monkeypatch.setattr(embed_routes, "_probe_config", fail_probe)
     monkeypatch.setattr(relay_routes, "_pick_auto_config", _vidcore)
 
-    request = _request("/embed/auto/tv/94997/1/1", "autoplay=true")
+    request = _request("/embed/auto/tv/94997/1/1", "mode=standard&autoplay=true")
     response = await embed_routes._serve(request, "auto", "tv", "94997", "1", "1")
 
     assert response.status_code == 200

@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -46,6 +46,10 @@ PROBE_TIMEOUT = 6.0
 AUTO_TOTAL_TIMEOUT = 15.0
 AUTO_FIRST_WAVE = 2
 NEGATIVE_CACHE_TTL = 60.0
+# Direct mode resolves the provider once, then serves the stream entirely from
+# MediaFlow. The resolved URL/headers/subtitles are cached for at most 6 hours
+# (or less when the upstream URL advertises its own expiry).
+RESOLVE_CACHE_TTL = 6 * 60 * 60.0
 # Indonesian first, English as the fallback. Everything else is only offered
 # when the user explicitly selects it.
 PLAYER_LANGUAGE_PRIORITY = [
@@ -63,6 +67,8 @@ PLAYER_LANGUAGE_PRIORITY = [
 
 # (host, media_type, media_id, season, episode) -> monotonic expiry.
 _negative_cache: dict[tuple[str, str, str, str, str], float] = {}
+# Same key -> {"result": extractor result, "expires_at": monotonic expiry}.
+_resolved_cache: dict[tuple[str, str, str, str, str], dict] = {}
 _cache_lock = asyncio.Lock()
 
 
@@ -98,11 +104,77 @@ async def _cache_failure(key: tuple[str, str, str, str, str]) -> None:
 
 
 async def _clear_failures(media_type: str, media_id: str, season: str | None, episode: str | None) -> None:
-    """Used by ``?retry=1`` so an explicit retry probes every host again."""
+    """Used by ``?retry=1`` so an explicit retry resolves every host again."""
     suffix = (media_type, media_id, season or "", episode or "")
     async with _cache_lock:
         for key in [k for k in _negative_cache if k[1:] == suffix]:
             _negative_cache.pop(key, None)
+        for key in [k for k in _resolved_cache if k[1:] == suffix]:
+            _resolved_cache.pop(key, None)
+
+
+def _upstream_ttl(result: dict) -> float:
+    """Use the upstream URL's own expiry when it is shorter than our cap."""
+    params = parse_qs(urlparse(result.get("destination_url") or "").query)
+    now = time.time()
+    for name in ("expires", "exp", "e"):
+        values = params.get(name) or []
+        if not values:
+            continue
+        try:
+            raw = float(values[0])
+        except (TypeError, ValueError):
+            continue
+        if raw > 1_000_000_000:
+            remaining = raw - now
+        else:
+            start = None
+            for start_name in ("s", "start", "iat"):
+                candidate = params.get(start_name) or []
+                if not candidate:
+                    continue
+                try:
+                    value = float(candidate[0])
+                except (TypeError, ValueError):
+                    continue
+                if value > 1_000_000_000:
+                    start = value
+                    break
+            remaining = (start + raw - now) if start else raw
+        if 0 < remaining < RESOLVE_CACHE_TTL:
+            # Re-resolve slightly before the upstream URL actually dies.
+            return max(min(remaining - 30, RESOLVE_CACHE_TTL), 60.0)
+    return RESOLVE_CACHE_TTL
+
+
+async def _cache_get(key: tuple[str, str, str, str, str]) -> dict | None:
+    """Return a cached extractor result that is still valid."""
+    now = time.monotonic()
+    async with _cache_lock:
+        entry = _resolved_cache.get(key)
+        if not entry:
+            return None
+        if entry["expires_at"] <= now:
+            _resolved_cache.pop(key, None)
+            return None
+        return entry["result"]
+
+
+async def _cache_set(key: tuple[str, str, str, str, str], result: dict) -> None:
+    async with _cache_lock:
+        _resolved_cache[key] = {
+            "result": dict(result),
+            "expires_at": time.monotonic() + _upstream_ttl(result),
+        }
+
+
+async def _cache_ttl(key: tuple[str, str, str, str, str]) -> int:
+    """Remaining lifetime in seconds, used for the signed proxy token."""
+    async with _cache_lock:
+        entry = _resolved_cache.get(key)
+        if not entry:
+            return int(RESOLVE_CACHE_TTL)
+        return max(60, int(entry["expires_at"] - time.monotonic()))
 
 
 def _origin(request: Request) -> str:
@@ -571,6 +643,7 @@ def _sign_asset_url(
     endpoint: str | None = None,
     force_playlist_proxy: bool | None = None,
     request_headers: dict | None = None,
+    expiration: int | None = None,
 ) -> str:
     """Sign one gateway URL without mutating the extractor result.
 
@@ -614,12 +687,15 @@ def _sign_asset_url(
         request_headers=request_headers or result.get("request_headers"),
         response_headers=proxy_headers.response,
         encryption_handler=encryption_handler,
-        expiration=result.get("expiration", 300),
+        expiration=expiration or result.get("expiration", 300),
     )
 
 
 def _signed_metadata(
-    request: Request, result: dict, proxy_headers: ProxyRequestHeaders
+    request: Request,
+    result: dict,
+    proxy_headers: ProxyRequestHeaders,
+    expiration: int | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Normalise and sign API-provided quality/subtitle metadata for the player."""
     sources: list[dict] = []
@@ -638,6 +714,7 @@ def _signed_metadata(
                     url,
                     request_headers=source.get("request_headers"),
                     force_playlist_proxy=True,
+                    expiration=expiration,
                 ),
             }
         )
@@ -661,6 +738,7 @@ def _signed_metadata(
                     endpoint="hls_segment_proxy",
                     request_headers=subtitle.get("request_headers"),
                     force_playlist_proxy=False,
+                    expiration=expiration,
                 ),
             }
         )
@@ -742,6 +820,58 @@ async def _probe_config(
     )
 
 
+async def _probe_direct(
+    request: Request,
+    config,
+    proxy_headers: ProxyRequestHeaders,
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+):
+    """Resolve once, then reuse the cached stream/subtitles without re-hitting
+    the embed host. The signed proxy token lives as long as the cached result.
+    """
+    key = _cache_key(config, media_type, media_id, season, episode)
+    result = await _cache_get(key)
+    if result is None:
+        try:
+            result = await asyncio.wait_for(
+                _extract(request, config, proxy_headers, media_type, media_id, season, episode),
+                timeout=PROBE_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("[embed/direct] %s failed: %s", config.canonical, exc)
+            return config, None, f"{config.canonical}: {exc}"
+        await _cache_set(key, result)
+
+    ttl = await _cache_ttl(key)
+    try:
+        stream_url = _sign_asset_url(
+            request, result, proxy_headers, result["destination_url"], expiration=ttl
+        )
+        sources, subtitles, capabilities = _signed_metadata(
+            request, result, proxy_headers, expiration=ttl
+        )
+    except Exception as exc:
+        logger.warning("[embed/direct] %s metadata signing failed: %s", config.canonical, exc)
+        return config, None, f"{config.canonical}: {exc}"
+
+    return (
+        config,
+        (
+            stream_url,
+            f"{config.canonical} — {media_id}",
+            request.query_params.get("autoplay", "").lower() in ("1", "true", "yes"),
+            config.slug,
+            sources,
+            subtitles,
+            capabilities,
+        ),
+        None,
+    )
+
+
 async def _resolve_proxy_url(
     request: Request,
     slug: str,
@@ -749,11 +879,14 @@ async def _resolve_proxy_url(
     media_id: str,
     season: str | None,
     episode: str | None,
+    direct: bool = False,
 ) -> tuple[str, str, bool, str, list[dict], list[dict], dict]:
     media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
     proxy_headers = get_proxy_headers(request)
     auto = slug == "auto"
     retry = request.query_params.get("retry") == "1"
+    if retry:
+        await _clear_failures(media_type, media_id, season, episode)
 
     if auto:
         configs = [get_config(name) for name in AUTO_HOST_ORDER]
@@ -761,8 +894,6 @@ async def _resolve_proxy_url(
         if forced:
             configs = [forced, *(c for c in configs if c and c.canonical != forced.canonical)]
         configs = [c for c in configs if c]
-        if retry:
-            await _clear_failures(media_type, media_id, season, episode)
     else:
         config = get_config(slug)
         if not config:
@@ -783,11 +914,10 @@ async def _resolve_proxy_url(
             ):
                 errors.append(f"{config.canonical}: recently failed")
                 continue
+            probe = _probe_direct if direct else _probe_config
             pending.append(
                 asyncio.create_task(
-                    _probe_config(
-                        request, config, proxy_headers, media_type, media_id, season, episode
-                    )
+                    probe(request, config, proxy_headers, media_type, media_id, season, episode)
                 )
             )
         if not pending:
@@ -864,6 +994,27 @@ def _render(
     )
 
 
+@embed_router.get("/cache")
+async def embed_cache_stats():
+    """Debug only: show cached resolves without exposing signed URLs."""
+    now = time.monotonic()
+    async with _cache_lock:
+        resolved = [
+            {
+                "host": key[0],
+                "type": key[1],
+                "id": key[2],
+                "season": key[3],
+                "episode": key[4],
+                "ttl": int(entry["expires_at"] - now),
+            }
+            for key, entry in _resolved_cache.items()
+            if entry["expires_at"] > now
+        ]
+        failed = sum(1 for expiry in _negative_cache.values() if expiry > now)
+    return {"resolved": resolved, "failed": failed}
+
+
 @embed_router.get("/servers")
 async def embed_servers():
     """Server list for clients that still want to render a picker."""
@@ -921,11 +1072,15 @@ async def _serve(
     episode: str | None,
 ) -> HTMLResponse:
     media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
-    if request.query_params.get("mode") == "relay":
+    mode = request.query_params.get("mode")
+    if mode == "relay":
         from mediaflow_proxy.routes.relay import relay_response
 
         return await relay_response(request, slug, media_type, media_id, season, episode)
 
+    # Direct resolve-once mode is the default. ``?mode=standard`` keeps the
+    # original per-load extraction available for debugging/compatibility.
+    direct = mode != "standard"
     try:
         (
             stream_url,
@@ -935,7 +1090,9 @@ async def _serve(
             sources,
             subtitles,
             capabilities,
-        ) = await _resolve_proxy_url(request, slug, media_type, media_id, season, episode)
+        ) = await _resolve_proxy_url(
+            request, slug, media_type, media_id, season, episode, direct=direct
+        )
     except EmbedUnavailable:
         # The provider's own embed page often works in the browser even when
         # server-side HLS extraction cannot decode its stream. Hand the request
@@ -957,6 +1114,32 @@ async def _serve(
         subtitles,
         capabilities,
     )
+
+
+# Explicit direct-mode aliases. Registered before the generic /{slug}/...
+# routes so "direct" is not treated as an embed host slug.
+@embed_router.get("/direct/{slug}/movie/{media_id}", response_class=HTMLResponse)
+async def direct_movie(request: Request, slug: str, media_id: str):
+    return await _serve(request, slug, "movie", media_id, None, None)
+
+
+@embed_router.get("/direct/{slug}/tv/{media_id}", response_class=HTMLResponse)
+async def direct_tv(request: Request, slug: str, media_id: str):
+    return await _serve(request, slug, "tv", media_id, None, None)
+
+
+@embed_router.get("/direct/{slug}/tv/{media_id}/{season}", response_class=HTMLResponse)
+async def direct_tv_season(request: Request, slug: str, media_id: str, season: str):
+    return await _serve(request, slug, "tv", media_id, season, None)
+
+
+@embed_router.get(
+    "/direct/{slug}/tv/{media_id}/{season}/{episode}", response_class=HTMLResponse
+)
+async def direct_tv_episode(
+    request: Request, slug: str, media_id: str, season: str, episode: str
+):
+    return await _serve(request, slug, "tv", media_id, season, episode)
 
 
 @embed_router.get("/{slug}/movie/{media_id}", response_class=HTMLResponse)

@@ -164,6 +164,10 @@ The embed player keeps its controls inside the iframe, positioned at the bottom 
 
 Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route. `?retry=1` clears the negative cache for that movie/episode and probes every host again; the player's **Ulangi** button uses it automatically.
 
+### Direct player (resolve once)
+
+By default `/embed/auto/...` (and every explicit `/embed/<slug>/...`) uses the direct player. MediaFlow contacts the embed host **once** to extract the direct HLS/MP4 URL, request headers, quality variants and subtitles, caches that result, and signs a MediaFlow proxy URL whose lifetime matches the cache (up to 6 hours, or shorter when the upstream URL advertises its own expiry). Playback, seeking, quality and subtitle switching then happen entirely through `mfp.oplay.id`; the provider's embed host is not contacted again until the cache expires or `?retry=1` is used. The original per-load extraction is still available with `?mode=standard`, and explicit aliases exist under `/embed/direct/...`. `/embed/cache` exposes cache statistics without signed URLs.
+
 ### Gateway / relay player
 
 StreamFlix owns its own URL scheme; every embed provider has a different one. MediaFlow translates between them:
