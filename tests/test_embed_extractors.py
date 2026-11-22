@@ -56,66 +56,14 @@ def test_auto_host_order_prefers_vidcore_and_includes_every_host():
     assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
 
 
-def test_player_html_emits_server_track_controls_and_error_messages():
-    from mediaflow_proxy.routes.embed import _player_html, PLAYER_LANGUAGE_PRIORITY
+def test_gateway_does_not_serve_a_player_or_provider_registry():
+    from mediaflow_proxy.main import app
+    from mediaflow_proxy.routes import embed as embed_routes
 
-    sources = [
-        {"id": "auto", "label": "Auto", "url": "https://mfp.example/proxy/master.m3u8"},
-        {"id": "1080p", "label": "1080p", "url": "https://mfp.example/proxy/1080.m3u8"},
-    ]
-    subtitles = [
-        {
-            "id": "sub-id-0",
-            "label": "Indonesian",
-            "language": "id",
-            "format": "vtt",
-            "url": "https://mfp.example/proxy/hls/segment.vtt?d=id",
-        },
-        {
-            "id": "sub-en-1",
-            "label": "English",
-            "language": "en",
-            "format": "vtt",
-            "url": "https://mfp.example/proxy/hls/segment.vtt?d=en",
-        },
-    ]
-    player = _player_html(
-        "https://mfp.example/proxy/playlist.m3u8",
-        "550",
-        True,
-        {"id": "vidcore", "name": "VidCore"},
-        [
-            {
-                "id": "auto",
-                "name": "Auto",
-                "url": "https://mfp.example/embed/auto/movie/550",
-                "active": False,
-            }
-        ],
-        sources=sources,
-        subtitles=subtitles,
-        capabilities={"quality_from_api": True, "subtitles_from_api": True},
-    )
-    assert "OPLAY_EMBED_SERVER" in player
-    assert "OPLAY_EMBED_ERROR" in player
-    assert "OPLAY_EMBED_READY" in player
-    assert "OPLAY_EMBED_TRACKS" in player
-    assert "OPLAY_EMBED_QUALITY" in player
-    assert "OPLAY_EMBED_SUBTITLE" in player
-    assert '"id": "vidcore"' in player
-    for control in ("server", "quality", "subtitle", "audio", "speed"):
-        assert f'id="{control}"' in player
-    assert '"language": "id"' in player
-    assert '"language": "en"' in player
-    assert "api_password" not in player
-    assert PLAYER_LANGUAGE_PRIORITY[0] == "id"
-    # MediaFlow controls sit below the video, never over StreamFlix's top header.
-    assert "bottom:52px" in player
-    assert "top:6px" not in player
-    # A failed selection reuses the same player shell with a retry control.
-    assert 'id="retry"' in player
-    assert "__MFP_ERROR__" not in player
-    assert PLAYER_LANGUAGE_PRIORITY[5] == "en"
+    assert not hasattr(embed_routes, "_player_html")
+    paths = [getattr(route, "path", "") for route in app.routes]
+    assert not any(path.startswith("/embed/") for path in paths)
+    assert all(path.startswith("/gateway/") for path in paths if "resolve" in path)
 
 
 def test_all_historical_embed_hosts_are_registered():
@@ -349,7 +297,7 @@ async def test_host_allowlist_is_enforced():
 # ---------------------------------------------------------------------------
 
 
-def _embed_request(path: str = "/embed/auto/tv/1399/1/1", query: str = "autoplay=true") -> Request:
+def _embed_request(path: str = "/gateway/resolve/tv/1399/1/1", query: str = "") -> Request:
     return Request(
         {
             "type": "http",
@@ -364,57 +312,193 @@ def _embed_request(path: str = "/embed/auto/tv/1399/1/1", query: str = "autoplay
     )
 
 
-def test_tv_params_are_normalised_for_streamflix_urls():
-    from mediaflow_proxy.routes.embed import _normalise_media
+# ---------------------------------------------------------------------------
+# Fetch-time ad filtering
+# ---------------------------------------------------------------------------
 
-    assert _normalise_media("tv", "tv-1399", "0", "oops") == ("1399", "1", "1")
-    assert _normalise_media("tv", "94997", "2", "5") == ("94997", "2", "5")
-    assert _normalise_media("movie", "550", None, None) == ("550", None, None)
+
+def test_sanitize_html_removes_ad_scripts_iframes_and_redirects():
+    from mediaflow_proxy.gateway.ad_filter import AdFilterReport, sanitize_html
+
+    html = (
+        '<script src="https://doubleclick.net/banner.js"></script>'
+        "<script>adsbygoogle.push({});</script>"
+        '<script>var player = { file: "https://cdn.example/a.m3u8" };</script>'
+        '<iframe src="https://popunder.network/pop.html"></iframe>'
+        '<meta http-equiv="refresh" content="0;url=https://adfly.com/x">'
+        '<a href="https://cdn.example/ok">ok</a>'
+    )
+    report = AdFilterReport()
+    clean = sanitize_html(html, "https://provider.example/", report)
+
+    assert "doubleclick.net" not in clean
+    assert "adsbygoogle" not in clean
+    assert "popunder.network" not in clean
+    assert "adfly.com" not in clean
+    assert "https://cdn.example/a.m3u8" in clean
+    assert report.sanitized_scripts == 2
+    assert report.sanitized_iframes == 1
+    assert report.sanitized_redirects == 1
+
+
+def test_filter_candidate_url_rejects_ad_and_non_http_urls():
+    from mediaflow_proxy.gateway.ad_filter import AdFilterReport, filter_candidate_url
+
+    report = AdFilterReport()
+    assert (
+        filter_candidate_url("/subs/id.vtt", "https://cdn.example/player", report)
+        == "https://cdn.example/subs/id.vtt"
+    )
+    assert filter_candidate_url("https://doubleclick.net/x", report=report) is None
+    assert filter_candidate_url("https://cdn.example/ad/banner.js", report=report) is None
+    assert filter_candidate_url("ftp://cdn.example/x", report=report) is None
+    assert "doubleclick.net" in report.blocked_domains
+    assert report.blocked_urls >= 3
+
+
+def test_ad_stream_result_is_rejected_and_audit_survives_repeated_filtering():
+    from mediaflow_proxy.extractors.base import ExtractorError
+    from mediaflow_proxy.gateway.ad_filter import filter_extractor_result
+
+    with pytest.raises(ExtractorError, match="ad-filter"):
+        filter_extractor_result({"destination_url": "https://adfly.com/stream.m3u8"})
+
+    result = {
+        "destination_url": "https://cdn.example/master.m3u8",
+        "sources": [
+            {"url": "https://cdn.example/master.m3u8"},
+            {"url": "https://doubleclick.net/ad.m3u8"},
+        ],
+        "subtitles": [{"url": "https://cdn.example/id.vtt"}],
+    }
+    first = filter_extractor_result(result)
+    second = filter_extractor_result(first)
+    assert first["sources"] == second["sources"]
+    assert first["ad_filter"] == second["ad_filter"]
+    assert first["ad_filter"]["blocked_urls"] == 1
 
 
 @pytest.mark.asyncio
-async def test_auto_resolver_uses_first_healthy_host(monkeypatch):
+async def test_vidspark_ad_stream_is_rejected():
+    config = EMBED_HOSTS["VidCore"]
+    extractor = GenericEmbedExtractor({}, config)
+    api_url = f"{VIDSPARK_API_BASE}/movie/550"
+    embed_url = "https://vidcore.org/embed/movie/550"
+    _mock_requests(
+        extractor,
+        {
+            api_url: _response(
+                api_url,
+                text=json.dumps(
+                    {
+                        "result": True,
+                        "sources": [{"url": "https://adfly.com/stream.m3u8"}],
+                    }
+                ),
+            )
+        },
+    )
+
+    with pytest.raises(Exception, match="ad-filter"):
+        await extractor.extract(embed_url)
+
+
+@pytest.mark.asyncio
+async def test_generic_flow_skips_ad_script_and_uses_clean_stream():
+    config = EMBED_HOSTS["VidKing"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://www.vidking.net/embed/movie/550"
+    destination = "https://cdn.example/video.m3u8"
+    _mock_requests(
+        extractor,
+        {
+            embed_url: _response(
+                embed_url,
+                text=(
+                    '<script>adsbygoogle.push("https://doubleclick.net/x");'
+                    'var player = { file: "https://ads.example.com/ad.m3u8" };</script>'
+                    f'<script>var player = {{ file: "{destination}" }};</script>'
+                ),
+            )
+        },
+    )
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == destination
+    assert result["ad_filter"]["sanitized_scripts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Gateway auto selection / failover
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gateway_auto_uses_first_healthy_host(monkeypatch):
     from mediaflow_proxy.routes import embed as embed_routes
 
     embed_routes._negative_cache.clear()
+    embed_routes._resolved_cache.clear()
+    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore", "VSEmbed"])
     probed: list[str] = []
 
     async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
         probed.append(config.canonical)
         if config.canonical == "VidCore":
             await asyncio.sleep(0.01)
-            return config, ("stream", "VidCore — 1399", True, "vidcore", [], [], {}), None
-        await asyncio.sleep(5)
+            return config, {"stream_url": "stream", "audit": {}}, None
+        await asyncio.sleep(0.5)
         return config, None, f"{config.canonical}: slow"
 
-    monkeypatch.setattr(embed_routes, "_probe_config", fake_probe)
-    result = await embed_routes._resolve_proxy_url(
-        _embed_request(), "auto", "tv", "tv-1399", "1", "1"
+    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
+    payload = await embed_routes._resolve_gateway(
+        _embed_request(), "tv", "tv-1399", "1", "1"
     )
 
-    assert result[0] == "stream"
+    assert payload["stream_url"] == "stream"
     assert probed[0] == "VidCore"
 
 
 @pytest.mark.asyncio
-async def test_auto_failure_renders_player_with_retry(monkeypatch):
+async def test_gateway_failure_raises_without_rendering_a_player(monkeypatch):
     from mediaflow_proxy.routes import embed as embed_routes
 
     embed_routes._negative_cache.clear()
+    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore"])
 
     async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
         return config, None, f"{config.canonical}: episode unavailable"
 
-    monkeypatch.setattr(embed_routes, "_probe_config", fake_probe)
-    request = _embed_request("/embed/auto/tv/94997/1/1")
+    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
 
+    with pytest.raises(embed_routes.EmbedUnavailable, match="episode unavailable"):
+        await embed_routes._resolve_gateway(
+            _embed_request(), "tv", "94997", "1", "1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_gateway_retry_clears_negative_cache(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    embed_routes._negative_cache.clear()
+    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore"])
+    attempts = 0
+
+    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return config, None, f"{config.canonical}: down"
+        return config, {"stream_url": "ok", "audit": {}}, None
+
+    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
     with pytest.raises(embed_routes.EmbedUnavailable):
-        await embed_routes._resolve_proxy_url(request, "auto", "tv", "94997", "1", "1")
+        await embed_routes._resolve_gateway(_embed_request(), "tv", "94997", "1", "1")
 
-    page = embed_routes._failure_response(
-        request, "auto", "tv", "94997", "1", "1", "all hosts failed"
-    ).body.decode()
-    assert "all hosts failed" in page
-    assert 'id="retry"' in page
-    assert "retry=1" in page
-    assert "api_password" not in page
+    payload = await embed_routes._resolve_gateway(
+        _embed_request(query="retry=1"), "tv", "94997", "1", "1"
+    )
+    assert payload["stream_url"] == "ok"
+    assert attempts == 2

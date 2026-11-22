@@ -16,6 +16,12 @@ from mediaflow_proxy.extractors.embed_hosts import (
     is_public_http_url,
     parse_media_path,
 )
+from mediaflow_proxy.gateway.ad_filter import (
+    AdFilterReport,
+    filter_candidate_url,
+    filter_extractor_result,
+    sanitize_html,
+)
 from mediaflow_proxy.utils.packed import eval_solver
 
 logger = logging.getLogger(__name__)
@@ -245,6 +251,7 @@ class GenericEmbedExtractor(BaseExtractor):
         super().__init__(request_headers)
         self.config = config
         self.mediaflow_endpoint = config.endpoint
+        self._ad_report = AdFilterReport()
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         if not is_public_http_url(url):
@@ -256,11 +263,14 @@ class GenericEmbedExtractor(BaseExtractor):
                 f"{self.config.canonical}: host {hostname!r} is not allowed for this extractor"
             )
 
+        self._ad_report = AdFilterReport()
         if self.config.flow == FLOW_VIDSPARK:
-            return await self._extract_vidspark(url)
-        if self.config.flow == FLOW_VSEMBED:
-            return await self._extract_vsembed(url)
-        return await self._extract_generic(url)
+            result = await self._extract_vidspark(url)
+        elif self.config.flow == FLOW_VSEMBED:
+            result = await self._extract_vsembed(url)
+        else:
+            result = await self._extract_generic(url)
+        return filter_extractor_result(result, self._ad_report)
 
     def _result(
         self,
@@ -340,21 +350,20 @@ class GenericEmbedExtractor(BaseExtractor):
         sources = payload.get("sources") or []
         if not isinstance(sources, list):
             sources = [sources]
-        destination = next(
-            (
-                candidate
-                for candidate in (
-                    (s.get("url") or s.get("src") or s.get("file"))
-                    if isinstance(s, dict)
-                    else s
-                    for s in sources
-                )
-                if isinstance(candidate, str) and is_public_http_url(candidate)
-            ),
-            None,
-        )
+        cleaned_sources = []
+        for item in sources:
+            raw = (item.get("url") or item.get("src") or item.get("file")) if isinstance(item, dict) else item
+            clean = filter_candidate_url(raw, api_url, self._ad_report)
+            if clean and clean not in cleaned_sources:
+                cleaned_sources.append(clean)
+        destination = cleaned_sources[0] if cleaned_sources else None
         if not destination:
-            raise ExtractorError(f"{self.config.canonical}: no playable source returned")
+            reason = (
+                "ad-filter blocked every source"
+                if self._ad_report.blocked_urls
+                else "no playable source returned"
+            )
+            raise ExtractorError(f"{self.config.canonical}: {reason}")
 
         subtitles = _collect_api_subtitles(payload)
         audio = payload.get("audio") or payload.get("audioTracks") or []
@@ -394,7 +403,8 @@ class GenericEmbedExtractor(BaseExtractor):
             nested_url = gate.json().get("src")
         except Exception as exc:
             raise ExtractorError(f"{self.config.canonical}: invalid gate response") from exc
-        if not nested_url or not is_public_http_url(nested_url):
+        nested_url = filter_candidate_url(nested_url, gate_url, self._ad_report)
+        if not nested_url:
             raise ExtractorError(f"{self.config.canonical}: gate did not return a usable player")
 
         landing = await self._make_request(
@@ -402,8 +412,8 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={"Referer": origin, "Accept": "text/html"},
         )
         cfg = _extract_json_object(_CFG_RE, landing.text, self.config.canonical)
-        player_url = urljoin(nested_url, cfg.get("playerUrl", ""))
-        if not player_url or not is_public_http_url(player_url):
+        player_url = filter_candidate_url(cfg.get("playerUrl"), nested_url, self._ad_report)
+        if not player_url:
             raise ExtractorError(f"{self.config.canonical}: player URL missing")
 
         player = await self._make_request(
@@ -447,12 +457,25 @@ class GenericEmbedExtractor(BaseExtractor):
         destination: Optional[str] = None
 
         if isinstance(stream_urls, list):
-            destination = next((u for u in stream_urls if u), None)
+            destination = next(
+                (
+                    clean
+                    for clean in (
+                        filter_candidate_url(u, player_url, self._ad_report) for u in stream_urls
+                    )
+                    if clean
+                ),
+                None,
+            )
         elif isinstance(stream_urls, str):
             # Encrypted responses carry plaintext cast URLs. The public /pl/
             # route is often playable without the cast token.
             for cast_url in data.get("cast_urls") or []:
-                candidate = cast_url.replace("/plc/", "/pl/")
+                candidate = filter_candidate_url(
+                    str(cast_url).replace("/plc/", "/pl/"), player_url, self._ad_report
+                )
+                if not candidate:
+                    continue
                 try:
                     probe = await self._make_request(
                         url=candidate,
@@ -493,27 +516,32 @@ class GenericEmbedExtractor(BaseExtractor):
                 url=current,
                 headers={"Referer": referer, "Accept": "text/html,application/json"},
             )
-            html = response.text
+            html = sanitize_html(response.text, current, self._ad_report)
 
             for pattern in _M3U8_PATTERNS:
-                match = re.search(pattern, html, re.I | re.S)
-                if match:
-                    destination = urljoin(current, match.group(1))
+                for match in re.finditer(pattern, html, re.I | re.S):
+                    destination = filter_candidate_url(
+                        urljoin(current, match.group(1)), current, self._ad_report
+                    )
+                    if not destination:
+                        continue
                     logger.info("[%s] resolved %s -> %s", self.config.canonical, url, destination)
                     return self._result(destination, referer)
 
             iframe = _IFRAME_RE.search(html)
             if not iframe:
                 break
-            nxt = urljoin(current, iframe.group(1))
-            if nxt in visited:
+            nxt = filter_candidate_url(iframe.group(1), current, self._ad_report)
+            if not nxt or nxt in visited:
                 break
             referer = current
             current = nxt
 
         try:
             destination = await eval_solver(self, current, {"Referer": referer}, _M3U8_PATTERNS)
-            return self._result(urljoin(current, destination), referer)
+            clean = filter_candidate_url(destination, current, self._ad_report)
+            if clean:
+                return self._result(clean, referer)
         except Exception:
             raise ExtractorError(
                 f"{self.config.canonical}: no direct stream found in embed page"

@@ -115,6 +115,72 @@ class SkipSegmentFilter:
         return bool(self.skip_segments)
 
 
+class AdRangeFilter:
+    """Remove HLS ad ranges without touching ordinary quality discontinuities.
+
+    Two common ad marker styles are handled:
+      * ``#EXT-X-CUE-OUT`` … ``#EXT-X-CUE-IN``
+      * ``#EXT-X-DATERANGE`` with ``CLASS="ad"`` and a ``DURATION``
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.current_time = 0.0
+        self.in_cue = False
+        self.cue_start = 0.0
+        self.cue_duration: Optional[float] = None
+        self.ranges: list[tuple[float, float]] = []
+        self.skipped_segments = 0
+
+    def observe_tag(self, line: str) -> bool:
+        """Return True when ``line`` is an ad tag that must be dropped."""
+        if not self.enabled:
+            return False
+        tag = line.strip()
+        # CUE-OUT-CONT continues an existing range; never restart it.
+        if tag.startswith("#EXT-X-CUE-OUT-CONT"):
+            return True
+        if tag.startswith("#EXT-X-CUE-IN"):
+            self.in_cue = False
+            self.cue_duration = None
+            return True
+        if tag.startswith("#EXT-X-CUE-OUT"):
+            self.in_cue = True
+            self.cue_start = self.current_time
+            match = re.search(r"DURATION=([0-9]+(?:\.[0-9]+)?)", tag, re.IGNORECASE)
+            self.cue_duration = float(match.group(1)) if match else None
+            return True
+        if tag.startswith("#EXT-X-DATERANGE") and re.search(
+            r'CLASS\s*=\s*"?ad(?:[-_][a-z0-9._-]+)?\"?', tag, re.IGNORECASE
+        ):
+            match = re.search(r"DURATION=([0-9]+(?:\.[0-9]+)?)", tag, re.IGNORECASE)
+            if match:
+                duration = float(match.group(1))
+                self.ranges.append((self.current_time, self.current_time + duration))
+            return True
+        return False
+
+    def should_skip(self, duration: float) -> bool:
+        """Decide whether the EXTINF segment of ``duration`` is an ad.
+
+        Also advances the logical playlist clock. Call this once per EXTINF,
+        even when no ad is present, so DATERANGE offsets stay accurate.
+        """
+        if not self.enabled:
+            return False
+        start = self.current_time
+        end = start + duration
+        skip = self.in_cue or any(range_start < end and range_end > start for range_start, range_end in self.ranges)
+        self.current_time = end
+
+        if self.cue_duration is not None and self.current_time >= self.cue_start + self.cue_duration:
+            self.in_cue = False
+            self.cue_duration = None
+        if skip:
+            self.skipped_segments += 1
+        return skip
+
+
 class M3U8Processor:
     def __init__(
         self,
@@ -125,6 +191,7 @@ class M3U8Processor:
         no_proxy: bool = False,
         skip_segments: Optional[List[dict]] = None,
         start_offset: Optional[float] = None,
+        filter_hls_ads: Optional[bool] = None,
     ):
         """
         Initializes the M3U8Processor with the request and URL prefix.
@@ -146,6 +213,9 @@ class M3U8Processor:
         self.no_proxy = no_proxy
         self.force_playlist_proxy = force_playlist_proxy
         self.skip_filter = SkipSegmentFilter(skip_segments)
+        self.ad_filter = AdRangeFilter(
+            settings.filter_hls_ads if filter_hls_ads is None else filter_hls_ads
+        )
         # Track if user explicitly provided start_offset (vs using default)
         self._user_provided_start_offset = start_offset is not None
         # Store the explicit value or default (will be applied conditionally for live streams)
@@ -225,6 +295,11 @@ class M3U8Processor:
         while i < len(lines):
             line = lines[i]
 
+            # Drop HLS ad markers before any other playlist processing.
+            if self.ad_filter.observe_tag(line):
+                i += 1
+                continue
+
             # Inject EXT-X-START tag right after #EXTM3U (only for live streams or if user explicitly requested)
             if line.strip() == "#EXTM3U" and apply_start_offset and not start_offset_injected:
                 processed_lines.append(line)
@@ -236,17 +311,21 @@ class M3U8Processor:
             # Handle EXTINF lines (segment duration markers)
             if line.startswith("#EXTINF:"):
                 duration = self._parse_extinf_duration(line)
+                ad_skip = self.ad_filter.should_skip(duration)
+                user_skip = self.skip_filter.has_skip_segments() and self.skip_filter.should_skip_segment(duration)
 
-                if self.skip_filter.has_skip_segments() and self.skip_filter.should_skip_segment(duration):
+                if ad_skip or user_skip:
                     # Skip this segment entirely - don't buffer the EXTINF
                     discontinuity_pending = True  # Mark that we need discontinuity before next kept segment
-                    self.skip_filter.advance_time(duration)
+                    if self.skip_filter.has_skip_segments():
+                        self.skip_filter.advance_time(duration)
                     pending_extinf = None
                     i += 1
                     continue
                 else:
                     # Keep this segment
-                    self.skip_filter.advance_time(duration)
+                    if self.skip_filter.has_skip_segments():
+                        self.skip_filter.advance_time(duration)
                     pending_extinf = line
                     i += 1
                     continue
@@ -291,6 +370,12 @@ class M3U8Processor:
         # Log skip statistics
         if self.skip_filter.has_skip_segments():
             logger.info(f"Content filtering: processed playlist with {len(self.skip_filter.skip_segments)} skip ranges")
+        if self.ad_filter.skipped_segments:
+            logger.info(
+                "[ad-filter] removed %s HLS ad segments from %s",
+                self.ad_filter.skipped_segments,
+                base_url,
+            )
 
         # Register playlist with the priority-based prefetcher
         if settings.enable_hls_prebuffer and "#EXTM3U" in content and self.playlist_url:
@@ -411,6 +496,10 @@ class M3U8Processor:
                     if not line:  # Skip empty lines
                         continue
 
+                    # Drop HLS ad markers before any other playlist processing.
+                    if self.ad_filter.observe_tag(line):
+                        continue
+
                     # Buffer header lines until we can determine playlist type
                     # This allows us to decide whether to inject EXT-X-START
                     if not header_flushed:
@@ -463,6 +552,8 @@ class M3U8Processor:
                             )
 
                             for header_line in header_buffer:
+                                if self.ad_filter.observe_tag(header_line):
+                                    continue
                                 # Process header lines to rewrite URLs (e.g., #EXT-X-KEY)
                                 processed_header_line = await self.process_line(header_line, base_url)
                                 yield processed_header_line + "\n"
@@ -488,8 +579,8 @@ class M3U8Processor:
                         start_offset_injected = True
                         continue
 
-                    # Handle segment filtering if skip_segments are configured
-                    if self.skip_filter.has_skip_segments():
+                    # Handle segment filtering for user skip ranges and ad ranges.
+                    if self.skip_filter.has_skip_segments() or self.ad_filter.enabled:
                         result = await self._process_line_with_filtering(
                             line, base_url, discontinuity_pending, pending_extinf
                         )
@@ -527,6 +618,8 @@ class M3U8Processor:
                 )
             )
             for header_line in header_buffer:
+                if self.ad_filter.observe_tag(header_line):
+                    continue
                 yield header_line + "\n"
                 if header_line.strip() == "#EXTM3U" and should_inject and not start_offset_injected:
                     yield f"#EXT-X-START:TIME-OFFSET={self._start_offset_value:.1f},PRECISE=YES\n"
@@ -549,7 +642,7 @@ class M3U8Processor:
             return
 
         if buffer:  # Process the last line if it's not empty
-            if self.skip_filter.has_skip_segments():
+            if self.skip_filter.has_skip_segments() or self.ad_filter.enabled:
                 result = await self._process_line_with_filtering(
                     buffer, base_url, discontinuity_pending, pending_extinf
                 )
@@ -563,6 +656,12 @@ class M3U8Processor:
         # Log skip statistics
         if self.skip_filter.has_skip_segments():
             logger.info(f"Content filtering: processed playlist with {len(self.skip_filter.skip_segments)} skip ranges")
+        if self.ad_filter.skipped_segments:
+            logger.info(
+                "[ad-filter] removed %s HLS ad segments from %s",
+                self.ad_filter.skipped_segments,
+                base_url,
+            )
 
         # Register playlist with the priority-based prefetcher
         # The prefetcher uses a smart approach:
@@ -609,8 +708,9 @@ class M3U8Processor:
         # Handle EXTINF lines (segment duration markers)
         if line.startswith("#EXTINF:"):
             duration = self._parse_extinf_duration(line)
+            ad_skip = self.ad_filter.should_skip(duration)
 
-            if self.skip_filter.should_skip_segment(duration):
+            if ad_skip or self.skip_filter.should_skip_segment(duration):
                 # Skip this segment - don't buffer the EXTINF
                 self.skip_filter.advance_time(duration)
                 return (None, True, None)  # discontinuity_pending = True, clear pending

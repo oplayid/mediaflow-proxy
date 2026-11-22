@@ -2,7 +2,9 @@
 # In Coolify: New Resource -> Docker Compose -> pick this file from the repo.
 services:
   mfp:
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:latest}
+    # Image is built and pushed to GHCR by .github/workflows/main.yml.
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.7.0.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.7.0}
     restart: unless-stopped
     ports:
       - "8888:8888"

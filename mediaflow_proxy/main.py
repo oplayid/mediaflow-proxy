@@ -15,8 +15,7 @@ from mediaflow_proxy.middleware import UIAccessControlMiddleware
 from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
-from mediaflow_proxy.routes.embed import embed_router
-from mediaflow_proxy.routes.relay import relay_router
+from mediaflow_proxy.routes.embed import gateway_router
 from mediaflow_proxy.routes.trailer import banner_router, trailer_router
 from mediaflow_proxy.routes.speedtest import speedtest_router
 from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
@@ -317,13 +316,10 @@ if settings.enable_telegram:
 
     app.include_router(telegram_router, prefix="/proxy", tags=["telegram"], dependencies=[Depends(verify_api_key)])
 app.include_router(extractor_router, prefix="/extractor", tags=["extractors"], dependencies=[Depends(verify_api_key)])
-# Public gateway endpoints: translate StreamFlix's URL scheme into each
-# provider's embed URL. Registered before /embed so /embed/relay/... is not
-# swallowed by the generic /embed/{slug}/... route.
-app.include_router(relay_router, prefix="/embed/relay", tags=["relay"])
-# Public embed endpoints: they sign their own short-lived proxy URLs internally,
-# so StreamFlix only has to point its existing <iframe> at MediaFlow.
-app.include_router(embed_router, prefix="/embed", tags=["embed"])
+# Public gateway endpoints: StreamFlix asks only for media identity; MediaFlow
+# scrubs provider pages server-side and returns clean, signed proxy URLs. There
+# is deliberately no /embed provider list, relay route or player iframe here.
+app.include_router(gateway_router, prefix="/gateway", tags=["gateway"])
 # Public trailer pages: MediaFlow selects the YouTube trailer from TMDB and
 # renders an iframe; no API password is needed in the browser.
 app.include_router(trailer_router, prefix="/trailer", tags=["trailer"])

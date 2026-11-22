@@ -49,6 +49,7 @@ class Settings(BaseSettings):
         "mediaflow"  # Routing strategy for M3U8 content URLs: "mediaflow", "stremio", or "direct"
     )
     enable_hls_prebuffer: bool = True  # Whether to enable HLS pre-buffering for improved streaming performance.
+    filter_hls_ads: bool = True  # Remove HLS ad ranges (CUE-OUT/CUE-IN, DATERANGE CLASS=ad) from proxied manifests.
     livestream_start_offset: (
         float | None
     ) = -18  # Default start offset for live streams (e.g., -18 to start 18 seconds behind live edge). Applies to HLS and MPD live playlists. Set to None to disable.

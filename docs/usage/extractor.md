@@ -112,83 +112,65 @@ GET /extractor/video.m3u8?host=TurboVidPlay&d=https://turbovidhls.com/t/abc123&a
 
 This redirects to the proxied HLS manifest URL, and because the request URL contains `.m3u8`, players like ExoPlayer will correctly use HLS playback.
 
-## StreamFlix iframe embed endpoints
+## StreamFlix gateway (output only)
 
-MediaFlow owns the iframe player, the embed-host registry, host selection, and failover. Streamflix only needs two URL templates and keeps its existing `OPLAY_EMBED_*` postMessage handling.
-
-| Endpoint | Description |
-|---|---|
-| `/embed/auto/movie/<tmdb_id>` | Movie player with automatic host selection |
-| `/embed/auto/tv/<tmdb_id>` | Show player, defaults to season 1 episode 1 |
-| `/embed/auto/tv/<tmdb_id>/<season>` | Show player, defaults to episode 1 |
-| `/embed/auto/tv/<tmdb_id>/<season>/<episode>` | TV episode player with automatic host selection |
-| `/embed/<slug>/movie/<tmdb_id>` | Force one host (for debugging) |
-| `/embed/<slug>/tv/<tmdb_id>[/<season>[/<episode>]]` | Force one host (for debugging) |
-| `/embed/servers` | JSON list of available servers and priorities |
-
-TV IDs accept an optional `tv-` prefix, and season/episode values are coerced to positive integers (invalid or zero values fall back to `1`). `auto` probes VidCore and VSEmbed first, then fans the remaining hosts out in parallel. Each probe has a 6 second timeout and the whole selection is capped at 15 seconds; the first healthy host wins and slower probes are cancelled. Failures are skipped via a 60 second negative cache. If no host can serve the exact episode, MediaFlow still returns its player shell with a readable error, a **Ulangi** button, and the server dropdown — never a blank iframe or a raw 502 page. The generated player includes a small control panel inside the iframe, so Streamflix does not need a server picker of its own: **Server**, **Kualitas**, **Subtitle**, **Audio**, and **Speed**. Quality/audio/subtitle tracks come from the HLS manifest and, for VidCore, from the upstream `sources`/`subtitles` API metadata. Subtitle default is Indonesian, falling back to English when no Indonesian track exists; everything else starts as Off. Nested variant playlists inherit `force_playlist_proxy`, so AES keys, segments, and external `.vtt` subtitles stay on the gateway instead of leaking to the embed host (which often blocks cross-origin playback).
-
-Examples:
-
-```
-https://mfp.oplay.id/embed/auto/movie/550
-https://mfp.oplay.id/embed/auto/tv/1399/1/1?autoplay=true
-```
-
-### YouTube trailer endpoints
-
-MediaFlow can also own trailer selection. Set `TMDB_API_KEY` (TMDB v3 key) on the server; the key is never exposed to the browser.
+MediaFlow is **not** a player and does not serve a provider list, a relay page, a server switcher, or a player iframe. Streamflix sends only media identity; MediaFlow visits the provider embed page server-side, scrubs ads, resolves the clean HLS/MP4 URL plus subtitle URLs, caches the result, and returns JSON containing MediaFlow-signed proxy URLs. Streamflix owns the UI, the player, watch progress, and history.
 
 | Endpoint | Description |
 |---|---|
-| `/trailer/movie/<tmdb_id>` | Iframe page with the movie's YouTube trailer |
-| `/trailer/tv/<tmdb_id>` | Iframe page with the show's YouTube trailer |
-| `/trailer/tv/<tmdb_id>/<season>/<episode>` | Same show trailer, for URL symmetry with embed routes |
-| `/trailer/info/movie/<tmdb_id>` | Debug JSON: selected key, language, type |
+| `/gateway/resolve/movie/<tmdb_id>` | Resolve a movie |
+| `/gateway/resolve/tv/<tmdb_id>` | Show, defaults to season 1 episode 1 |
+| `/gateway/resolve/tv/<tmdb_id>/<season>` | Show, defaults to episode 1 |
+| `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
+| `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-Query parameters for the player pages: `autoplay` (default `true`), `mute` (default `true`, required for autoplay), `controls` (default `false`), `loop` (default `true`). MediaFlow picks a YouTube trailer from TMDB `/videos` with Indonesian first, English second; if none exists it renders a small "Trailer tidak tersedia" placeholder. The YouTube stream itself stays in the viewer's browser, so the gateway only performs a small cached TMDB JSON lookup.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. `auto` selection probes VidCore and VSEmbed first, fans the remaining hosts out in parallel, and cancels slower probes once one host returns a clean stream. Each probe has a 6 second timeout and selection is capped at 15 seconds; failed hosts are skipped for 60 seconds. If every host fails the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
 
-### Poster-first banner endpoints
+Example:
 
-For a film detail page, Streamflix only needs one iframe — MediaFlow owns the whole banner experience:
-
-| Endpoint | Description |
-|---|---|
-| `/banner/movie/<tmdb_id>` | Poster → delayed muted trailer |
-| `/banner/tv/<tmdb_id>` | Same for a show |
-| `/banner/tv/<tmdb_id>/<season>/<episode>` | Same URL shape, for route symmetry |
-
-Query parameters: `delay` in milliseconds (default `3000`), `autoplay_trailer` (default `true`), `mute` (default `true`). MediaFlow fetches the TMDB backdrop, shows it immediately, and swaps in a muted trailer iframe after the delay. The banner is **purely visual and click-through-free**: it has no Play button and no navigation overlay, because StreamFlix's own Play button is the only entry point to `/watch/...`. No player logic, YouTube parsing, or host registry is needed in Streamflix.
-
-The embed player keeps its controls inside the iframe, positioned at the bottom so they never overlap StreamFlix's top navigation/player header.
-
-Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route. `?retry=1` clears the negative cache for that movie/episode and probes every host again; the player's **Ulangi** button uses it automatically.
-
-### Direct player (resolve once)
-
-By default `/embed/auto/...` (and every explicit `/embed/<slug>/...`) uses the direct player. MediaFlow contacts the embed host **once** to extract the direct HLS/MP4 URL, request headers, quality variants and subtitles, caches that result, and signs a MediaFlow proxy URL whose lifetime matches the cache (up to 6 hours, or shorter when the upstream URL advertises its own expiry). Playback, seeking, quality and subtitle switching then happen entirely through `mfp.oplay.id`; the provider's embed host is not contacted again until the cache expires or `?retry=1` is used. The original per-load extraction is still available with `?mode=standard`, and explicit aliases exist under `/embed/direct/...`. `/embed/cache` exposes cache statistics without signed URLs.
-
-### Gateway / relay player
-
-StreamFlix owns its own URL scheme; every embed provider has a different one. MediaFlow translates between them:
-
-| Endpoint | Translated provider URL (example) |
-|---|---|
-| `/embed/relay/vidcore/tv/94997/1/1` | `https://vidcore.org/embed/tv/94997/1/1` |
-| `/embed/relay/vsembed/tv/94997/1/1` | `https://stream.oplay.id/embed/tv/94997/1/1` |
-| `/embed/relay/2embed/tv/94997/1/1` | `https://www.2embed.cc/embedtv/94997&s=1&e=1` |
-| `/embed/relay/auto/movie/550` | first reachable provider that actually has the media |
-| `/embed/relay/hosts` | debug JSON of the translation table |
-
-The relay page is a thin MediaFlow wrapper around the provider's own embed URL. The nested iframe always loads the **provider** URL; the server dropdown navigates the relay page through `/embed/relay/...` URLs, so StreamFlix never handles provider URLs and the relay can never load itself recursively. Auto selection first checks reachability and then asks providers with metadata whether the exact movie/episode exists — VidCore/VidSpark via its API (`Episode not found` is skipped) and VSEmbed via its gate. A manually selected host that reports a missing episode shows an error with a **Coba host berikutnya** button immediately. A `postMessage` bridge forwards StreamFlix playback commands down to the provider, mirrors provider messages (VSEmbed's `PLAYER_TITLE`, `TV_INFO`, `TV_STATE`, `MEDIA_NOT_FOUND`, `VS_EXPIRED`) up to StreamFlix, and sends `TV_SET` on handshake so season/episode stay in sync. Providers that do not report playback time cannot drive `OPLAY_EMBED_PROGRESS`, so the native HLS player remains the default for progress/history accuracy.
-
-The normal embed routes accept `?mode=relay` to force this mode, and automatically fall back to it whenever HLS extraction fails for every host. `?retry=1` still forces a fresh attempt.
-
-In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:
-
-```js
-{ type: "OPLAY_EMBED_SERVER", id: "vidcore", name: "VidCore" }
-{ type: "OPLAY_EMBED_ERROR", message: "..." }
+```
+GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1
 ```
 
-These endpoints are intentionally public: they resolve the upstream stream and sign a short-lived MediaFlow proxy URL internally, so `api_password` is never exposed to the browser.
+```json
+{
+  "stream_url": "https://mfp.oplay.id/proxy/hls/manifest.m3u8?d=...&exp=...",
+  "sources": [{"id": "auto", "label": "Auto", "url": "..."}],
+  "subtitles": [
+    {"id": "sub-id-0", "label": "Indonesian", "language": "id", "format": "vtt", "url": "..."},
+    {"id": "sub-en-1", "label": "English", "language": "en", "format": "vtt", "url": "..."}
+  ],
+  "capabilities": {"subtitles_from_api": true},
+  "expires_in": 21600,
+  "audit": {"blocked_domains": [], "blocked_urls": 0, "hls_filter_enabled": true},
+  "media": {"type": "tv", "id": "94997", "season": "1", "episode": "1"}
+}
+```
+
+`stream_url` and every URL in `sources`/`subtitles` is signed: upstream headers, query parameters, and `api_password` are encrypted into the token, so the browser never sees `api_password` in plaintext. `expires_in` is the token lifetime in seconds. Streamflix should re-fetch the gateway when the token approaches expiry (or when the user retries) instead of contacting the provider again.
+
+Subtitles are ordered Indonesian first, English second. Streamflix selects the Indonesian track by default and falls back to English if no Indonesian track exists.
+
+### Caching and retry
+
+The provider is contacted **once** per media identity. The extracted result is cached in MediaFlow for at most 6 hours, or for a shorter time when the upstream URL advertises its own expiry (`expires`, `exp`, or `e`). Signed token lifetime matches the cache entry. Playback then goes only through `mfp.oplay.id/proxy/hls/...`; the embed host is not contacted again until the cache expires. `?retry=1` clears both positive and negative cache entries for that movie/episode and forces a fresh extraction, e.g.:
+
+```
+GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1?retry=1
+```
+
+There are no `?mode=`, `?server=`, `?slug=`, or `/embed/...` routes: server selection is internal and cannot be overridden by the browser.
+
+### Ad filtering
+
+Ad filtering runs at three layers and writes an audit trail:
+
+1. **Fetch time** — provider HTML is sanitised (ad scripts, ad iframes, `meta refresh`, `window.open`, and `location` redirects are removed). Every candidate URL is checked against an advertising/tracker/wrapper denylist by domain, path, and query parameter; a resolved stream that is an ad/wrapper is rejected and the host is skipped.
+2. **HLS manifest** — `CUE-OUT`/`CUE-IN` and `DATERANGE CLASS="ad"` ranges are removed from proxied playlists, with a `[ad-filter] removed N HLS ad segments ...` log line. Set `FILTER_HLS_ADS=false` to disable this layer.
+3. **Audit** — the `audit` object in the gateway response reports blocked domains/URLs and sanitised scripts/iframes/redirects; the server additionally logs `[ad-filter] audit host=... media=... {...}` whenever something was blocked.
+
+### Removed legacy surfaces
+
+`/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, and the in-iframe player with its `OPLAY_EMBED_*` postMessage contract have been removed entirely. Streamflix keeps its navbar, Play button, `/watch/...` page, and progress/history; MediaFlow only outputs clean URLs.
+
+These endpoints are intentionally public: they resolve the upstream stream and sign a short-lived MediaFlow proxy URL internally, so `api_password` is never exposed to the browser. The TMDB API key used by trailer/banner endpoints also stays server-side.
