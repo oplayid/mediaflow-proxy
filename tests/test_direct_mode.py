@@ -163,6 +163,17 @@ async def test_gateway_never_exposes_api_password(monkeypatch):
     assert body["expires_in"] > 0
 
 
+def test_error_reason_maps_upstream_404_to_content_unavailable():
+    from mediaflow_proxy.routes.embed import _error_reason
+
+    assert (
+        _error_reason(Exception("HTTP error 404 while requesting https://vidspark.to/api/x"))
+        == "content_unavailable"
+    )
+    assert _error_reason(Exception("VidCore: content_unavailable: Episode not found")) == "content_unavailable"
+    assert _error_reason(Exception("HTTP error 403 while requesting https://vsapi.example")) == "token_invalid"
+
+
 @pytest.mark.asyncio
 async def test_sandbox_usage_is_reported_in_audit(monkeypatch):
     from mediaflow_proxy.routes import embed as embed_routes

@@ -282,6 +282,8 @@ def _error_reason(exc: Exception) -> str:
             "episode not found",
             "no vidora link found",
             "stream unavailable",
+            "http error 404",
+            "http error 410",
         )
     ):
         return "content_unavailable"

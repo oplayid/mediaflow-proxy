@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 from starlette.datastructures import URL
 
@@ -91,3 +93,89 @@ async def test_hls_ad_filter_can_be_disabled():
 
     assert "ad.ts" in result
     assert "CUE-OUT" in result
+
+
+def _master_playlist() -> tuple[str, str, str]:
+    variants = [
+        "https://cdn.example/hls/video-v1.m3u8.js?token=abc",
+        "https://cdn.example/hls/video-v2.m3u8.js?token=def",
+    ]
+    content = "\n".join(
+        [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720",
+            variants[0],
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080",
+            variants[1],
+            "",
+        ]
+    )
+    return content, "https://cdn.example/hls/master.m3u8", variants[0]
+
+
+@pytest.mark.asyncio
+async def test_master_variant_uris_survive_ad_filter():
+    content, base_url, variant = _master_playlist()
+    processor = M3U8Processor(DummyRequest())
+
+    result = await processor.process_m3u8(content, base_url)
+
+    assert result.count("#EXT-X-STREAM-INF") == 2
+    assert result.count("manifest.m3u8?d=") == 2
+    assert quote(variant, safe="") in result
+    assert "/proxy/hls/segment" not in result
+
+
+async def _chunks(text: str):
+    for start in range(0, len(text), 37):
+        yield text[start : start + 37].encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_streaming_master_variant_uris_survive_ad_filter():
+    content, base_url, variant = _master_playlist()
+    processor = M3U8Processor(DummyRequest())
+
+    result = "".join(
+        [part async for part in processor.process_m3u8_streaming(_chunks(content), base_url)]
+    )
+
+    assert result.count("#EXT-X-STREAM-INF") == 2
+    assert result.count("manifest.m3u8?d=") == 2
+    assert quote(variant, safe="") in result
+    assert "/proxy/hls/segment" not in result
+
+
+@pytest.mark.asyncio
+async def test_streaming_ad_segments_are_still_removed():
+    content = "\n".join(
+        [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:10",
+            "#EXTINF:10.0,",
+            "content.ts",
+            "#EXT-X-CUE-OUT:DURATION=10",
+            "#EXTINF:10.0,",
+            "ad.ts",
+            "#EXT-X-CUE-IN",
+            "#EXT-X-ENDLIST",
+            "",
+        ]
+    )
+    processor = M3U8Processor(DummyRequest())
+
+    result = "".join(
+        [
+            part
+            async for part in processor.process_m3u8_streaming(
+                _chunks(content), "https://cdn.example/hls/media.m3u8"
+            )
+        ]
+    )
+
+    assert "content.ts" in result
+    assert "ad.ts" not in result
+    assert "CUE-OUT" not in result
+    assert processor.ad_filter.skipped_segments == 1

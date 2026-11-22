@@ -288,6 +288,8 @@ class M3U8Processor:
         pending_extinf: Optional[str] = None
         # Track if we've injected EXT-X-START tag
         start_offset_injected = False
+        # A URI directly after #EXT-X-STREAM-INF is a master variant, not a segment.
+        after_stream_inf = False
         # Determine if we should apply start_offset (checks if live stream)
         apply_start_offset = self._should_apply_start_offset(content)
 
@@ -307,6 +309,28 @@ class M3U8Processor:
                 start_offset_injected = True
                 i += 1
                 continue
+
+            # A URI on the line immediately after #EXT-X-STREAM-INF is a master
+            # variant playlist, never a segment. Ad filtering must not delete it
+            # just because there is no preceding #EXTINF. This also covers hosts
+            # that disguise variant playlists with a .js extension.
+            if line.startswith("#EXT-X-STREAM-INF"):
+                after_stream_inf = True
+                processed_lines.append(line)
+                i += 1
+                continue
+
+            if not line.startswith("#") and line.strip() and after_stream_inf:
+                after_stream_inf = False
+                full_url = parse.urljoin(base_url, line)
+                processed_lines.append(
+                    await self.proxy_url(full_url, base_url, use_full_url=True, is_playlist=True)
+                )
+                i += 1
+                continue
+
+            if line.startswith("#"):
+                after_stream_inf = False
 
             # Handle EXTINF lines (segment duration markers)
             if line.startswith("#EXTINF:"):
@@ -554,8 +578,22 @@ class M3U8Processor:
                             for header_line in header_buffer:
                                 if self.ad_filter.observe_tag(header_line):
                                     continue
-                                # Process header lines to rewrite URLs (e.g., #EXT-X-KEY)
-                                processed_header_line = await self.process_line(header_line, base_url)
+                                # Route header lines through the same filter path as the
+                                # rest of the playlist. Otherwise the first #EXTINF is
+                                # consumed without setting pending_extinf and its segment
+                                # is dropped.
+                                if self.skip_filter.has_skip_segments() or self.ad_filter.enabled:
+                                    (
+                                        processed_header_line,
+                                        discontinuity_pending,
+                                        pending_extinf,
+                                    ) = await self._process_line_with_filtering(
+                                        header_line, base_url, discontinuity_pending, pending_extinf
+                                    )
+                                    if processed_header_line is None:
+                                        continue
+                                else:
+                                    processed_header_line = await self.process_line(header_line, base_url)
                                 yield processed_header_line + "\n"
                                 if header_line.strip() == "#EXTM3U" and should_inject and not start_offset_injected:
                                     yield f"#EXT-X-START:TIME-OFFSET={self._start_offset_value:.1f},PRECISE=YES\n"
@@ -620,7 +658,19 @@ class M3U8Processor:
             for header_line in header_buffer:
                 if self.ad_filter.observe_tag(header_line):
                     continue
-                yield header_line + "\n"
+                if self.skip_filter.has_skip_segments() or self.ad_filter.enabled:
+                    (
+                        processed_header_line,
+                        discontinuity_pending,
+                        pending_extinf,
+                    ) = await self._process_line_with_filtering(
+                        header_line, base_url, discontinuity_pending, pending_extinf
+                    )
+                    if processed_header_line is None:
+                        continue
+                else:
+                    processed_header_line = await self.process_line(header_line, base_url)
+                yield processed_header_line + "\n"
                 if header_line.strip() == "#EXTM3U" and should_inject and not start_offset_injected:
                     yield f"#EXT-X-START:TIME-OFFSET={self._start_offset_value:.1f},PRECISE=YES\n"
                     start_offset_injected = True
@@ -705,6 +755,26 @@ class M3U8Processor:
         Returns a tuple of (processed_lines, discontinuity_pending, pending_extinf).
         processed_lines is None if the line should be skipped, otherwise a string to output.
         """
+        # Master-playlist variant URIs are not segments: there is no preceding
+        # #EXTINF. Keep them out of the segment filter path so ad scrubbing
+        # cannot delete every playable rendition. This mirrors process_line(),
+        # including hosts that disguise variant playlists with a .js extension.
+        if line.startswith("#EXT-X-STREAM-INF"):
+            self._after_stream_inf = True
+            return (line, discontinuity_pending, pending_extinf)
+
+        if not line.startswith("#") and line.strip() and self._after_stream_inf:
+            self._after_stream_inf = False
+            full_url = parse.urljoin(base_url, line)
+            return (
+                await self.proxy_url(full_url, base_url, use_full_url=True, is_playlist=True),
+                discontinuity_pending,
+                pending_extinf,
+            )
+
+        if line.startswith("#"):
+            self._after_stream_inf = False
+
         # Handle EXTINF lines (segment duration markers)
         if line.startswith("#EXTINF:"):
             duration = self._parse_extinf_duration(line)
