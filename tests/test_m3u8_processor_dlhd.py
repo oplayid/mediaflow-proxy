@@ -28,3 +28,25 @@ async def test_process_key_line_resolves_relative_key_uri_for_proxy_encoding():
 
     assert "d=https%3A%2F%2Fai.the-sunmoon.site%2Fkey%2Fpremium49%2F5913111" in processed
     assert "d=%2Fkey%2Fpremium49%2F5913111" not in processed
+
+
+@pytest.mark.asyncio
+async def test_proxy_url_keeps_force_playlist_proxy_for_nested_playlists():
+    request = DummyRequest({"api_password": "devpass", "force_playlist_proxy": "1"})
+    processor = M3U8Processor(request)
+
+    playlist_url = await processor.proxy_url(
+        "https://upstream.example/hls/variant.m3u8",
+        "https://upstream.example/hls/master.m3u8",
+        use_full_url=True,
+        is_playlist=True,
+    )
+    segment_url = await processor.proxy_url(
+        "https://upstream.example/hls/segment0.ts",
+        "https://upstream.example/hls/variant.m3u8",
+        use_full_url=True,
+        is_playlist=False,
+    )
+
+    assert "force_playlist_proxy=1" in playlist_url
+    assert "force_playlist_proxy=1" not in segment_url

@@ -855,9 +855,13 @@ class M3U8Processor:
             for key in list(query_params.keys())
             if key.lower().startswith("r_") and not key.lower().startswith("rp_")
         ]
-        # Remove manifest-only parameters to avoid them being added to subsequent requests
-        query_params.pop("force_playlist_proxy", None)
+        # Remove manifest-only parameters from non-playlist child URLs. Nested
+        # playlists must keep force_playlist_proxy: some embed hosts serve a
+        # variant playlist with Content-Type: application/javascript and no
+        # .m3u8 suffix, so without the flag MediaFlow streams it raw and its
+        # #EXT-X-KEY URI never gets rewritten through this gateway.
         if not is_playlist:
+            query_params.pop("force_playlist_proxy", None)
             query_params.pop("start_offset", None)
 
         # Use appropriate proxy URL based on content type

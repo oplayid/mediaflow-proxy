@@ -124,7 +124,7 @@ MediaFlow owns the iframe player, the embed-host registry, host selection, and f
 | `/embed/<slug>/tv/<tmdb_id>/<season>/<episode>` | Force one host (for debugging) |
 | `/embed/servers` | JSON list of available servers and priorities |
 
-`auto` tries hosts in priority order — VidCore, VSEmbed, then the remaining historical hosts — and skips hosts that recently failed (5 minute negative cache). The generated player includes a small server switcher inside the iframe, so Streamflix does not need a server picker of its own.
+`auto` tries hosts in priority order — VidCore, VSEmbed, then the remaining historical hosts — and skips hosts that recently failed (5 minute negative cache). The generated player includes a small server switcher inside the iframe, so Streamflix does not need a server picker of its own. Nested variant playlists inherit `force_playlist_proxy`, so AES keys and segments stay on the gateway instead of leaking to the embed host (which often blocks cross-origin playback).
 
 Examples:
 
