@@ -921,6 +921,11 @@ async def _serve(
     episode: str | None,
 ) -> HTMLResponse:
     media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
+    if request.query_params.get("mode") == "relay":
+        from mediaflow_proxy.routes.relay import relay_response
+
+        return await relay_response(request, slug, media_type, media_id, season, episode)
+
     try:
         (
             stream_url,
@@ -931,8 +936,13 @@ async def _serve(
             subtitles,
             capabilities,
         ) = await _resolve_proxy_url(request, slug, media_type, media_id, season, episode)
-    except EmbedUnavailable as exc:
-        return _failure_response(request, slug, media_type, media_id, season, episode, exc.detail)
+    except EmbedUnavailable:
+        # The provider's own embed page often works in the browser even when
+        # server-side HLS extraction cannot decode its stream. Hand the request
+        # to the gateway player before giving up on this episode.
+        from mediaflow_proxy.routes.relay import relay_response
+
+        return await relay_response(request, slug, media_type, media_id, season, episode)
     return _render(
         request,
         stream_url,

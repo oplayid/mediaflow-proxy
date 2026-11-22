@@ -164,6 +164,22 @@ The embed player keeps its controls inside the iframe, positioned at the bottom 
 
 Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route. `?retry=1` clears the negative cache for that movie/episode and probes every host again; the player's **Ulangi** button uses it automatically.
 
+### Gateway / relay player
+
+StreamFlix owns its own URL scheme; every embed provider has a different one. MediaFlow translates between them:
+
+| Endpoint | Translated provider URL (example) |
+|---|---|
+| `/embed/relay/vidcore/tv/94997/1/1` | `https://vidcore.org/embed/tv/94997/1/1` |
+| `/embed/relay/vsembed/tv/94997/1/1` | `https://stream.oplay.id/embed/tv/94997/1/1` |
+| `/embed/relay/2embed/tv/94997/1/1` | `https://www.2embed.cc/embedtv/94997&s=1&e=1` |
+| `/embed/relay/auto/movie/550` | first reachable provider embed page |
+| `/embed/relay/hosts` | debug JSON of the translation table |
+
+The relay page is a thin MediaFlow wrapper around the provider's own embed URL. All server switching happens through `/embed/relay/...` URLs, so StreamFlix never handles provider URLs. A `postMessage` bridge forwards StreamFlix playback commands down to the provider, mirrors provider messages (VSEmbed's `PLAYER_TITLE`, `TV_INFO`, `TV_STATE`, `MEDIA_NOT_FOUND`, `VS_EXPIRED`) up to StreamFlix, and sends `TV_SET` on handshake so season/episode stay in sync. Providers that do not report playback time cannot drive `OPLAY_EMBED_PROGRESS`, so the native HLS player remains the default for progress/history accuracy.
+
+The normal embed routes accept `?mode=relay` to force this mode, and automatically fall back to it whenever HLS extraction fails for every host. `?retry=1` still forces a fresh attempt.
+
 In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:
 
 ```js
