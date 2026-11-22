@@ -39,7 +39,13 @@ logger = logging.getLogger(__name__)
 embed_router = APIRouter()
 
 HLS_JS_URL = "https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"
-NEGATIVE_CACHE_TTL = 300.0
+# Auto selection is bounded: a slow/dead host must never leave StreamFlix with
+# a blank watch page. The first wave is small, the remaining hosts are probed
+# in parallel, and the first healthy host wins.
+PROBE_TIMEOUT = 6.0
+AUTO_TOTAL_TIMEOUT = 15.0
+AUTO_FIRST_WAVE = 2
+NEGATIVE_CACHE_TTL = 60.0
 # Indonesian first, English as the fallback. Everything else is only offered
 # when the user explicitly selects it.
 PLAYER_LANGUAGE_PRIORITY = [
@@ -70,6 +76,10 @@ def _js_string(value: str) -> str:
     return _js_json(value)
 
 
+def _cache_key(config, media_type: str, media_id: str, season: str | None, episode: str | None):
+    return (config.canonical, media_type, media_id, season or "", episode or "")
+
+
 async def _cache_is_hot(key: tuple[str, str, str, str, str]) -> bool:
     now = time.monotonic()
     async with _cache_lock:
@@ -85,6 +95,14 @@ async def _cache_is_hot(key: tuple[str, str, str, str, str]) -> bool:
 async def _cache_failure(key: tuple[str, str, str, str, str]) -> None:
     async with _cache_lock:
         _negative_cache[key] = time.monotonic() + NEGATIVE_CACHE_TTL
+
+
+async def _clear_failures(media_type: str, media_id: str, season: str | None, episode: str | None) -> None:
+    """Used by ``?retry=1`` so an explicit retry probes every host again."""
+    suffix = (media_type, media_id, season or "", episode or "")
+    async with _cache_lock:
+        for key in [k for k in _negative_cache if k[1:] == suffix]:
+            _negative_cache.pop(key, None)
 
 
 def _origin(request: Request) -> str:
@@ -146,6 +164,8 @@ def _player_html(
     sources: list[dict] | None = None,
     subtitles: list[dict] | None = None,
     capabilities: dict | None = None,
+    error: str | None = None,
+    retry_url: str | None = None,
 ) -> str:
     """Small HLS player implementing the OPLAY embed postMessage contract.
 
@@ -170,8 +190,11 @@ def _player_html(
 <style>
 html,body{margin:0;height:100%;background:#000;overflow:hidden}
 video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
-#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
-      color:#bbb;font:14px/1.5 system-ui,-apple-system,Arial,sans-serif;text-align:center;padding:24px}
+#err{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;
+      justify-content:center;gap:12px;color:#bbb;
+      font:14px/1.5 system-ui,-apple-system,Arial,sans-serif;text-align:center;padding:24px}
+#retry{color:#fff;background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.4);
+       border-radius:6px;font:13px/1.4 system-ui,-apple-system,Arial,sans-serif;padding:7px 14px;cursor:pointer}
 #panel{position:absolute;bottom:52px;right:8px;z-index:2;display:flex;flex-direction:row;
        flex-wrap:wrap;gap:4px;align-items:center;justify-content:flex-end;max-width:calc(100% - 16px)}
 #panel select{max-width:190px;color:#fff;background:rgba(0,0,0,.68);
@@ -189,7 +212,7 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
 <select id="audio" aria-label="Audio" hidden></select>
 <select id="speed" aria-label="Playback speed" hidden></select>
 </div>
-<div id="err">Stream unavailable</div>
+<div id="err"><span id="errmsg">Stream unavailable</span><button id="retry" hidden>Ulangi</button></div>
 <script>
 (function () {
   var SRC = __MFP_SRC__;
@@ -199,8 +222,12 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
   var PREFERRED = __MFP_PREFERRED__;
   var AUTOPLAY = __MFP_AUTOPLAY__;
   var SELECTED = __MFP_SELECTED__;
+  var ERROR = __MFP_ERROR__;
+  var RETRY_URL = __MFP_RETRY_URL__;
   var video = document.getElementById('video');
   var err = document.getElementById('err');
+  var errmsg = document.getElementById('errmsg');
+  var retryBtn = document.getElementById('retry');
   var serverSel = document.getElementById('server');
   var qualitySel = document.getElementById('quality');
   var subtitleSel = document.getElementById('subtitle');
@@ -229,9 +256,10 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
   function fail(message) {
     if (failed) return;
     failed = true;
+    errmsg.textContent = message || 'Stream unavailable';
     err.style.display = 'flex';
-    err.textContent = message || 'Stream unavailable';
-    post('OPLAY_EMBED_ERROR', { message: err.textContent });
+    if (RETRY_URL) retryBtn.hidden = false;
+    post('OPLAY_EMBED_ERROR', { message: errmsg.textContent });
   }
   function resetSelect(select) {
     while (select.firstChild) select.removeChild(select.firstChild);
@@ -427,6 +455,9 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
   serverSel.addEventListener('change', function () {
     if (serverSel.value) window.location.href = serverSel.value;
   });
+  retryBtn.addEventListener('click', function () {
+    if (RETRY_URL) window.location.href = RETRY_URL;
+  });
   qualitySel.addEventListener('change', function () {
     var value = qualitySel.value;
     if (value.indexOf('src:') === 0) {
@@ -490,7 +521,8 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
 
   initExternalSubtitles();
   setupSpeed();
-  loadStream(SRC, 0);
+  if (ERROR) fail(ERROR);
+  else loadStream(SRC, 0);
 })();
 </script>
 </body>
@@ -508,6 +540,8 @@ video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
         "__MFP_PREFERRED__": _js_json(PLAYER_LANGUAGE_PRIORITY),
         "__MFP_AUTOPLAY__": json.dumps(autoplay),
         "__MFP_SELECTED__": _js_json(selected),
+        "__MFP_ERROR__": _js_json(error or ""),
+        "__MFP_RETRY_URL__": _js_json(retry_url or ""),
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
@@ -641,6 +675,73 @@ def _quality_id(label) -> str:
     return slug or "auto"
 
 
+class EmbedUnavailable(Exception):
+    """Every configured host was unavailable for this exact media request."""
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _normalise_media(
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Accept the URL shapes StreamFlix can send and make them canonical."""
+    media_id = re.sub(r"^tv-", "", str(media_id).strip(), flags=re.IGNORECASE)
+    if media_type != "tv":
+        return media_id, season, episode
+
+    def positive(value, default: str = "1") -> str:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return str(number if number > 0 else 1)
+
+    return media_id, positive(season), positive(episode)
+
+
+async def _probe_config(
+    request: Request,
+    config,
+    proxy_headers: ProxyRequestHeaders,
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+):
+    """Probe one host with a hard timeout; never let it abort the whole fan-out."""
+    try:
+        result = await asyncio.wait_for(
+            _extract(request, config, proxy_headers, media_type, media_id, season, episode),
+            timeout=PROBE_TIMEOUT,
+        )
+        stream_url = _sign_asset_url(
+            request, result, proxy_headers, result["destination_url"]
+        )
+        sources, subtitles, capabilities = _signed_metadata(request, result, proxy_headers)
+    except Exception as exc:
+        logger.warning("[embed] %s failed: %s", config.canonical, exc)
+        return config, None, f"{config.canonical}: {exc}"
+
+    return (
+        config,
+        (
+            stream_url,
+            f"{config.canonical} — {media_id}",
+            request.query_params.get("autoplay", "").lower() in ("1", "true", "yes"),
+            config.slug,
+            sources,
+            subtitles,
+            capabilities,
+        ),
+        None,
+    )
+
+
 async def _resolve_proxy_url(
     request: Request,
     slug: str,
@@ -649,9 +750,10 @@ async def _resolve_proxy_url(
     season: str | None,
     episode: str | None,
 ) -> tuple[str, str, bool, str, list[dict], list[dict], dict]:
+    media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
     proxy_headers = get_proxy_headers(request)
-    autoplay = request.query_params.get("autoplay", "").lower() in ("1", "true", "yes")
     auto = slug == "auto"
+    retry = request.query_params.get("retry") == "1"
 
     if auto:
         configs = [get_config(name) for name in AUTO_HOST_ORDER]
@@ -659,6 +761,8 @@ async def _resolve_proxy_url(
         if forced:
             configs = [forced, *(c for c in configs if c and c.canonical != forced.canonical)]
         configs = [c for c in configs if c]
+        if retry:
+            await _clear_failures(media_type, media_id, season, episode)
     else:
         config = get_config(slug)
         if not config:
@@ -666,48 +770,61 @@ async def _resolve_proxy_url(
         configs = [config]
 
     errors: list[str] = []
-    for config in configs:
-        key = (
-            config.canonical,
-            media_type,
-            media_id,
-            season or "",
-            episode or "",
-        )
-        if auto and await _cache_is_hot(key):
-            errors.append(f"{config.canonical}: recently failed")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + AUTO_TOTAL_TIMEOUT
+    wave_size = AUTO_FIRST_WAVE if auto else 1
+
+    for start in range(0, len(configs), wave_size):
+        wave = configs[start : start + wave_size]
+        pending: list[asyncio.Task] = []
+        for config in wave:
+            if auto and not retry and await _cache_is_hot(
+                _cache_key(config, media_type, media_id, season, episode)
+            ):
+                errors.append(f"{config.canonical}: recently failed")
+                continue
+            pending.append(
+                asyncio.create_task(
+                    _probe_config(
+                        request, config, proxy_headers, media_type, media_id, season, episode
+                    )
+                )
+            )
+        if not pending:
             continue
 
         try:
-            result = await _extract(
-                request, config, proxy_headers, media_type, media_id, season, episode
-            )
-            stream_url = _sign_asset_url(
-                request, result, proxy_headers, result["destination_url"]
-            )
-            sources, subtitles, capabilities = _signed_metadata(
-                request, result, proxy_headers
-            )
-        except Exception as exc:
-            logger.warning("[embed/%s] %s failed: %s", slug, config.canonical, exc)
-            if auto:
-                await _cache_failure(key)
-            errors.append(f"{config.canonical}: {exc}")
-            continue
-
-        logger.info("[embed/%s] selected %s for %s %s", slug, config.canonical, media_type, media_id)
-        return (
-            stream_url,
-            f"{config.canonical} — {media_id}",
-            autoplay,
-            config.slug,
-            sources,
-            subtitles,
-            capabilities,
-        )
+            for finished in asyncio.as_completed(
+                pending, timeout=max(0.1, deadline - loop.time())
+            ):
+                config, outcome, error = await finished
+                if outcome is not None:
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                    logger.info(
+                        "[embed/%s] selected %s for %s %s",
+                        slug,
+                        config.canonical,
+                        media_type,
+                        media_id,
+                    )
+                    return outcome
+                errors.append(error or f"{config.canonical}: failed")
+                if auto:
+                    await _cache_failure(
+                        _cache_key(config, media_type, media_id, season, episode)
+                    )
+        except asyncio.TimeoutError:
+            errors.append("auto selection timed out")
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     detail = "; ".join(errors) or "No embed host available"
-    raise HTTPException(status_code=502, detail=detail)
+    raise EmbedUnavailable(detail)
 
 
 def _render(
@@ -760,51 +877,69 @@ async def embed_servers():
     return servers
 
 
-@embed_router.get("/{slug}/movie/{media_id}", response_class=HTMLResponse)
-async def embed_movie(request: Request, slug: str, media_id: str):
-    (
-        stream_url,
-        title,
-        autoplay,
-        selected_slug,
-        sources,
-        subtitles,
-        capabilities,
-    ) = await _resolve_proxy_url(request, slug, "movie", media_id, None, None)
-    return _render(
-        request,
-        stream_url,
-        title,
-        autoplay,
-        selected_slug,
-        "movie",
-        media_id,
-        None,
-        None,
-        sources,
-        subtitles,
-        capabilities,
+def _failure_response(
+    request: Request,
+    slug: str,
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+    detail: str,
+) -> HTMLResponse:
+    """Return a usable player shell even when no host can serve the episode."""
+    config = get_config(slug)
+    selected = {
+        "id": slug,
+        "name": "Auto" if slug == "auto" else (config.canonical if config else slug),
+    }
+    retry = request.url.include_query_params(retry="1")
+    retry_url = f"{_origin(request)}{retry.path}?{retry.query}"
+    autoplay = request.query_params.get("autoplay", "").lower() in ("1", "true", "yes")
+    return HTMLResponse(
+        _player_html(
+            "",
+            f"{selected['name']} — {media_id}",
+            autoplay,
+            selected,
+            _server_options(request, media_type, media_id, season, episode, autoplay, slug),
+            sources=[],
+            subtitles=[],
+            capabilities={},
+            error=detail,
+            retry_url=retry_url,
+        ),
+        headers={"Cache-Control": "no-store"},
     )
 
 
-@embed_router.get("/{slug}/tv/{media_id}/{season}/{episode}", response_class=HTMLResponse)
-async def embed_tv(request: Request, slug: str, media_id: str, season: str, episode: str):
-    (
-        stream_url,
-        title,
-        autoplay,
-        selected_slug,
-        sources,
-        subtitles,
-        capabilities,
-    ) = await _resolve_proxy_url(request, slug, "tv", media_id, season, episode)
+async def _serve(
+    request: Request,
+    slug: str,
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+) -> HTMLResponse:
+    media_id, season, episode = _normalise_media(media_type, media_id, season, episode)
+    try:
+        (
+            stream_url,
+            title,
+            autoplay,
+            selected_slug,
+            sources,
+            subtitles,
+            capabilities,
+        ) = await _resolve_proxy_url(request, slug, media_type, media_id, season, episode)
+    except EmbedUnavailable as exc:
+        return _failure_response(request, slug, media_type, media_id, season, episode, exc.detail)
     return _render(
         request,
         stream_url,
         title,
         autoplay,
         selected_slug,
-        "tv",
+        media_type,
         media_id,
         season,
         episode,
@@ -812,3 +947,25 @@ async def embed_tv(request: Request, slug: str, media_id: str, season: str, epis
         subtitles,
         capabilities,
     )
+
+
+@embed_router.get("/{slug}/movie/{media_id}", response_class=HTMLResponse)
+async def embed_movie(request: Request, slug: str, media_id: str):
+    return await _serve(request, slug, "movie", media_id, None, None)
+
+
+@embed_router.get("/{slug}/tv/{media_id}", response_class=HTMLResponse)
+async def embed_tv(request: Request, slug: str, media_id: str):
+    return await _serve(request, slug, "tv", media_id, None, None)
+
+
+@embed_router.get("/{slug}/tv/{media_id}/{season}", response_class=HTMLResponse)
+async def embed_tv_season(request: Request, slug: str, media_id: str, season: str):
+    return await _serve(request, slug, "tv", media_id, season, None)
+
+
+@embed_router.get("/{slug}/tv/{media_id}/{season}/{episode}", response_class=HTMLResponse)
+async def embed_tv_episode(
+    request: Request, slug: str, media_id: str, season: str, episode: str
+):
+    return await _serve(request, slug, "tv", media_id, season, episode)

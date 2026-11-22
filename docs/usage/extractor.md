@@ -119,12 +119,14 @@ MediaFlow owns the iframe player, the embed-host registry, host selection, and f
 | Endpoint | Description |
 |---|---|
 | `/embed/auto/movie/<tmdb_id>` | Movie player with automatic host selection |
+| `/embed/auto/tv/<tmdb_id>` | Show player, defaults to season 1 episode 1 |
+| `/embed/auto/tv/<tmdb_id>/<season>` | Show player, defaults to episode 1 |
 | `/embed/auto/tv/<tmdb_id>/<season>/<episode>` | TV episode player with automatic host selection |
 | `/embed/<slug>/movie/<tmdb_id>` | Force one host (for debugging) |
-| `/embed/<slug>/tv/<tmdb_id>/<season>/<episode>` | Force one host (for debugging) |
+| `/embed/<slug>/tv/<tmdb_id>[/<season>[/<episode>]]` | Force one host (for debugging) |
 | `/embed/servers` | JSON list of available servers and priorities |
 
-`auto` tries hosts in priority order — VidCore, VSEmbed, then the remaining historical hosts — and skips hosts that recently failed (5 minute negative cache). The generated player includes a small control panel inside the iframe, so Streamflix does not need a server picker of its own: **Server**, **Kualitas**, **Subtitle**, **Audio**, and **Speed**. Quality/audio/subtitle tracks come from the HLS manifest and, for VidCore, from the upstream `sources`/`subtitles` API metadata. Subtitle default is Indonesian, falling back to English when no Indonesian track exists; everything else starts as Off. Nested variant playlists inherit `force_playlist_proxy`, so AES keys, segments, and external `.vtt` subtitles stay on the gateway instead of leaking to the embed host (which often blocks cross-origin playback).
+TV IDs accept an optional `tv-` prefix, and season/episode values are coerced to positive integers (invalid or zero values fall back to `1`). `auto` probes VidCore and VSEmbed first, then fans the remaining hosts out in parallel. Each probe has a 6 second timeout and the whole selection is capped at 15 seconds; the first healthy host wins and slower probes are cancelled. Failures are skipped via a 60 second negative cache. If no host can serve the exact episode, MediaFlow still returns its player shell with a readable error, a **Ulangi** button, and the server dropdown — never a blank iframe or a raw 502 page. The generated player includes a small control panel inside the iframe, so Streamflix does not need a server picker of its own: **Server**, **Kualitas**, **Subtitle**, **Audio**, and **Speed**. Quality/audio/subtitle tracks come from the HLS manifest and, for VidCore, from the upstream `sources`/`subtitles` API metadata. Subtitle default is Indonesian, falling back to English when no Indonesian track exists; everything else starts as Off. Nested variant playlists inherit `force_playlist_proxy`, so AES keys, segments, and external `.vtt` subtitles stay on the gateway instead of leaking to the embed host (which often blocks cross-origin playback).
 
 Examples:
 
@@ -160,7 +162,7 @@ Query parameters: `delay` in milliseconds (default `3000`), `autoplay_trailer` (
 
 The embed player keeps its controls inside the iframe, positioned at the bottom so they never overlap StreamFlix's top navigation/player header.
 
-Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route.
+Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route. `?retry=1` clears the negative cache for that movie/episode and probes every host again; the player's **Ulangi** button uses it automatically.
 
 In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:
 

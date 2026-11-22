@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
+from starlette.requests import Request
 
 from mediaflow_proxy.extractors.base import HttpResponse
 from mediaflow_proxy.extractors.embed_hosts import (
@@ -110,6 +112,9 @@ def test_player_html_emits_server_track_controls_and_error_messages():
     # MediaFlow controls sit below the video, never over StreamFlix's top header.
     assert "bottom:52px" in player
     assert "top:6px" not in player
+    # A failed selection reuses the same player shell with a retry control.
+    assert 'id="retry"' in player
+    assert "__MFP_ERROR__" not in player
     assert PLAYER_LANGUAGE_PRIORITY[5] == "en"
 
 
@@ -337,3 +342,79 @@ async def test_host_allowlist_is_enforced():
 
     with pytest.raises(Exception, match="not allowed"):
         await extractor.extract("https://evil.example/embed/movie/550")
+
+
+# ---------------------------------------------------------------------------
+# StreamFlix TV/episode requests and bounded auto failover
+# ---------------------------------------------------------------------------
+
+
+def _embed_request(path: str = "/embed/auto/tv/1399/1/1", query: str = "autoplay=true") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "https",
+            "server": ("mfp.example", 443),
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [(b"host", b"mfp.example")],
+        }
+    )
+
+
+def test_tv_params_are_normalised_for_streamflix_urls():
+    from mediaflow_proxy.routes.embed import _normalise_media
+
+    assert _normalise_media("tv", "tv-1399", "0", "oops") == ("1399", "1", "1")
+    assert _normalise_media("tv", "94997", "2", "5") == ("94997", "2", "5")
+    assert _normalise_media("movie", "550", None, None) == ("550", None, None)
+
+
+@pytest.mark.asyncio
+async def test_auto_resolver_uses_first_healthy_host(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    embed_routes._negative_cache.clear()
+    probed: list[str] = []
+
+    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
+        probed.append(config.canonical)
+        if config.canonical == "VidCore":
+            await asyncio.sleep(0.01)
+            return config, ("stream", "VidCore — 1399", True, "vidcore", [], [], {}), None
+        await asyncio.sleep(5)
+        return config, None, f"{config.canonical}: slow"
+
+    monkeypatch.setattr(embed_routes, "_probe_config", fake_probe)
+    result = await embed_routes._resolve_proxy_url(
+        _embed_request(), "auto", "tv", "tv-1399", "1", "1"
+    )
+
+    assert result[0] == "stream"
+    assert probed[0] == "VidCore"
+
+
+@pytest.mark.asyncio
+async def test_auto_failure_renders_player_with_retry(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    embed_routes._negative_cache.clear()
+
+    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
+        return config, None, f"{config.canonical}: episode unavailable"
+
+    monkeypatch.setattr(embed_routes, "_probe_config", fake_probe)
+    request = _embed_request("/embed/auto/tv/94997/1/1")
+
+    with pytest.raises(embed_routes.EmbedUnavailable):
+        await embed_routes._resolve_proxy_url(request, "auto", "tv", "94997", "1", "1")
+
+    page = embed_routes._failure_response(
+        request, "auto", "tv", "94997", "1", "1", "all hosts failed"
+    ).body.decode()
+    assert "all hosts failed" in page
+    assert 'id="retry"' in page
+    assert "retry=1" in page
+    assert "api_password" not in page
