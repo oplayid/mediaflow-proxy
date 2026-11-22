@@ -9,6 +9,8 @@ services:
     environment:
       # Set this in Coolify's environment variables section (required).
       API_PASSWORD: ${API_PASSWORD:?API_PASSWORD must be set in Coolify}
+      # Optional: enables /trailer/... YouTube trailer endpoints (TMDB v3 key).
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
       # Coolify sits behind Traefik; without this the client IP is read as 127.0.0.1
       # and IP-bound encrypted URLs will fail.
       FORWARDED_ALLOW_IPS: "*"

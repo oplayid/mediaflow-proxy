@@ -3,6 +3,7 @@
 Set the following environment variables:
 
 - `API_PASSWORD`: Optional. Protects against unauthorized access and API network abuses.
+- `TMDB_API_KEY`: Optional. TMDB v3 API key used by the public `/trailer/...` endpoints to select a YouTube trailer (Indonesian first, then English). The key stays server-side and is never rendered into the browser.
 - `ENABLE_STREAMING_PROGRESS`: Optional. Enable streaming progress logging. Default is `false`.
 - `DISABLE_SSL_VERIFICATION_GLOBALLY`: Optional. Disable SSL verification for all requests globally. Default is `false`.
 - `DISABLE_HOME_PAGE`: Optional. Disables the home page UI. Returns 403 for the root path and direct access to index.html. Default is `false`.

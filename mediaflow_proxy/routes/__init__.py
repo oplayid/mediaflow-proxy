@@ -6,6 +6,7 @@ __all__ = [
     "xtream_root_router",
     "acestream_router",
     "telegram_router",
+    "trailer_router",
 ]
 
 
@@ -40,4 +41,8 @@ def __getattr__(name: str):
         from .telegram import telegram_router
 
         return telegram_router
+    if name == "trailer_router":
+        from .trailer import trailer_router
+
+        return trailer_router
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

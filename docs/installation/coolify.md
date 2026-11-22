@@ -28,7 +28,8 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
    | Variable | Example | Notes |
    |----------|---------|-------|
    | `API_PASSWORD` | `my-secret` | Required. Without it authentication and encrypted URLs are disabled. |
-   | `MFP_IMAGE` | `ghcr.io/oplayid/mediaflow-proxy:2.4.1` | Optional; defaults to `:latest`. Use an immutable version tag in production. |
+   | `MFP_IMAGE` | `ghcr.io/oplayid/mediaflow-proxy:v2.4.5` | Optional; defaults to `:latest`. Use an immutable version tag in production. |
+   | `TMDB_API_KEY` | `your-tmdb-v3-key` | Optional. Enables `/trailer/...` YouTube trailer pages; the key is never sent to the browser. |
 
 3. Set your domain and enable HTTPS in Coolify as usual; Traefik routes to port `8888`.
 4. The compose file defines a healthcheck on `GET /health` and a Redis 7 service with a persistent volume. Redis is optional for the app itself but strongly recommended: rate limiting, locks, extractor deduplication, segment caching and HLS/DASH prebuffer coordination all use it, and Redis failures are fail-open.

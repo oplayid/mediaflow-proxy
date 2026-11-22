@@ -133,6 +133,19 @@ https://mfp.oplay.id/embed/auto/movie/550
 https://mfp.oplay.id/embed/auto/tv/1399/1/1?autoplay=true
 ```
 
+### YouTube trailer endpoints
+
+MediaFlow can also own trailer selection. Set `TMDB_API_KEY` (TMDB v3 key) on the server; the key is never exposed to the browser.
+
+| Endpoint | Description |
+|---|---|
+| `/trailer/movie/<tmdb_id>` | Iframe page with the movie's YouTube trailer |
+| `/trailer/tv/<tmdb_id>` | Iframe page with the show's YouTube trailer |
+| `/trailer/tv/<tmdb_id>/<season>/<episode>` | Same show trailer, for URL symmetry with embed routes |
+| `/trailer/info/movie/<tmdb_id>` | Debug JSON: selected key, language, type |
+
+Query parameters for the player pages: `autoplay` (default `true`), `mute` (default `true`, required for autoplay), `controls` (default `false`), `loop` (default `true`). MediaFlow picks a YouTube trailer from TMDB `/videos` with Indonesian first, English second; if none exists it renders a small "Trailer tidak tersedia" placeholder. The YouTube stream itself stays in the viewer's browser, so the gateway only performs a small cached TMDB JSON lookup.
+
 Add `?autoplay=true` to start muted autoplay. `?server=<slug>` can force a host while still using the `auto` route.
 
 In addition to the existing `OPLAY_EMBED_READY` / `OPLAY_EMBED_PROGRESS` messages, the player emits:
