@@ -21,7 +21,13 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from mediaflow_proxy.extractors.embed_hosts import AUTO_HOST_ORDER, build_embed_url, get_config
+from mediaflow_proxy.extractors.embed_hosts import (
+    AUTO_HOST_ORDER,
+    FLOW_VIDSPARK,
+    FLOW_VSEMBED,
+    build_embed_url,
+    get_config,
+)
 from mediaflow_proxy.routes.embed import _normalise_media, _origin
 from mediaflow_proxy.utils.http_client import create_aiohttp_session
 
@@ -61,13 +67,28 @@ def _options(
     episode: str | None,
     autoplay: bool,
     selected_slug: str,
+    resolved_host_url: str,
 ) -> list[dict]:
-    options: list[dict] = [{"id": "auto", "name": "Auto"}]
+    """Build the server switcher.
+
+    ``url`` is the relay URL (navigation stays on mfp.oplay.id), while
+    ``hostUrl`` is the translated provider embed URL loaded by the nested
+    iframe. Keeping them separate prevents the relay from loading itself.
+    """
+    options: list[dict] = [
+        {"id": "auto", "name": "Auto", "hostUrl": resolved_host_url},
+    ]
     for canonical in AUTO_HOST_ORDER:
         config = get_config(canonical)
         if not config:
             continue
-        options.append({"id": config.slug, "name": config.canonical})
+        options.append(
+            {
+                "id": config.slug,
+                "name": config.canonical,
+                "hostUrl": build_embed_url(config, media_type, media_id, season, episode),
+            }
+        )
     for option in options:
         option["url"] = (
             f"{_origin(request)}"
@@ -84,6 +105,7 @@ def _relay_html(
     season: str,
     episode: str,
     autoplay: bool,
+    error: str | None = None,
 ) -> HTMLResponse:
     option_markup = "".join(
         '<option value="{url}"{selected}>{name}</option>'.format(
@@ -126,6 +148,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden}
   var INDEX = __MFP_INDEX__;
   var MEDIA = __MFP_MEDIA__;
   var AUTOPLAY = __MFP_AUTOPLAY__;
+  var INITIAL_ERROR = __MFP_ERROR_JSON__;
   var frame = document.getElementById('host');
   var serverSel = document.getElementById('server');
   var err = document.getElementById('err');
@@ -154,15 +177,19 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden}
     ready = false;
     err.style.display = 'none';
     serverSel.value = OPTIONS[index].url;
-    frame.src = OPTIONS[index].url;
+    // Load the *provider* embed here. OPTIONS[index].url is the relay page
+    // itself and must never be used as the nested iframe src.
+    var target = OPTIONS[index].hostUrl;
+    if (target && frame.src !== target) frame.src = target;
     post('OPLAY_EMBED_SERVER', serverInfo());
   }
   function nextHost() { load(INDEX + 1); }
 
+  // Switching servers navigates the relay page, so the address bar, refresh
+  // and history all keep pointing at mfp.oplay.id (never at a provider).
   serverSel.addEventListener('change', function () {
-    for (var i = 0; i < OPTIONS.length; i++) {
-      if (OPTIONS[i].url === serverSel.value) { load(i); return; }
-    }
+    var target = serverSel.value;
+    if (target && target !== window.location.href) window.location.href = target;
   });
   nextBtn.addEventListener('click', nextHost);
 
@@ -221,6 +248,11 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden}
   });
 
   load(INDEX);
+  if (INITIAL_ERROR) {
+    errmsg.textContent = INITIAL_ERROR;
+    err.style.display = 'flex';
+    post('OPLAY_EMBED_ERROR', { message: INITIAL_ERROR });
+  }
 })();
 </script>
 </body>
@@ -233,6 +265,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden}
         "__MFP_INDEX__": str(next(i for i, o in enumerate(options) if o["selected"])),
         "__MFP_MEDIA__": _js_json({"season": int(season), "episode": int(episode)}),
         "__MFP_AUTOPLAY__": "true" if autoplay else "false",
+        "__MFP_ERROR_JSON__": _js_json(error) if error else "null",
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
@@ -244,25 +277,99 @@ def _js_json(value) -> str:
     return json.dumps(value).replace("<", "\\u003c")
 
 
+async def _relay_reachable(config, media_type: str, media_id: str, season: str, episode: str) -> bool:
+    """Only check that the provider's embed page responds."""
+    url = build_embed_url(config, media_type, media_id, season, episode)
+    try:
+        async with create_aiohttp_session(url, timeout=RELAY_PROBE_TIMEOUT) as (session, proxy_url):
+            async with session.head(url, proxy=proxy_url, allow_redirects=True) as response:
+                return response.status < 400 or response.status == 405
+    except Exception as exc:
+        logger.debug("[relay] %s reachability probe failed: %s", config.canonical, exc)
+        return False
+
+
+async def _relay_has_episode(config, media_type: str, media_id: str, season: str, episode: str) -> bool:
+    """Ask the provider whether it really has this exact movie/episode."""
+    if config.flow == FLOW_VIDSPARK and config.api_base:
+        path = (
+            f"/tv/{media_id}/{season}/{episode}"
+            if media_type == "tv"
+            else f"/movie/{media_id}"
+        )
+        api_url = f"{config.api_base.rstrip('/')}{path}"
+        try:
+            async with create_aiohttp_session(
+                api_url, timeout=RELAY_PROBE_TIMEOUT, headers=config.api_headers or None
+            ) as (session, proxy_url):
+                async with session.get(api_url, proxy=proxy_url) as response:
+                    payload = await response.json(content_type=None)
+            return bool(
+                isinstance(payload, dict)
+                and payload.get("result")
+                and payload.get("sources")
+            )
+        except Exception as exc:
+            logger.debug("[relay] %s episode probe failed: %s", config.canonical, exc)
+            return False
+
+    if config.flow == FLOW_VSEMBED:
+        origin = f"https://{config.domains[0]}"
+        gate_url = f"{origin}/vs_src.php?type={media_type}&id={media_id}"
+        try:
+            async with create_aiohttp_session(
+                gate_url, timeout=RELAY_PROBE_TIMEOUT
+            ) as (session, proxy_url):
+                async with session.get(
+                    gate_url,
+                    proxy=proxy_url,
+                    headers={
+                        "Referer": build_embed_url(config, media_type, media_id, season, episode),
+                        "Accept": "application/json",
+                    },
+                ) as response:
+                    payload = await response.json(content_type=None)
+            return bool(isinstance(payload, dict) and payload.get("src"))
+        except Exception as exc:
+            logger.debug("[relay] %s gate probe failed: %s", config.canonical, exc)
+            return False
+
+    return True
+
+
 async def _pick_auto_config(media_type: str, media_id: str, season: str, episode: str):
-    """Pick the first provider whose embed page is reachable right now."""
+    """Pick a provider that is reachable *and* actually serves this episode.
+
+    A plain HTTP probe is not enough: VidCore's embed page always answers 200,
+    even when VidSpark's API answers ``Episode not found``. VSEmbed has a gate
+    endpoint that only returns a player URL for media it can serve. Providers
+    without such metadata fall back to the reachability check.
+    """
     configs = [get_config(name) for name in AUTO_RELAY_CANDIDATES]
     configs = [config for config in configs if config]
 
     async def check(config):
-        url = build_embed_url(config, media_type, media_id, season, episode)
-        try:
-            async with create_aiohttp_session(url, timeout=RELAY_PROBE_TIMEOUT) as (session, proxy_url):
-                async with session.head(url, proxy=proxy_url, allow_redirects=True) as response:
-                    return config if response.status < 400 or response.status == 405 else None
-        except Exception as exc:
-            logger.debug("[relay] %s probe failed: %s", config.canonical, exc)
-            return None
+        online = await _relay_reachable(config, media_type, media_id, season, episode)
+        available = (
+            await _relay_has_episode(config, media_type, media_id, season, episode)
+            if online
+            else False
+        )
+        return config, online, available
 
     if configs:
         results = await asyncio.gather(*(check(config) for config in configs))
-        for config in results:
-            if config:
+        for config, online, available in results:
+            if online and available:
+                logger.info(
+                    "[relay] auto selected %s for %s/%s/%s/%s",
+                    config.canonical, media_type, media_id, season, episode,
+                )
+                return config
+        # Nothing confirmed the episode exists: still render a usable switcher
+        # with the first reachable provider rather than a hard 502.
+        for config, online, _available in results:
+            if online:
                 return config
     return configs[0] if configs else get_config("VidCore")
 
@@ -291,13 +398,24 @@ async def relay_response(
     # the provider actually chosen by the probe.
     selected_slug = config.slug
     host_url = build_embed_url(config, media_type, media_id, season, episode)
+
+    # For a manually selected host, tell the user immediately when upstream
+    # reports that this exact episode does not exist. The auto route already
+    # skipped such hosts during probing.
+    error = None
+    if slug != "auto" and not await _relay_has_episode(
+        config, media_type, media_id, season, episode
+    ):
+        error = f"{config.canonical} tidak menyediakan episode ini."
+
     return _relay_html(
         f"{config.canonical} — {media_id}",
         host_url,
-        _options(request, media_type, media_id, season, episode, autoplay, selected_slug),
+        _options(request, media_type, media_id, season, episode, autoplay, selected_slug, host_url),
         season or "1",
         episode or "1",
         autoplay,
+        error,
     )
 
 

@@ -173,10 +173,10 @@ StreamFlix owns its own URL scheme; every embed provider has a different one. Me
 | `/embed/relay/vidcore/tv/94997/1/1` | `https://vidcore.org/embed/tv/94997/1/1` |
 | `/embed/relay/vsembed/tv/94997/1/1` | `https://stream.oplay.id/embed/tv/94997/1/1` |
 | `/embed/relay/2embed/tv/94997/1/1` | `https://www.2embed.cc/embedtv/94997&s=1&e=1` |
-| `/embed/relay/auto/movie/550` | first reachable provider embed page |
+| `/embed/relay/auto/movie/550` | first reachable provider that actually has the media |
 | `/embed/relay/hosts` | debug JSON of the translation table |
 
-The relay page is a thin MediaFlow wrapper around the provider's own embed URL. All server switching happens through `/embed/relay/...` URLs, so StreamFlix never handles provider URLs. A `postMessage` bridge forwards StreamFlix playback commands down to the provider, mirrors provider messages (VSEmbed's `PLAYER_TITLE`, `TV_INFO`, `TV_STATE`, `MEDIA_NOT_FOUND`, `VS_EXPIRED`) up to StreamFlix, and sends `TV_SET` on handshake so season/episode stay in sync. Providers that do not report playback time cannot drive `OPLAY_EMBED_PROGRESS`, so the native HLS player remains the default for progress/history accuracy.
+The relay page is a thin MediaFlow wrapper around the provider's own embed URL. The nested iframe always loads the **provider** URL; the server dropdown navigates the relay page through `/embed/relay/...` URLs, so StreamFlix never handles provider URLs and the relay can never load itself recursively. Auto selection first checks reachability and then asks providers with metadata whether the exact movie/episode exists — VidCore/VidSpark via its API (`Episode not found` is skipped) and VSEmbed via its gate. A manually selected host that reports a missing episode shows an error with a **Coba host berikutnya** button immediately. A `postMessage` bridge forwards StreamFlix playback commands down to the provider, mirrors provider messages (VSEmbed's `PLAYER_TITLE`, `TV_INFO`, `TV_STATE`, `MEDIA_NOT_FOUND`, `VS_EXPIRED`) up to StreamFlix, and sends `TV_SET` on handshake so season/episode stay in sync. Providers that do not report playback time cannot drive `OPLAY_EMBED_PROGRESS`, so the native HLS player remains the default for progress/history accuracy.
 
 The normal embed routes accept `?mode=relay` to force this mode, and automatically fall back to it whenever HLS extraction fails for every host. `?retry=1` still forces a fresh attempt.
 

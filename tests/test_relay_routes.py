@@ -41,6 +41,10 @@ async def test_relay_translates_streamflix_tv_url_to_provider_url(monkeypatch):
     assert "https://vidcore.org/embed/tv/94997/1/1" in body
     assert "https://vidcore.org/embed/tv/94997/1/1?autoplay=true" in body
     assert "/embed/relay/vidcore/tv/94997/1/1" in body
+    assert '"hostUrl": "https://vidcore.org/embed/tv/94997/1/1?autoplay=true&lang=id&theme=FCC217"' in body
+    assert "var target = OPTIONS[index].hostUrl;" in body
+    assert "frame.src = target;" in body
+    assert "frame.src = OPTIONS[index].url" not in body
     assert "api_password" not in body
     assert "__MFP_" not in body
 
@@ -53,6 +57,7 @@ def test_relay_bridge_exposes_streamflix_contract():
             "id": "vidcore",
             "name": "VidCore",
             "url": "https://mfp.example/embed/relay/vidcore/tv/94997/1/1",
+            "hostUrl": "https://vidcore.org/embed/tv/94997/1/1",
             "selected": True,
         }
     ]
@@ -72,6 +77,57 @@ def test_relay_bridge_exposes_streamflix_contract():
     assert "MEDIA_NOT_FOUND" in body
     assert "TV_SET" in body
     assert 'id="next"' in body
+    assert "var target = OPTIONS[index].hostUrl;" in body
+    assert "frame.src = target;" in body
+    assert "frame.src = OPTIONS[index].url" not in body
+    assert "window.location.href = target" in body
+
+
+def test_relay_preflight_error_offers_next_host():
+    from mediaflow_proxy.routes.relay import _relay_html
+
+    options = [
+        {
+            "id": "vidcore",
+            "name": "VidCore",
+            "url": "https://mfp.example/embed/relay/vidcore/tv/293610/1/1",
+            "hostUrl": "https://vidcore.org/embed/tv/293610/1/1",
+            "selected": True,
+        }
+    ]
+    body = _relay_html(
+        "VidCore — 293610",
+        "https://vidcore.org/embed/tv/293610/1/1",
+        options,
+        "1",
+        "1",
+        True,
+        "VidCore tidak menyediakan episode ini.",
+    ).body.decode()
+
+    assert "VidCore tidak menyediakan episode ini." in body
+    assert "INITIAL_ERROR" in body
+    assert "post('OPLAY_EMBED_ERROR'" in body
+    assert 'id="next"' in body
+
+
+@pytest.mark.asyncio
+async def test_auto_skips_provider_that_reports_missing_episode(monkeypatch):
+    from mediaflow_proxy.routes import relay as relay_routes
+
+    async def reachable(config, *_args, **_kwargs):
+        return config.canonical in ("VidCore", "VSEmbed", "MultiEmbed")
+
+    async def has_episode(config, *_args, **_kwargs):
+        # VidCore's embed page is 200 but VidSpark says "Episode not found";
+        # VSEmbed's gate has no usable player either.
+        return config.canonical == "MultiEmbed"
+
+    monkeypatch.setattr(relay_routes, "_relay_reachable", reachable)
+    monkeypatch.setattr(relay_routes, "_relay_has_episode", has_episode)
+
+    chosen = await relay_routes._pick_auto_config("tv", "293610", "1", "1")
+    assert chosen.canonical == "MultiEmbed"
 
 
 def test_relay_translates_host_specific_url_shapes():
