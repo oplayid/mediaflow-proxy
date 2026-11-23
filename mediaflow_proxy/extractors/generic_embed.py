@@ -868,22 +868,51 @@ class GenericEmbedExtractor(BaseExtractor):
         else:
             api_url = f"{api_base}/movie/{api_token}?multiLang=0"
 
-        response = await self._make_request(
-            url=api_url,
-            headers={
-                "Referer": url,
-                "Accept": "application/json",
-                "X-Playback-Environment": "dash-hevc",
-            },
-        )
-        try:
-            payload = response.json()
-        except Exception as exc:
-            raise ExtractorError(f"{self.config.canonical}: invalid playback API response") from exc
-        if not isinstance(payload, dict) or not payload.get("stream"):
-            raise ExtractorError(
-                f"{self.config.canonical}: content_unavailable: playback API returned no stream"
+        # VidLink's current browser contract selects the DASH playlist with the
+        # `webkit` environment. `dash-hevc` is kept only as a compatibility
+        # fallback: asking for HEVC up front made some titles start and then
+        # fail a couple of seconds later when neither the browser nor the
+        # transcode path could decode the selected rendition.
+        payload = None
+        used_environment = ""
+        invalid_response = False
+        for environment in ("webkit", "dash-hevc"):
+            try:
+                candidate_response = await self._make_request(
+                    url=api_url,
+                    headers={
+                        "Referer": url,
+                        "Origin": f"{parsed.scheme}://{parsed.netloc}",
+                        "Accept": "application/json",
+                        "X-Playback-Environment": environment,
+                    },
+                )
+                candidate_payload = candidate_response.json()
+            except Exception as exc:
+                invalid_response = True
+                logger.info(
+                    "[%s] playback API environment=%s failed: %s: %s",
+                    self.config.canonical,
+                    environment,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+
+            if isinstance(candidate_payload, dict) and candidate_payload.get("stream"):
+                payload = candidate_payload
+                used_environment = environment
+                invalid_response = False
+                break
+            invalid_response = False
+
+        if payload is None:
+            reason = (
+                "invalid playback API response"
+                if invalid_response
+                else "playback API returned no stream"
             )
+            raise ExtractorError(f"{self.config.canonical}: content_unavailable: {reason}")
 
         cleaned = self._vidlink_sources_from_payload(payload, api_url)
         if not cleaned:
@@ -898,11 +927,12 @@ class GenericEmbedExtractor(BaseExtractor):
             subtitles.extend(_collect_api_subtitles(stream))
         subtitles.extend(_collect_api_subtitles(payload))
         logger.info(
-            "[%s] resolved %s -> %s (%s sources)",
+            "[%s] resolved %s -> %s (%s sources, environment=%s)",
             self.config.canonical,
             url,
             destination,
             len(cleaned),
+            used_environment,
         )
         return self._result(
             destination,

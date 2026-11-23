@@ -707,6 +707,86 @@ async def test_vidlink_movie_playback_api():
 
 
 @pytest.mark.asyncio
+async def test_vidlink_uses_webkit_environment_and_keeps_source_headers():
+    config = EMBED_HOSTS["VidLink"]
+    extractor = GenericEmbedExtractor({}, config)
+    token = "A" * 64
+    embed_url = f"https://vidlink.pro/movie/786892?adv_token={token}"
+    api_url = f"https://vidlink.pro/api/b/movie/{token}?multiLang=0"
+    calls: list[dict] = []
+
+    async def fake_request(url: str, **kwargs) -> HttpResponse:
+        assert url == api_url
+        calls.append(kwargs)
+        return _vidlink_api_response(url)
+
+    extractor._make_request = fake_request  # type: ignore[method-assign]
+    result = await extractor.extract(embed_url)
+
+    assert len(calls) == 1
+    assert calls[0]["headers"]["X-Playback-Environment"] == "webkit"
+    assert calls[0]["headers"]["Origin"] == "https://vidlink.pro"
+    assert result["sources"][0]["request_headers"]["referer"] == "https://filmboom.top/"
+
+
+@pytest.mark.asyncio
+async def test_vidlink_falls_back_to_dash_hevc_when_webkit_has_no_stream():
+    config = EMBED_HOSTS["VidLink"]
+    extractor = GenericEmbedExtractor({}, config)
+    token = "A" * 64
+    embed_url = f"https://vidlink.pro/movie/786892?adv_token={token}"
+    environments: list[str] = []
+
+    async def fake_request(url: str, **kwargs) -> HttpResponse:
+        environment = kwargs["headers"]["X-Playback-Environment"]
+        environments.append(environment)
+        if environment == "webkit":
+            return _response(url, text=json.dumps({"stream": None}))
+        return _vidlink_api_response(url)
+
+    extractor._make_request = fake_request  # type: ignore[method-assign]
+    result = await extractor.extract(embed_url)
+
+    assert environments == ["webkit", "dash-hevc"]
+    assert result["destination_url"] == "https://cdn.example/video-1080.mp4?sign=abc"
+
+
+@pytest.mark.asyncio
+async def test_vidlink_playlist_headers_reach_signed_source():
+    from mediaflow_proxy.routes.embed import _headers_for_destination
+
+    config = EMBED_HOSTS["VidLink"]
+    extractor = GenericEmbedExtractor({}, config)
+    token = "A" * 64
+    embed_url = f"https://vidlink.pro/movie/786892?adv_token={token}"
+    api_url = f"https://vidlink.pro/api/b/movie/{token}?multiLang=0"
+    cookie = (
+        "CloudFront-Policy=eyJpolicy; CloudFront-Signature=signed; "
+        "CloudFront-Key-Pair-Id=K1EXAMPLE"
+    )
+    payload = {
+        "stream": {
+            "id": "primary",
+            "url": "https://cdn.example/dash/index.mpd",
+            "playlistHeaders": {
+                "Cookie": cookie,
+                "Referer": "https://vidlink.pro/",
+            },
+            "captions": [],
+        }
+    }
+
+    _mock_requests(extractor, {api_url: _response(api_url, text=json.dumps(payload))})
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == "https://cdn.example/dash/index.mpd"
+    assert result["sources"][0]["request_headers"]["Cookie"] == cookie
+    signed_headers = _headers_for_destination(result, result["destination_url"])
+    assert signed_headers is not None
+    assert signed_headers["Cookie"] == cookie
+
+
+@pytest.mark.asyncio
 async def test_vidlink_tv_playback_api_uses_season_episode():
     config = EMBED_HOSTS["VidLink"]
     extractor = GenericEmbedExtractor({}, config)
