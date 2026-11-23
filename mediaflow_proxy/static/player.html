@@ -46,9 +46,9 @@
 
   <script src="/vendor/hls.min.js"></script>
   <script src="/vendor/dash.all.min.js"></script>
-  <script>
-    window.__MFP_SESSION__ = /*__MFP_SESSION__*/null;
-  </script>
+  <!-- CSP-safe data block: script-src 'self' forbids executable inline scripts,
+       but a non-JavaScript type is a data block and is never executed. -->
+  <script type="application/json" id="mfp-session">/*__MFP_SESSION__*/null</script>
   <script src="/player.js"></script>
 </body>
 </html>

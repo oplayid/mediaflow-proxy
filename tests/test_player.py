@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -201,6 +202,38 @@ def test_player_js_retries_inside_iframe():
     assert "/retry?" in text
     assert "mfp:host" not in text
     assert "start_time" in text
+
+
+def test_player_session_is_csp_safe():
+    static_dir = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static"
+    html = (static_dir / "player.html").read_text(encoding="utf-8")
+    js = (static_dir / "player.js").read_text(encoding="utf-8")
+
+    assert '<script type="application/json" id="mfp-session">/*__MFP_SESSION__*/null</script>' in html
+    # `script-src 'self'` has no unsafe-inline: every script tag must either be
+    # an external file or a non-executable JSON data block.
+    for tag in re.findall(r"<script\b[^>]*>", html, re.IGNORECASE):
+        assert "src=" in tag or 'type="application/json"' in tag, tag
+    assert 'getElementById("mfp-session")' in js
+    assert "JSON.parse(element.textContent" in js
+
+
+def test_render_player_injects_session_into_data_block():
+    from mediaflow_proxy.routes.player import _render_player
+
+    rendered = _render_player(
+        {
+            "candidates": [{"host": "VidCore", "url": "https://mfp.example/proxy?d=</script>"}],
+            "subtitles": [],
+            "audit": {},
+            "generated_at": 0,
+        }
+    )
+    marker = '<script type="application/json" id="mfp-session">'
+    assert marker in rendered
+    block = rendered.split(marker, 1)[1].split("</script>", 1)[0]
+    assert "<\\/script>" in block
+    assert "</script>" not in block
 
 
 def test_classify_manifest():

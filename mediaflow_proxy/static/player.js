@@ -1,7 +1,20 @@
 (function () {
   "use strict";
 
-  var session = window.__MFP_SESSION__ || { candidates: [], subtitles: [], audit: {} };
+  // The session lives in a non-executable <script type="application/json">
+  // data block. The old inline assignment is blocked by `script-src 'self'`.
+  function readSession() {
+    var element = document.getElementById("mfp-session");
+    var legacy = window.__MFP_SESSION__ || { candidates: [], subtitles: [], audit: {} };
+    if (!element) return legacy;
+    try {
+      return JSON.parse(element.textContent || "null") || legacy;
+    } catch (error) {
+      return legacy;
+    }
+  }
+
+  var session = readSession();
   var candidates = Array.isArray(session.candidates) ? session.candidates : [];
   var subtitles = Array.isArray(session.subtitles) ? session.subtitles : [];
 
