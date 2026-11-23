@@ -189,6 +189,14 @@
       playCandidate(next, video.currentTime);
       return;
     }
+    // Standby host selection stays inside this iframe. Reloading /retry with
+    // the failed host excluded makes the server continue down PLAYER_HOSTS;
+    // StreamFlix only ever sees the ID and the opaque player URL.
+    if ((session.audit || {}).retry_available) {
+      setOverlay("Host " + candidate.host + " gagal. Mencoba host berikutnya…", 70);
+      retryExcluding(candidate.host);
+      return;
+    }
     showError(source === "transcode"
       ? "Transcode HEVC gagal. Silakan coba ulang."
       : "Semua host gagal diputar. Silakan cari ulang host.");
@@ -288,6 +296,20 @@
     window.location.href = path.replace(/\/$/, "") + "/retry";
   }
 
+  // Keep the same encrypted token (it lives in the path prefix) and only add
+  // the explicit exclude/position query params. The middleware decrypts the
+  // token again on the /retry route and forwards these to simulate_session().
+  function retryExcluding(host) {
+    var audit = session.audit || {};
+    var excluded = Array.isArray(audit.excluded_hosts) ? audit.excluded_hosts.slice() : [];
+    if (host && excluded.indexOf(host) === -1) excluded.push(host);
+    var path = window.location.pathname.replace(/\/?retry\/?$/, "").replace(/\/$/, "");
+    var query = new URLSearchParams(window.location.search);
+    query.set("exclude", excluded.join(","));
+    if (video.currentTime > 0) query.set("t", String(Math.floor(video.currentTime)));
+    window.location.href = path + "/retry?" + query.toString();
+  }
+
   retryButton.addEventListener("click", retry);
   errorRetry.addEventListener("click", retry);
 
@@ -330,10 +352,9 @@
       video.pause();
     } else if (data.type === "mfp:play") {
       video.play().catch(function () {});
-    } else if (data.type === "mfp:host") {
-      var index = Number(data.index);
-      if (index >= 0 && index < candidates.length) playCandidate(index, video.currentTime);
     }
+    // No external host-switch command: Streamflix supplies only the media ID
+    // and renders the opaque player URL. Failover is owned here via /retry.
   });
 
   var media = session.media || {};
@@ -351,5 +372,5 @@
   fillSubtitles();
   fillHosts();
   setOverlay("Simulasi selesai. Menyiapkan " + candidates[0].host + "…", 100);
-  playCandidate(0, 0);
+  playCandidate(0, Number(session.start_time) || 0);
 })();

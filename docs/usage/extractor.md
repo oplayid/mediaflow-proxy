@@ -124,11 +124,11 @@ This redirects to the proxied HLS manifest URL, and because the request URL cont
 | `/gateway/resolve/tv/<tmdb_id>/<season>` | Show, defaults to episode 1 |
 | `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
 | `/_token_<token>/player/<type>/<id>[/<season>/<episode>]` | Smart player iframe (tokenized, no `api_password`) |
-| `/_token_<token>/player/<type>/<id>[/<season>[/<episode>]]/retry` | Re-run simulation with a clean cache |
+| `/_token_<token>/player/<type>/<id>[/<season>[/<episode>]]/retry` | Re-run simulation with a clean cache; `?exclude=<host>` skips a failed host and `&t=<seconds>` restores the position |
 | `/_token_<token>/player/transcode/<job>/master.m3u8` | Tokenized HLS output of a server-side HEVC → H.264 job |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway resolves **VidCore, VSEmbed, VidLink, then VidSrcTo** (10 seconds per host, 40 seconds total). The player uses a different, broader order: **VSEmbed, VidCore, VidLink, VidSrcTo**, followed by every host registered in `EMBED_HOSTS`. Set `PLAYER_HOSTS=VSEmbed,VidCore,VidLink,VidSrcTo` to override that order; keep `VidSrcTo` in the production list so it is actually probed. `VidSrcTo` follows the `vidsrc.to` wrapper to `vidsrc.sh`, reads its short-lived `/vs_src.php` gate, then reuses the VSEmbed player chain. It accepts numeric TMDB ids and IMDb `tt...` ids (`/embed/tv/tt.../1/2` becomes `/1-2` upstream). Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway resolves **VidCore, VSEmbed, VidLink, then VidSrcTo** (10 seconds per host, 40 seconds total). The player uses first-success order **VidCore, VSEmbed, VidSrcTo, VidLink**, then every other host in `EMBED_HOSTS`; it stops as soon as one host passes the probe. Override with `PLAYER_HOSTS=VidCore,VSEmbed,VidSrcTo,VidLink`. VidLink is last because DASH + HEVC transcoding is the most fragile path. `VidSrcTo` follows the `vidsrc.to` wrapper to `vidsrc.sh`, reads its short-lived `/vs_src.php` gate, then reuses the VSEmbed player chain. It accepts numeric TMDB ids and IMDb `tt...` ids (`/embed/tv/tt.../1/2` becomes `/1-2` upstream). Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
 
 Example:
 
@@ -159,9 +159,9 @@ GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1
 
 ### Player simulation
 
-Simulation starts when the iframe mounts, not on every play click. With a hard budget of `PLAYER_SIMULATION_BUDGET=10` seconds, the player resolves hosts concurrently (`RESOLVE_TIMEOUT=7.5`, `PROBE_TIMEOUT=2.5`, `PROBE_CONCURRENCY=4`), fetches a manifest plus one tiny segment range, detects HLS/DASH/MP4 and codecs, checks subtitle availability, then ranks candidates. DASH sources are always routed through the `/proxy/mpd/...` conversion pipeline, so their relative segments resolve correctly in both dash.js and the FFmpeg transcode prewarm; the candidate is reported to the browser as HLS even when the probe saw an MPD. HTTP 200 manifest +40, segment 200/206 +25, HLS +20, DASH +8, HEVC −25, latency bonus up to +10, Indonesian subtitle +5.
+Simulation starts when the iframe mounts, not on every play click. With a hard budget of `PLAYER_SIMULATION_BUDGET=10` seconds, the player walks `PLAYER_HOSTS` in order (`RESOLVE_TIMEOUT=7.5`, `PROBE_TIMEOUT=2.5`), resolves one host at a time, fetches a manifest plus one tiny segment range, detects HLS/DASH/MP4 and codecs, and checks subtitle availability. It stops at the first host that passes the probe — standby hosts are not probed up front, so no budget is wasted on hosts that will not be played. DASH sources are routed through the `/proxy/mpd/...` conversion pipeline, including padded `$Number%05d$` / `$Time%05d$` templates that previously stayed literal and made every segment request 404. Relative segments therefore resolve correctly in both dash.js and the FFmpeg transcode prewarm; the browser receives an HLS URL even when the probe saw an MPD.
 
-All playable candidates are kept in order. The browser can switch host or quality; if the active host fails, the player moves to the next candidate at the same `currentTime`. Native subtitles from every host are merged, deduplicated by language/label, and ordered `id` > `en` > others while retaining `host`/`origin` metadata. hls.js `1.6.13` and dash.js `4.7.4` are bundled locally, so no third-party CDN is contacted.
+Only the winning host is returned to the iframe, together with an `audit` object (`tried_hosts`, `excluded_hosts`, `retry_available`). If playback fails in the browser, the iframe reloads itself at `/player/.../retry?exclude=<failed_host>&t=<currentTime>`; the server continues down `PLAYER_HOSTS` and seeks to the same position. Streamflix never receives a host list and never participates in failover. Subtitles from the winner are normalised, deduplicated by language/label, and ordered `id` > `en` > others while retaining `host`/`origin` metadata. hls.js `1.6.13` and dash.js `4.7.4` are bundled locally, so no third-party CDN is contacted.
 
 ### HEVC → H.264 transcoding
 
@@ -170,18 +170,21 @@ Some hosts (notably VidLink DASH) only expose `hev1`/`hvc1`/`h265`, which most H
 - `PLAYER_TRANSCODE_HEVC=true` (default) enables the fallback; the candidate is marked `needs_transcode` and `playback_type="hls"`.
 - The source URL and signed headers stay server-side in the Redis job registry. FFmpeg re-encodes video to H.264 (`libx264`, `yuv420p`) and copies AAC audio when present, capped by `PLAYER_TRANSCODE_HEIGHT=720`, `PLAYER_TRANSCODE_CRF=23`, `PLAYER_TRANSCODE_PRESET=veryfast`, `PLAYER_TRANSCODE_HLS_TIME=4`.
 - `PLAYER_TRANSCODE_HLS_LIST_SIZE=0` keeps every VOD segment so playback starts at the beginning; idle jobs are stopped after `PLAYER_TRANSCODE_IDLE_TTL=300` seconds. At most `PLAYER_TRANSCODE_MAX_JOBS=4` run per worker.
-- The winner is prewarmed in the background so the 10-second simulation budget is unchanged. The player polls the tokenized manifest until it returns 200, showing **Menyiapkan transcode HEVC → H.264…**, then forces hls.js. If the job does not become ready within 25 seconds, the player tries the native proxied source once before falling back to the next candidate. FFmpeg stderr is logged with the job id when a process exits unexpectedly.
-- Native quality options are hidden for transcoded candidates; subtitles and host failover still work normally.
+- The winner is prewarmed in the background so the 10-second simulation budget is unchanged. The player polls the tokenized manifest until it returns 200, showing **Menyiapkan transcode HEVC → H.264…**, then forces hls.js. If the job does not become ready within 25 seconds, the player tries the native proxied source once before triggering the iframe retry with the next host. FFmpeg stderr is logged with the job id when a process exits unexpectedly.
+- Native quality options are hidden for transcoded candidates; subtitles still work, and failover is handled entirely by the iframe retry.
 
-Streamflix only listens to `postMessage` events (`ready`, `timeupdate`, `playing`, `paused`, `ended`, `error`) and may send `mfp:seek`, `mfp:setSubtitle`, `mfp:pause`, `mfp:play`, or `mfp:host`. `ready` and `sourcechange` include a `transcode` flag. On `playing`, StreamFlix hides its own controls/overlays so the iframe fills the screen; they return on `ended`, `error`, or a new `player_url`. CSP `frame-ancestors` is `https://movie.oplay.id` by default; override with `PLAYER_FRAME_ANCESTORS` if needed.
+Streamflix only listens to `postMessage` events (`ready`, `timeupdate`, `playing`, `paused`, `ended`, `error`) and may send `mfp:seek`, `mfp:setSubtitle`, `mfp:pause`, or `mfp:play`. It never sends a host command. `ready` and `sourcechange` include a `transcode` flag. On `playing`, StreamFlix hides its own controls/overlays so the iframe fills the screen; they return on `ended`, `error`, or a new `player_url`. CSP `frame-ancestors` is `https://movie.oplay.id` by default; override with `PLAYER_FRAME_ANCESTORS` if needed.
 
 ### Caching and retry
 
-The provider is contacted **once** per media identity. The extracted result is cached in MediaFlow for at most 6 hours, or for a shorter time when the upstream URL advertises its own expiry (`expires`, `exp`, or `e`). The simulated player session has a separate, shorter cache (`PLAYER_CACHE_TTL=600`, default 10 minutes) shared across workers via Redis when configured. `?retry=1` on the gateway clears the positive extractor cache; the player's **Cari ulang host** button uses `/player/.../retry` to bypass the player cache and re-run the simulation, e.g.:
+The provider is contacted **once** per media identity. The extracted result is cached in MediaFlow for at most 6 hours, or for a shorter time when the upstream URL advertises its own expiry (`expires`, `exp`, or `e`). The simulated player session has a separate, shorter cache (`PLAYER_CACHE_TTL=600`, default 10 minutes) shared across workers via Redis when configured. `?retry=1` on the gateway clears the positive extractor cache. The iframe's own **Cari ulang host** flow calls `/player/.../retry?exclude=<failed_host>&t=<seconds>` to bypass that cache, skip the failed host, and resume at the same position, e.g.:
 
 ```
 GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1?retry=1
+GET https://mfp.oplay.id/_token_<token>/player/tv/94997/1/1/retry?exclude=VidCore&t=42
 ```
+
+`exclude` and `t` are deliberately **query parameters, not fields of the encrypted token**: `EncryptionMiddleware` merges the decrypted payload over the query string, so including them in the token would silently erase the values appended by the iframe during a retry.
 
 There are no `?mode=`, `?server=`, `?slug=`, or legacy `/embed/...` routes: server selection is internal and cannot be overridden by the browser.
 

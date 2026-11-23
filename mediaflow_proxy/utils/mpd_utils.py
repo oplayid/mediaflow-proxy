@@ -11,6 +11,21 @@ import xmltodict
 
 logger = logging.getLogger(__name__)
 
+# DASH templates use ``$Name$`` or ``$Name%05d$``. The padded form is common on
+# VidLink/sacdn manifests; leaving it literal makes every segment request 404.
+_SEGMENT_PLACEHOLDER_RE = re.compile(r"\$(?:Number|Time|Bandwidth|RepresentationID)(?:%0?\d+d)?\$")
+_TIME_TEMPLATE_RE = re.compile(r"\$Time(?:%0?\d+d)?\$")
+
+
+def _expand_padded_template(text: str, name: str, value: int) -> str:
+    """Expand ``$Number%05d$`` / ``$Number%5d$`` style templates."""
+    pattern = re.compile(rf"\${name}%0?(\d+)d\$")
+
+    def _replace(match: re.Match) -> str:
+        return f"{value:0{int(match.group(1))}d}"
+
+    return pattern.sub(_replace, text)
+
 
 def resolve_url(base_url: str, relative_url: str) -> str:
     """
@@ -652,11 +667,11 @@ def create_segment_data(
     """
     media_template = item["@media"]
     media = media_template.replace("$RepresentationID$", profile.get("rep_id", profile["id"]))
-    media = media.replace("$Number%04d$", f"{segment['number']:04d}")
+    media = _expand_padded_template(media, "Number", segment["number"])
     media = media.replace("$Number$", str(segment["number"]))
     media = media.replace("$Bandwidth$", str(profile["bandwidth"]))
 
-    if "$Time$" in media and timescale is not None:
+    if _TIME_TEMPLATE_RE.search(media) and timescale is not None:
         time_value = None
         if "time" in segment:
             time_value = int(segment["time"])
@@ -681,10 +696,11 @@ def create_segment_data(
                 )
 
         if time_value is not None:
+            media = _expand_padded_template(media, "Time", time_value)
             media = media.replace("$Time$", str(time_value))
 
-    if "$Time$" in media:
-        logger.warning("Unresolved $Time$ placeholder in segment URL template: %s", media_template)
+    if _SEGMENT_PLACEHOLDER_RE.search(media):
+        logger.warning("Unresolved segment template placeholder: %s -> %s", media_template, media)
 
     # Combine base_url and media, then resolve against mpd_url
     if base_url:

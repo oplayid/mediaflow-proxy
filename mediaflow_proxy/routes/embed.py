@@ -188,6 +188,9 @@ def _sign_player_url(
     path = f"/player/{media_type}/{media_id}"
     if media_type == "tv":
         path += f"/{season or '1'}/{episode or '1'}"
+    # Do NOT put `exclude` or `t` in the token: EncryptionMiddleware merges the
+    # decrypted payload over the query string, which would erase the values the
+    # iframe appends when it retries itself.
     payload = {
         "type": media_type,
         "id": media_id,

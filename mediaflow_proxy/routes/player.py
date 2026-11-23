@@ -82,6 +82,10 @@ async def player_page(
         raise HTTPException(status_code=400, detail="Player token media id mismatch")
 
     is_retry = request.url.path.rstrip("/").endswith("/retry") or request.query_params.get("retry") is True
+    try:
+        start_time = float(request.query_params.get("t") or 0)
+    except (TypeError, ValueError):
+        start_time = 0.0
     session = await simulate_session(
         request,
         media_type,
@@ -89,5 +93,7 @@ async def player_page(
         season or request.query_params.get("s"),
         episode or request.query_params.get("e"),
         retry=is_retry,
+        exclude=request.query_params.get("exclude"),
+        start_time=start_time,
     )
     return HTMLResponse(_render_player(session), headers=_security_headers())

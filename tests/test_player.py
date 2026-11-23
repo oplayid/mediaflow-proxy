@@ -97,8 +97,110 @@ def test_host_configs_honours_env_override(monkeypatch):
 def test_host_configs_default_prefers_known_good_hosts(monkeypatch):
     monkeypatch.setattr(settings, "player_hosts", "")
     names = [config.canonical for config in host_configs()]
-    assert names[:3] == ["VSEmbed", "VidCore", "VidLink"]
+    assert names[:4] == ["VidCore", "VSEmbed", "VidSrcTo", "VidLink"]
     assert "VidKing" in names
+
+
+def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
+    """Stub network work so first-success ordering can be asserted offline."""
+    calls: list[tuple[str, str]] = []
+
+    class _DummySession:
+        async def close(self):
+            pass
+
+    class _DummyStreamer:
+        session = _DummySession()
+
+    async def fake_streamer(url):
+        return _DummyStreamer()
+
+    async def fake_resolve(config, request, media_type, media_id, season, episode):
+        calls.append(("resolve", config.canonical))
+        return {
+            "destination_url": f"https://cdn.example/{config.canonical}/master.m3u8",
+            "sources": [],
+            "subtitles": [],
+        }
+
+    async def fake_probe(result, streamer, timeout):
+        host = result["destination_url"].split("/")[-2]
+        calls.append(("probe", host))
+        return ProbeResult(ok=host in ok_hosts, manifest_type="hls", score=80)
+
+    async def fake_signed(request, result, proxy_headers, expiration, host, probe):
+        calls.append(("sign", host))
+        return Candidate(
+            host=host,
+            url="https://mfp.example/hls/master.m3u8",
+            manifest_type="hls",
+            playback_type="hls",
+            probe=probe,
+        )
+
+    async def no_cache(*args, **kwargs):
+        return None
+
+    async def no_set(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(simulator, "create_streamer", fake_streamer)
+    monkeypatch.setattr(simulator, "_resolve_host", fake_resolve)
+    monkeypatch.setattr(simulator, "probe_candidate", fake_probe)
+    monkeypatch.setattr(simulator, "_signed_candidate", fake_signed)
+    monkeypatch.setattr(simulator, "get_cached_extractor", no_cache)
+    monkeypatch.setattr(simulator, "set_cached_extractor", no_set)
+    monkeypatch.setattr(simulator, "_prewarm", lambda job: None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_simulate_session_stops_at_first_playable_host(monkeypatch):
+    monkeypatch.setattr(settings, "player_hosts", "VidCore,VSEmbed,VidLink")
+    calls = _patch_simulation(monkeypatch, {"VidCore"})
+
+    session = await simulator.simulate_session(
+        _request("/player/movie/1263337"), "movie", "1263337", None, None, start_time=42
+    )
+
+    assert [item for item in calls if item[0] in ("resolve", "probe")] == [
+        ("resolve", "VidCore"),
+        ("probe", "VidCore"),
+    ]
+    assert len(session["candidates"]) == 1
+    assert session["audit"]["chosen_video_host"] == "VidCore"
+    assert session["audit"]["retry_available"] is True
+    assert session["start_time"] == 42.0
+
+
+@pytest.mark.asyncio
+async def test_simulate_session_skips_excluded_host(monkeypatch):
+    monkeypatch.setattr(settings, "player_hosts", "VidCore,VSEmbed,VidLink")
+    calls = _patch_simulation(monkeypatch, {"VSEmbed"})
+
+    session = await simulator.simulate_session(
+        _request("/player/movie/1263337/retry"),
+        "movie",
+        "1263337",
+        None,
+        None,
+        retry=True,
+        exclude="VidCore",
+    )
+
+    assert [host for kind, host in calls if kind == "resolve"] == ["VSEmbed"]
+    assert session["audit"]["chosen_video_host"] == "VSEmbed"
+    assert session["audit"]["excluded_hosts"] == ["VidCore"]
+
+
+def test_player_js_retries_inside_iframe():
+    player_js = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static" / "player.js"
+    text = player_js.read_text(encoding="utf-8")
+    assert 'query.set("exclude"' in text
+    assert 'query.set("t"' in text
+    assert "/retry?" in text
+    assert "mfp:host" not in text
+    assert "start_time" in text
 
 
 def test_classify_manifest():
@@ -204,6 +306,38 @@ def test_encryption_middleware_restores_tokenized_scope(monkeypatch):
     # Uvicorn access logs read the scope afterwards; no plaintext should remain.
     assert scope["path"] == path
     assert scope["query_string"] == b""
+
+
+def test_encryption_middleware_keeps_retry_query_params(monkeypatch):
+    handler = EncryptionHandler("unit-secret")
+    monkeypatch.setattr(crypto_utils, "encryption_handler", handler)
+    token = handler.encrypt_data({"api_password": "unit-secret"}, 60)
+    path = f"/_token_{token}/player/movie/550/retry"
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"exclude=VidCore&t=42",
+        "headers": [(b"host", b"mfp.oplay.id")],
+        "client": ("10.0.0.1", 12345),
+    }
+    request = Request(scope)
+    seen: dict[str, dict] = {}
+
+    async def call_next(captured: Request):
+        seen["query"] = dict(captured.query_params)
+        return Response("ok")
+
+    middleware = crypto_utils.EncryptionMiddleware(app=None)
+    response = asyncio.run(middleware.dispatch(request, call_next))
+
+    assert response.status_code == 200
+    assert seen["query"]["exclude"] == "VidCore"
+    assert seen["query"]["t"] == "42"
 
 
 def test_needs_transcode_detects_hevc_codec_and_url(monkeypatch):

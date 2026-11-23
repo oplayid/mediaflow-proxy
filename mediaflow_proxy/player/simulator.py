@@ -29,9 +29,9 @@ from mediaflow_proxy.utils.redis_utils import get_cached_extractor, set_cached_e
 
 logger = logging.getLogger(__name__)
 
-# Hosts that historically produce a playable HLS stream. They are tried first
-# so the 10 second budget is spent on the most likely winners.
-PREFERRED_HOSTS = ("VSEmbed", "VidCore", "VidLink", "VidSrcTo")
+# First-success order: VidCore is the known-good HLS host, then the other HLS
+# chains. VidLink is last because it needs DASH conversion + HEVC transcoding.
+PREFERRED_HOSTS = ("VidCore", "VSEmbed", "VidSrcTo", "VidLink")
 # vidsrc.to chains through vidsrc.sh before reaching the VSEmbed player, so
 # resolution alone can take ~6s. Keep room for PROBE_TIMEOUT within the 10s
 # simulation budget (7.5 + 2.5).
@@ -378,6 +378,17 @@ def _merge_subtitles(candidates: list[Candidate], limit: int = 16) -> list[dict]
     return ordered[:limit]
 
 
+def _normalise_exclude(exclude: str | list[str] | None) -> set[str]:
+    """Read the ``exclude`` query param (comma separated or repeated)."""
+    if not exclude:
+        return set()
+    values: list[str] = []
+    items = [exclude] if isinstance(exclude, str) else exclude
+    for item in items:
+        values.extend(re.split(r"[,\s]+", str(item)))
+    return {item.strip() for item in values if item.strip()}
+
+
 async def simulate_session(
     request,
     media_type: str,
@@ -386,92 +397,95 @@ async def simulate_session(
     episode: str | None,
     *,
     retry: bool = False,
+    exclude: str | list[str] | None = None,
+    start_time: float = 0.0,
 ) -> dict:
-    """Run the bounded simulation and return a browser-safe session dict."""
+    """Resolve hosts in order, stop at the first playable one, stay under budget.
+
+    Standby hosts are not probed up front. If the chosen host fails in the
+    browser, the iframe reloads itself with ``/retry?exclude=<host>`` and this
+    function simply continues down the list. StreamFlix never sees host names.
+    """
     season = season or "1"
     episode = episode or "1"
+    excluded = _normalise_exclude(exclude)
+    suffix = ",".join(sorted(excluded))
     cache_key = f"{CACHE_PREFIX}{media_type}:{media_id}:{season}:{episode}"
+    if suffix:
+        cache_key += f":excluded={suffix}"
     if not retry:
         cached = await get_cached_extractor(cache_key)
         if cached and isinstance(cached, dict) and cached.get("candidates"):
             logger.info("[player] session cache hit %s/%s s%s e%s", media_type, media_id, season, episode)
+            cached = dict(cached)
+            cached["start_time"] = max(0.0, float(start_time or 0.0))
             return cached
 
     started = time.monotonic()
     budget = max(1.0, float(settings.player_simulation_budget))
-    configs = host_configs()
+    configs = [config for config in host_configs() if config.canonical not in excluded]
     proxy_headers = get_proxy_headers(request)
-    streamer = await create_streamer(build_embed_url(configs[0], media_type, media_id, season, episode))
-    semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+    tried: list[dict] = []
+    winner: Candidate | None = None
 
-    async def worker(config) -> Candidate | None:
-        async with semaphore:
-            remaining = budget - (time.monotonic() - started)
-            if remaining <= 0.5:
-                return None
-            try:
-                raw = await asyncio.wait_for(
-                    _resolve_host(config, request, media_type, media_id, season, episode),
-                    timeout=min(RESOLVE_TIMEOUT, remaining),
-                )
+    if configs:
+        streamer = await create_streamer(build_embed_url(configs[0], media_type, media_id, season, episode))
+        try:
+            for config in configs:
+                remaining = budget - (time.monotonic() - started)
+                if remaining <= 0.5:
+                    tried.append({"host": config.canonical, "reason": "budget_exhausted"})
+                    continue
+                try:
+                    raw = await asyncio.wait_for(
+                        _resolve_host(config, request, media_type, media_id, season, episode),
+                        timeout=min(RESOLVE_TIMEOUT, remaining),
+                    )
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc or '-'}"
+                    logger.info("[player] %s unavailable: %s", config.canonical, reason)
+                    tried.append({"host": config.canonical, "reason": reason})
+                    continue
+
                 remaining = budget - (time.monotonic() - started)
                 if remaining <= 0.3:
-                    return None
-                probe = await asyncio.wait_for(
-                    probe_candidate(raw, streamer, min(PROBE_TIMEOUT, remaining)),
-                    timeout=min(PROBE_TIMEOUT, remaining),
-                )
+                    tried.append({"host": config.canonical, "reason": "budget_exhausted"})
+                    continue
+                try:
+                    probe = await asyncio.wait_for(
+                        probe_candidate(raw, streamer, min(PROBE_TIMEOUT, remaining)),
+                        timeout=min(PROBE_TIMEOUT, remaining),
+                    )
+                except Exception as exc:
+                    probe = ProbeResult(reason=f"{type(exc).__name__}: {exc or '-'}")
                 if not probe.ok:
                     logger.info("[player] %s rejected: %s", config.canonical, probe.reason)
-                    return None
-                return await _signed_candidate(request, raw, proxy_headers, SESSION_TTL, config.canonical, probe)
-            except Exception as exc:
-                logger.info(
-                    "[player] %s unavailable: %s: %s",
-                    config.canonical,
-                    type(exc).__name__,
-                    exc or "-",
+                    tried.append({"host": config.canonical, "reason": probe.reason or "probe_failed"})
+                    continue
+
+                winner = await _signed_candidate(
+                    request, raw, proxy_headers, SESSION_TTL, config.canonical, probe
                 )
-                return None
+                break
+        finally:
+            await streamer.session.close()
 
-    try:
-        tasks = [asyncio.create_task(worker(config)) for config in configs]
-        # Leave a small margin so the measured simulation stays under the hard
-        # 10 second budget even after task cancellation and serialization.
-        wait_timeout = max(1.0, budget - 0.15)
-        done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        candidates: list[Candidate] = []
-        for task in done:
-            if task.cancelled() or task.exception():
-                continue
-            candidate = task.result()
-            if candidate:
-                candidates.append(candidate)
-        candidates.sort(key=lambda item: item.score, reverse=True)
-    finally:
-        await streamer.session.close()
-
-    winner = candidates[0] if candidates else None
+    candidates = [winner] if winner else []
     if winner and winner.needs_transcode and winner.transcode_job:
         _prewarm(winner.transcode_job)
 
-    if not candidates:
-        # Keep the contract stable: the player renders a clear error instead of
-        # receiving an exception or an upstream/provider URL.
-        candidates = []
-
     subtitles = _merge_subtitles(candidates)
+    remaining_hosts = [config for config in configs if config.canonical != (winner.host if winner else None)]
     audit = {
-        "hosts_tried": len(configs),
+        "hosts_tried": len(tried) + (1 if winner else 0),
         "hosts_playable": len(candidates),
-        "chosen_video_host": candidates[0].host if candidates else None,
+        "hosts_available": len(configs),
+        "chosen_video_host": winner.host if winner else None,
         "chosen_subtitle_hosts": sorted({item.get("host") for item in subtitles if item.get("host")}),
-        "transcode_hosts": sorted(item.host for item in candidates if item.needs_transcode),
+        "transcode_hosts": [winner.host] if winner and winner.needs_transcode else [],
+        "excluded_hosts": sorted(excluded),
+        "tried_hosts": tried,
+        "retry_available": bool(remaining_hosts),
         "simulation_ms": int((time.monotonic() - started) * 1000),
     }
     session = session_to_dict(
@@ -483,16 +497,17 @@ async def simulate_session(
         subtitles=subtitles,
         audit=audit,
         generated_at=time.time(),
+        start_time=start_time,
     )
     if candidates:
         await set_cached_extractor(cache_key, session, ttl=settings.player_cache_ttl)
     logger.info(
-        "[player] simulated %s/%s: %s/%s hosts playable, winner=%s (%sms)",
+        "[player] simulated %s/%s: winner=%s after %s/%s hosts, %sms",
         media_type,
         media_id,
-        len(candidates),
-        len(configs),
         audit["chosen_video_host"],
+        audit["hosts_tried"],
+        len(configs),
         audit["simulation_ms"],
     )
     return session
