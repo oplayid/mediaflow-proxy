@@ -417,6 +417,61 @@ async def test_vsembed_tv_uses_stream_base_and_preserves_stream_urls_flag():
 
 
 @pytest.mark.asyncio
+async def test_vsembed_refreshes_missing_api_token():
+    """Gated player pages get a second fetch, like the upstream browser does."""
+    config = EMBED_HOSTS["VSEmbed"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://stream.oplay.id/embed/tv/293610/1/4"
+    gate_url = "https://stream.oplay.id/vs_src.php?type=tv&id=293610&season=1&episode=4"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html"
+    stream_base = "https://vsapi.example/api.php?type=tv&tmdb=293610"
+    api_url = (
+        f"{stream_base}&stream_urls=&season=1&episode=4&api_token=tok"
+    )
+    destination = "https://cdn.example/master.m3u8"
+
+    responses = {
+        gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+        nested_url: _response(
+            nested_url,
+            text=f'<script>window.CFG={{"playerUrl":"{player_url}"}};</script>',
+        ),
+        api_url: _response(
+            api_url,
+            text=json.dumps({"data": {"stream_urls": [destination], "cast_urls": []}}),
+        ),
+    }
+    player_calls = {"count": 0}
+    gated_config = {
+        "streamBase": stream_base,
+        "apiTokenRefresh": True,
+        "castGate": True,
+    }
+    refreshed_config = {
+        "streamBase": stream_base,
+        "apiToken": "tok",
+        "apiTokenRefresh": True,
+    }
+
+    async def fake_request(url: str, **kwargs):
+        if url == player_url:
+            player_calls["count"] += 1
+            payload = gated_config if player_calls["count"] == 1 else refreshed_config
+            return _response(player_url, text=f"<script>window.CONFIG={json.dumps(payload)};</script>")
+        if url not in responses:
+            raise AssertionError(f"Unexpected request: {url}")
+        return responses[url]
+
+    extractor._make_request = fake_request  # type: ignore[method-assign]
+
+    result = await extractor.extract(embed_url)
+
+    assert player_calls["count"] == 2
+    assert result["destination_url"] == destination
+
+
+@pytest.mark.asyncio
 async def test_vsembed_cast_playlist_falls_back_to_browser_sandbox(monkeypatch):
     config = EMBED_HOSTS["VSEmbed"]
     extractor = GenericEmbedExtractor({}, config)

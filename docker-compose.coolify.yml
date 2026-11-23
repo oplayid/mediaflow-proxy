@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.7.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.7}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.8.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.8}
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -21,10 +21,12 @@ services:
       FORWARDED_ALLOW_IPS: "*"
       # Pin the bind address so a platform-injected PORT cannot change it.
       GUNICORN_BIND: "0.0.0.0:8888"
+      # Keep this set. It shares the transcode job registry and caches across
+      # Gunicorn workers; without it a 4-worker deploy can 404 on transcode URLs.
       REDIS_URL: redis://redis:6379
       # Host order lives only in HOST_ORDER (VidCore, VSEmbed, VidSrcTo, VidLink).
       # Optional overrides — uncomment and set in Coolify as needed:
-      # WEB_CONCURRENCY: "1"          # use 1 if using Telegram interactive login
+      # WEB_CONCURRENCY: "2"          # 2-4 is safe with Redis; use 1 only for Telegram interactive login
       # ENABLE_TRANSCODE: "false"
       # ENABLE_HLS_PREBUFFER: "false"
       # ENABLE_DASH_PREBUFFER: "false"

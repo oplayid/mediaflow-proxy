@@ -640,6 +640,52 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={"Referer": nested_url, "Accept": "text/html"},
         )
         player_cfg = _extract_json_object(_CONFIG_RE, player.text, self.config.canonical)
+        # Upstream can render the player before minting its short-lived API
+        # token. The browser handles this by re-fetching the same player URL
+        # once when `apiTokenRefresh` is set. Mirror that instead of treating a
+        # valid chain as broken; otherwise gated pages surface as
+        # "stream API config missing" even though the host is playable.
+        has_api = any(
+            player_cfg.get(key)
+            for key in ("api", "streamBase", "stream_base", "apiUrl", "api_url")
+        )
+        has_token = any(
+            player_cfg.get(key) for key in ("apiToken", "api_token", "token")
+        )
+        if player_cfg.get("apiTokenRefresh") and not (has_api and has_token):
+            try:
+                refreshed = await self._make_request(
+                    url=player_url,
+                    headers={
+                        "Referer": nested_url,
+                        "Accept": "text/html",
+                        "Cache-Control": "no-store",
+                    },
+                )
+                refreshed_cfg = _extract_json_object(
+                    _CONFIG_RE, refreshed.text, self.config.canonical
+                )
+                for key in (
+                    "api",
+                    "streamBase",
+                    "stream_base",
+                    "apiUrl",
+                    "api_url",
+                    "apiToken",
+                    "api_token",
+                    "token",
+                    "metaApi",
+                    "meta_api",
+                ):
+                    if refreshed_cfg.get(key):
+                        player_cfg[key] = refreshed_cfg[key]
+                logger.info("[%s] stream API token refreshed", self.config.canonical)
+            except ExtractorError as exc:
+                logger.debug(
+                    "[%s] stream API token refresh failed: %s",
+                    self.config.canonical,
+                    exc,
+                )
         # Movie pages expose `api`; TV pages expose `streamBase`. Upstream has
         # also been seen with camel/snake aliases for both API and token, so
         # accept all of them and log the received keys when they change again.
