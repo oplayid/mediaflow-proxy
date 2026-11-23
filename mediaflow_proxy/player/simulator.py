@@ -22,6 +22,7 @@ from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS, build_embed_url,
 from mediaflow_proxy.extractors.factory import ExtractorFactory
 from mediaflow_proxy.gateway.ad_filter import AdFilterReport, filter_extractor_result
 from mediaflow_proxy.player.models import Candidate, ProbeResult, session_to_dict
+from mediaflow_proxy.player.transcoder import create_transcode_job, prepare_transcode
 from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url
 from mediaflow_proxy.utils.http_utils import create_streamer, get_proxy_headers
 from mediaflow_proxy.utils.redis_utils import get_cached_extractor, set_cached_extractor
@@ -40,6 +41,41 @@ SESSION_TTL = 600
 _LANGUAGE_RANK = {"id": 0, "en": 1}
 _CODEC_RE = re.compile(r'codecs=["\']([^"\']+)["\']', re.I)
 _HEVC_RE = re.compile(r"\b(hvc1|hev1|hevc|h265)\b", re.I)
+# Upstream paths often use ``_h265_`` where ``\b`` would not match after "_".
+_HEVC_URL_RE = re.compile(r"(hvc1|hev1|hevc|h265)", re.I)
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _needs_transcode(probe: ProbeResult, destination: str) -> bool:
+    """Return True when the source uses a codec browsers/TV boxes often lack."""
+    if not settings.player_transcode_hevc:
+        return False
+    if any(_HEVC_RE.search(codec) for codec in probe.codecs):
+        return True
+    return bool(_HEVC_URL_RE.search(destination or ""))
+
+
+def _audio_can_be_copied(probe: ProbeResult) -> bool:
+    """HLS TS needs AAC; re-encode audio when the manifest says otherwise."""
+    if not probe.codecs:
+        return True
+    return any("mp4a" in codec.lower() for codec in probe.codecs)
+
+
+def _prewarm(job: str) -> None:
+    """Start the winner's transcode without delaying the 10s simulation."""
+    task = asyncio.create_task(prepare_transcode(job))
+
+    def _done(finished: asyncio.Task) -> None:
+        _BACKGROUND_TASKS.discard(finished)
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc:
+            logger.info("[player] transcode prewarm failed: %s: %s", type(exc).__name__, exc)
+
+    task.add_done_callback(_done)
+    _BACKGROUND_TASKS.add(task)
 
 
 def host_configs() -> list[Any]:
@@ -196,7 +232,7 @@ def _language_rank(entry: dict) -> int:
     return 99
 
 
-def _signed_candidate(request, result: dict, proxy_headers, expiration: int, host: str, probe: ProbeResult) -> Candidate:
+async def _signed_candidate(request, result: dict, proxy_headers, expiration: int, host: str, probe: ProbeResult) -> Candidate:
     """Sign all URLs for one candidate while keeping headers server-side."""
     endpoint = result.get("mediaflow_endpoint") or "hls_manifest_proxy"
     destination = result["destination_url"]
@@ -260,6 +296,33 @@ def _signed_candidate(request, result: dict, proxy_headers, expiration: int, hos
                 }
             )
 
+    needs_transcode = _needs_transcode(probe, str(destination or ""))
+    transcode_url = ""
+    transcode_job = ""
+    if needs_transcode:
+        try:
+            transcode_job, transcode_url = await create_transcode_job(
+                request,
+                primary,
+                host,
+                {
+                    "type": request.query_params.get("type") or "",
+                    "id": request.query_params.get("id") or "",
+                    "host": host,
+                },
+                audio_copy=_audio_can_be_copied(probe),
+            )
+        except Exception as exc:
+            # A failed job registration must not discard an otherwise playable
+            # candidate: the player can still try native playback/fallback.
+            logger.warning(
+                "[player] %s transcode job failed: %s: %s",
+                host,
+                type(exc).__name__,
+                exc,
+            )
+            needs_transcode = False
+
     return Candidate(
         host=host,
         url=primary,
@@ -268,6 +331,10 @@ def _signed_candidate(request, result: dict, proxy_headers, expiration: int, hos
         subtitles=subtitles,
         score=probe.score,
         probe=probe,
+        needs_transcode=needs_transcode,
+        transcode_url=transcode_url,
+        transcode_job=transcode_job,
+        playback_type="hls" if needs_transcode else probe.manifest_type,
     )
 
 
@@ -339,7 +406,7 @@ async def simulate_session(
                 if not probe.ok:
                     logger.info("[player] %s rejected: %s", config.canonical, probe.reason)
                     return None
-                return _signed_candidate(request, raw, proxy_headers, SESSION_TTL, config.canonical, probe)
+                return await _signed_candidate(request, raw, proxy_headers, SESSION_TTL, config.canonical, probe)
             except Exception as exc:
                 logger.info(
                     "[player] %s unavailable: %s: %s",
@@ -371,6 +438,10 @@ async def simulate_session(
     finally:
         await streamer.session.close()
 
+    winner = candidates[0] if candidates else None
+    if winner and winner.needs_transcode and winner.transcode_job:
+        _prewarm(winner.transcode_job)
+
     if not candidates:
         # Keep the contract stable: the player renders a clear error instead of
         # receiving an exception or an upstream/provider URL.
@@ -382,6 +453,7 @@ async def simulate_session(
         "hosts_playable": len(candidates),
         "chosen_video_host": candidates[0].host if candidates else None,
         "chosen_subtitle_hosts": sorted({item.get("host") for item in subtitles if item.get("host")}),
+        "transcode_hosts": sorted(item.host for item in candidates if item.needs_transcode),
         "simulation_ms": int((time.monotonic() - started) * 1000),
     }
     session = session_to_dict(

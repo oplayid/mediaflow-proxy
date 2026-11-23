@@ -27,6 +27,7 @@
   var readySent = false;
   var lastTimeUpdate = 0;
   var trackElements = {};
+  var generation = 0;
   var allowedParents = ["https://movie.oplay.id", window.location.origin];
 
   function parentWindow() {
@@ -112,7 +113,7 @@
     candidates.forEach(function (candidate, index) {
       var option = document.createElement("option");
       option.value = String(index);
-      option.textContent = candidate.host + " • " + candidate.manifest_type + " • " + candidate.score;
+      option.textContent = candidate.host + " • " + (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type) + " • " + candidate.score;
       hostSelect.appendChild(option);
     });
     if (candidates.length) hostSelect.value = "0";
@@ -125,6 +126,11 @@
     auto.textContent = "Auto";
     qualitySelect.appendChild(auto);
     var candidate = currentCandidate();
+    if (candidate && candidate.needs_transcode) {
+      qualitySelect.disabled = true;
+      return;
+    }
+    qualitySelect.disabled = false;
     (candidate && candidate.sources ? candidate.sources : []).forEach(function (source) {
       var option = document.createElement("option");
       option.value = source.url;
@@ -134,8 +140,38 @@
   }
 
   function cleanup() {
+    generation += 1;
     if (hls) { try { hls.destroy(); } catch (error) {} hls = null; }
     if (dashPlayer) { try { dashPlayer.reset(); } catch (error) {} dashPlayer = null; }
+  }
+
+  function waitForTranscode(url, token) {
+    return new Promise(function (resolve, reject) {
+      var started = Date.now();
+      var deadline = 60000;
+      function check() {
+        if (token !== generation) return;
+        var elapsed = Date.now() - started;
+        var percent = Math.min(95, Math.round((elapsed / deadline) * 100));
+        setOverlay("Menyiapkan transcode HEVC → H.264… " + percent + "%", percent);
+        fetch(url, { cache: "no-store" })
+          .then(function (response) {
+            if (token !== generation) return;
+            if (response.ok) { resolve(); return; }
+            if (response.status === 503 && elapsed < deadline) {
+              setTimeout(check, 1000);
+              return;
+            }
+            reject(new Error("transcode HTTP " + response.status));
+          })
+          .catch(function (error) {
+            if (token !== generation) return;
+            if (elapsed < deadline) { setTimeout(check, 1500); return; }
+            reject(error);
+          });
+      }
+      check();
+    });
   }
 
   function handleError(source, fatal) {
@@ -145,21 +181,26 @@
     failed[activeIndex] = true;
     var next = candidates.findIndex(function (_item, index) { return !failed[index]; });
     if (next >= 0) {
-      setOverlay("Host " + candidate.host + " gagal. Mencoba " + candidates[next].host + "…", 70);
+      var detail = source === "transcode" ? " transcode gagal" : "";
+      setOverlay("Host " + candidate.host + detail + ". Mencoba " + candidates[next].host + "…", 70);
       overlay.classList.remove("hidden");
       playCandidate(next, video.currentTime);
       return;
     }
-    showError("Semua host gagal diputar. Silakan cari ulang host.");
+    showError(source === "transcode"
+      ? "Transcode HEVC gagal. Silakan coba ulang."
+      : "Semua host gagal diputar. Silakan cari ulang host.");
   }
 
   function sendReady() {
     if (readySent) return;
     readySent = true;
     hideOverlay();
+    var candidate = currentCandidate();
     post("ready", {
       duration: Number.isFinite(video.duration) ? video.duration : 0,
-      host: currentCandidate() ? currentCandidate().host : null,
+      host: candidate ? candidate.host : null,
+      transcode: !!(candidate && candidate.needs_transcode),
       audit: session.audit || {}
     });
   }
@@ -174,12 +215,11 @@
     }
   }
 
-  function playUrl(candidate, url, startTime) {
-    cleanup();
+  function startPlayback(candidate, url, startTime, playbackType) {
     setOverlay("Memutar " + candidate.host + "…", 90);
     attachCommon(startTime);
 
-    if (candidate.manifest_type === "hls") {
+    if (playbackType === "hls") {
       if (window.Hls && window.Hls.isSupported()) {
         hls = new window.Hls({ enableWorker: true, capLevelToPlayerSize: true });
         hls.loadSource(url);
@@ -190,7 +230,7 @@
         video.src = url;
         video.addEventListener("loadedmetadata", sendReady, { once: true });
       }
-    } else if (candidate.manifest_type === "dash" && window.dashjs) {
+    } else if (playbackType === "dash" && window.dashjs) {
       dashPlayer = window.dashjs.MediaPlayer().create();
       dashPlayer.initialize(video, url, false);
       dashPlayer.on(window.dashjs.MediaPlayer.events.ERROR, function (event) {
@@ -203,7 +243,28 @@
     }
 
     video.play().catch(function () {});
-    post("sourcechange", { host: candidate.host, type: candidate.manifest_type });
+    post("sourcechange", { host: candidate.host, type: playbackType, transcode: !!candidate.needs_transcode });
+  }
+
+  function playUrl(candidate, url, startTime) {
+    cleanup();
+    var token = generation;
+    if (candidate.needs_transcode) {
+      startPlaybackAfterTranscode(candidate, startTime, token);
+      return;
+    }
+    startPlayback(candidate, url, startTime, candidate.playback_type || candidate.manifest_type);
+  }
+
+  function startPlaybackAfterTranscode(candidate, startTime, token) {
+    setOverlay("Menyiapkan transcode HEVC → H.264…", 5);
+    waitForTranscode(candidate.transcode_url, token).then(function () {
+      if (token !== generation) return;
+      startPlayback(candidate, candidate.transcode_url, startTime, "hls");
+    }).catch(function () {
+      if (token !== generation) return;
+      handleError("transcode", true);
+    });
   }
 
   function playCandidate(index, startTime) {
@@ -212,8 +273,9 @@
     activeIndex = index;
     hostSelect.value = String(index);
     fillQualities();
-    hostBadge.textContent = candidate.host + " • " + candidate.manifest_type;
+    hostBadge.textContent = candidate.host + " • " + (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type);
     hostBadge.classList.add("good");
+    hostBadge.classList.toggle("transcode", !!candidate.needs_transcode);
     playUrl(candidate, candidate.url, startTime || 0);
   }
 

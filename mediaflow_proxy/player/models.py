@@ -34,6 +34,10 @@ class Candidate:
     subtitles: list[dict] = field(default_factory=list)
     score: float = 0.0
     probe: ProbeResult = field(default_factory=ProbeResult)
+    needs_transcode: bool = False
+    transcode_url: str = ""
+    transcode_job: str = ""
+    playback_type: str = ""  # Effective player type after transcoding.
 
     def to_dict(self) -> dict:
         data = asdict(self)

@@ -125,6 +125,7 @@ This redirects to the proxied HLS manifest URL, and because the request URL cont
 | `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
 | `/_token_<token>/player/<type>/<id>[/<season>/<episode>]` | Smart player iframe (tokenized, no `api_password`) |
 | `/_token_<token>/player/<type>/<id>[/<season>[/<episode>]]/retry` | Re-run simulation with a clean cache |
+| `/_token_<token>/player/transcode/<job>/master.m3u8` | Tokenized HLS output of a server-side HEVC → H.264 job |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
 TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway still resolves **VidCore, VSEmbed, then VidLink** (10 seconds per host, 40 seconds total). The player uses a different, broader order: **VSEmbed, VidCore, VidLink**, followed by every host registered in `EMBED_HOSTS`. Set `PLAYER_HOSTS=VidLink,VSEmbed,...` to override that order. Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
@@ -162,7 +163,17 @@ Simulation starts when the iframe mounts, not on every play click. With a hard b
 
 All playable candidates are kept in order. The browser can switch host or quality; if the active host fails, the player moves to the next candidate at the same `currentTime`. Native subtitles from every host are merged, deduplicated by language/label, and ordered `id` > `en` > others while retaining `host`/`origin` metadata. hls.js `1.6.13` and dash.js `4.7.4` are bundled locally, so no third-party CDN is contacted.
 
-Streamflix only listens to `postMessage` events (`ready`, `timeupdate`, `playing`, `paused`, `ended`, `error`) and may send `mfp:seek`, `mfp:setSubtitle`, `mfp:pause`, `mfp:play`, or `mfp:host`. CSP `frame-ancestors` is `https://movie.oplay.id` by default; override with `PLAYER_FRAME_ANCESTORS` if needed.
+### HEVC → H.264 transcoding
+
+Some hosts (notably VidLink DASH) only expose `hev1`/`hvc1`/`h265`, which most HP browsers and TV boxes cannot decode. When the probe detects HEVC in the manifest codecs or the upstream URL, the player registers a lazy server-side FFmpeg job and gives the browser only a tokenized HLS URL:
+
+- `PLAYER_TRANSCODE_HEVC=true` (default) enables the fallback; the candidate is marked `needs_transcode` and `playback_type="hls"`.
+- The source URL and signed headers stay server-side in the Redis job registry. FFmpeg re-encodes video to H.264 (`libx264`, `yuv420p`) and copies AAC audio when present, capped by `PLAYER_TRANSCODE_HEIGHT=720`, `PLAYER_TRANSCODE_CRF=23`, `PLAYER_TRANSCODE_PRESET=veryfast`, `PLAYER_TRANSCODE_HLS_TIME=4`.
+- `PLAYER_TRANSCODE_HLS_LIST_SIZE=0` keeps every VOD segment so playback starts at the beginning; idle jobs are stopped after `PLAYER_TRANSCODE_IDLE_TTL=300` seconds. At most `PLAYER_TRANSCODE_MAX_JOBS=4` run per worker.
+- The winner is prewarmed in the background so the 10-second simulation budget is unchanged. The player polls the tokenized manifest until it returns 200, showing **Menyiapkan transcode HEVC → H.264…**, then forces hls.js. If the job fails, it falls back to the next candidate.
+- Native quality options are hidden for transcoded candidates; subtitles and host failover still work normally.
+
+Streamflix only listens to `postMessage` events (`ready`, `timeupdate`, `playing`, `paused`, `ended`, `error`) and may send `mfp:seek`, `mfp:setSubtitle`, `mfp:pause`, `mfp:play`, or `mfp:host`. `ready` and `sourcechange` include a `transcode` flag. On `playing`, StreamFlix hides its own controls/overlays so the iframe fills the screen; they return on `ended`, `error`, or a new `player_url`. CSP `frame-ancestors` is `https://movie.oplay.id` by default; override with `PLAYER_FRAME_ANCESTORS` if needed.
 
 ### Caching and retry
 
@@ -184,6 +195,6 @@ Ad filtering runs at three layers and writes an audit trail:
 
 ### Removed legacy surfaces
 
-`/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, and the old `OPLAY_EMBED_*` postMessage contract have been removed entirely. They are replaced by the tokenized `/player/...` iframe described above. Streamflix keeps its navbar, Play button, `/watch/...` page, and progress/history; MediaFlow owns playback and host logic.
+`/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, and the old `OPLAY_EMBED_*` postMessage contract have been removed entirely. They are replaced by the tokenized `/player/...` iframe described above. Streamflix keeps its navbar, Play button, `/watch/...` page, and progress/history; MediaFlow owns playback and host logic. While playback is active the Streamflix UI is hidden so the MediaFlow player occupies the full screen.
 
 These endpoints are intentionally public: they resolve the upstream stream and sign a short-lived MediaFlow proxy URL internally, so `api_password` is never exposed to the browser. The TMDB API key used by trailer/banner endpoints also stays server-side.

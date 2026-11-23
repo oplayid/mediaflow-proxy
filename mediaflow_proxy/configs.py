@@ -138,6 +138,16 @@ class Settings(BaseSettings):
     player_simulation_budget: float = 10.0  # Max seconds spent scoring hosts before playback.
     player_cache_ttl: int = 600  # Seconds a simulated session is reused across workers.
     player_frame_ancestors: str = "https://movie.oplay.id"  # CSP frame-ancestors for the iframe.
+    # HEVC browsers/TV boxes often cannot decode hvc1/hev1. Transcode to H.264.
+    player_transcode_hevc: bool = True
+    player_transcode_height: int = 720
+    player_transcode_crf: int = 23
+    player_transcode_preset: str = "veryfast"
+    player_transcode_hls_time: int = 4
+    player_transcode_hls_list_size: int = 0  # 0 = keep all VOD segments
+    player_transcode_idle_ttl: int = 300
+    player_transcode_max_jobs: int = 4
+    player_transcode_startup_timeout: int = 30
 
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.

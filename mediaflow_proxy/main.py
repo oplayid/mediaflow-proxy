@@ -18,7 +18,7 @@ from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
 from mediaflow_proxy.routes.embed import gateway_router
-from mediaflow_proxy.routes.player import player_router
+from mediaflow_proxy.routes.player import player_router, transcode_router
 from mediaflow_proxy.routes.trailer import banner_router, trailer_router
 from mediaflow_proxy.routes.speedtest import speedtest_router
 from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
@@ -329,6 +329,9 @@ app.include_router(extractor_router, prefix="/extractor", tags=["extractors"], d
 # is deliberately no /embed provider list, relay route or player iframe here.
 app.include_router(gateway_router, prefix="/gateway", tags=["gateway"])
 
+# Transcode files must be registered before the generic player page routes,
+# otherwise /player/transcode/{job}/{file} is parsed as a media id/season pair.
+app.include_router(transcode_router, prefix="/player", tags=["player"])
 # Smart iframe player. Provider/proxy URLs are resolved and signed on this
 # origin only; StreamFlix embeds the opaque URL from /gateway/resolve.
 app.include_router(player_router, prefix="/player", tags=["player"])

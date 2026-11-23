@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.player.models import Candidate, ProbeResult
-from mediaflow_proxy.player.simulator import _classify_manifest, _merge_subtitles, host_configs
+from mediaflow_proxy.player.simulator import (
+    _audio_can_be_copied,
+    _classify_manifest,
+    _merge_subtitles,
+    _needs_transcode,
+    host_configs,
+)
+from mediaflow_proxy.player.transcoder import (
+    build_ffmpeg_command,
+    serve_transcode_file,
+    sign_transcode_url,
+)
 from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_player_url
 from mediaflow_proxy.utils import crypto_utils
 from mediaflow_proxy.utils.crypto_utils import EncryptionHandler
@@ -158,3 +172,80 @@ def test_encryption_middleware_restores_tokenized_scope(monkeypatch):
     # Uvicorn access logs read the scope afterwards; no plaintext should remain.
     assert scope["path"] == path
     assert scope["query_string"] == b""
+
+
+def test_needs_transcode_detects_hevc_codec_and_url(monkeypatch):
+    monkeypatch.setattr(settings, "player_transcode_hevc", True)
+    assert _needs_transcode(ProbeResult(codecs=["hev1.1.6.L90.90"]), "https://cdn/a/index.mpd")
+    assert _needs_transcode(ProbeResult(), "https://cdn/h265/index_web.mpd")
+    assert not _needs_transcode(ProbeResult(codecs=["avc1.640028"]), "https://cdn/a/index.mpd")
+
+    monkeypatch.setattr(settings, "player_transcode_hevc", False)
+    assert not _needs_transcode(ProbeResult(codecs=["hev1.1.6.L90.90"]), "https://cdn/h265/index.mpd")
+
+
+def test_audio_can_be_copied_only_for_aac():
+    assert _audio_can_be_copied(ProbeResult(codecs=["hev1.1.6.L90.90", "mp4a.40.2"]))
+    assert not _audio_can_be_copied(ProbeResult(codecs=["hev1.1.6.L90.90", "ac-3"]))
+    assert _audio_can_be_copied(ProbeResult())
+
+
+def test_build_ffmpeg_command_bounds_h264_hls_output(monkeypatch):
+    monkeypatch.setattr(settings, "player_transcode_preset", "ultrafast")
+    monkeypatch.setattr(settings, "player_transcode_crf", 21)
+    monkeypatch.setattr(settings, "player_transcode_height", 480)
+    monkeypatch.setattr(settings, "player_transcode_hls_time", 3)
+    monkeypatch.setattr(settings, "player_transcode_hls_list_size", 0)
+
+    command = build_ffmpeg_command("https://proxy/source.mpd", Path("/tmp/job"))
+    assert command[0] == "ffmpeg"
+    assert command[command.index("-i") + 1] == "https://proxy/source.mpd"
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert command[command.index("-preset") + 1] == "ultrafast"
+    assert command[command.index("-crf") + 1] == "21"
+    assert command[command.index("-vf") + 1] == "scale=-2:480"
+    assert command[command.index("-pix_fmt") + 1] == "yuv420p"
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert command[command.index("-hls_time") + 1] == "3"
+    assert command[command.index("-hls_list_size") + 1] == "0"
+    assert "delete_segments" not in command
+    assert command[-1] == "/tmp/job/master.m3u8"
+
+    reencoded = build_ffmpeg_command("https://proxy/source.mpd", Path("/tmp/job"), audio_copy=False)
+    assert reencoded[reencoded.index("-c:a") + 1] == "aac"
+
+
+def test_sign_transcode_url_is_opaque_and_decryptable(monkeypatch):
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+    url = sign_transcode_url(_request(), "job-123", expiration=120)
+    assert url.startswith("https://mfp.oplay.id/_token_")
+    assert "/player/transcode/job-123/master.m3u8" in url
+    assert "api_password" not in url
+
+    token = url.split("/_token_", 1)[1].split("/player/", 1)[0]
+    payload = EncryptionHandler("unit-secret").decrypt_data(token, None)
+    assert payload["job"] == "job-123"
+
+
+def test_serve_transcode_file_rejects_mismatched_token_and_filename():
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": "/player/transcode/job-123/master.m3u8",
+        "raw_path": b"/player/transcode/job-123/master.m3u8",
+        "query_string": b"job=other",
+        "headers": [(b"host", b"mfp.oplay.id")],
+        "client": ("10.0.0.1", 12345),
+    }
+    request = Request(scope)
+    with pytest.raises(HTTPException) as mismatch:
+        asyncio.run(serve_transcode_file(request, "job-123", "master.m3u8"))
+    assert mismatch.value.status_code == 400
+
+    scope["query_string"] = b""
+    request = Request(scope)
+    with pytest.raises(HTTPException) as invalid:
+        asyncio.run(serve_transcode_file(request, "job-123", "../../etc/passwd"))
+    assert invalid.value.status_code == 400

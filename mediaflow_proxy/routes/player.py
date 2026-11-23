@@ -14,8 +14,10 @@ from fastapi.responses import HTMLResponse
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.player import simulate_session
+from mediaflow_proxy.player.transcoder import serve_transcode_file
 
 player_router = APIRouter()
+transcode_router = APIRouter()
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _PLAYER_HTML = _STATIC_DIR / "player.html"
@@ -27,6 +29,12 @@ def _render_player(session: dict) -> str:
     template = _PLAYER_HTML.read_text(encoding="utf-8")
     payload = json.dumps(session, separators=(",", ":")).replace("</", "<\\/")
     return template.replace("/*__MFP_SESSION__*/null", payload)
+
+
+@transcode_router.get("/transcode/{job}/{filename}", name="player_transcode_file")
+async def player_transcode_file(request: Request, job: str, filename: str):
+    """Serve tokenized HLS output produced by the server-side transcoder."""
+    return await serve_transcode_file(request, job, filename)
 
 
 def _security_headers() -> dict[str, str]:
@@ -45,6 +53,7 @@ def _security_headers() -> dict[str, str]:
         ),
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "same-origin",
+        "Cache-Control": "no-store",
     }
 
 

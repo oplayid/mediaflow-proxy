@@ -65,6 +65,7 @@ video {
 }
 
 .badge.good { color: var(--accent); border-color: rgba(74, 222, 128, 0.4); }
+.badge.transcode { color: #fbbf24; border-color: rgba(251, 191, 36, 0.45); }
 
 .controls {
   position: absolute;
