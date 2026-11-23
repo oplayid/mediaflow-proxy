@@ -11,6 +11,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from mediaflow_proxy.configs import settings
+from mediaflow_proxy.player import simulator
 from mediaflow_proxy.player.models import Candidate, ProbeResult
 from mediaflow_proxy.player.simulator import (
     _audio_can_be_copied,
@@ -105,6 +106,37 @@ def test_classify_manifest():
     assert _classify_manifest('<?xml version="1.0"?><MPD></MPD>', "application/dash+xml", "https://x/a") == "dash"
     assert _classify_manifest("", "video/mp4", "https://x/a") == "mp4"
     assert _classify_manifest("hello", "text/html", "https://x/a") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_signed_candidate_converts_dash_to_hls_playback(monkeypatch):
+    endpoints: list[str] = []
+
+    def fake_sign(request, result, proxy_headers, destination, *, endpoint=None, **kwargs):
+        endpoints.append(endpoint or "")
+        return f"https://mfp.oplay.id/proxy/{endpoint}"
+
+    monkeypatch.setattr(simulator, "_sign_asset_url", fake_sign)
+    monkeypatch.setattr(simulator.settings, "player_transcode_hevc", False)
+
+    candidate = await simulator._signed_candidate(
+        _request("/player/movie/533535"),
+        {
+            "destination_url": "https://cdn.example/1080_h265/index_web.mpd",
+            "mediaflow_endpoint": "proxy_stream_endpoint",
+            "sources": [],
+            "subtitles": [],
+            "provider_subtitles": [],
+        },
+        {},
+        600,
+        "VidLink",
+        ProbeResult(ok=True, manifest_type="dash", score=60),
+    )
+
+    assert endpoints[0] == "mpd_manifest_proxy"
+    assert candidate.manifest_type == "hls"
+    assert candidate.playback_type == "hls"
 
 
 def test_merge_subtitles_prefers_indonesian_and_deduplicates():

@@ -50,6 +50,7 @@ class _RunningJob:
 
 _RUNNING: dict[str, _RunningJob] = {}
 _CLEANUP_TASKS: set[asyncio.Task] = set()
+_WATCH_TASKS: set[asyncio.Task] = set()
 # Fallback for single-worker installs without Redis. Redis remains the source
 # of truth when configured so Gunicorn workers share the same job registry.
 _JOBS: dict[str, dict[str, Any]] = {}
@@ -133,6 +134,7 @@ async def create_transcode_job(
     *,
     audio_copy: bool = True,
     expiration: int = 3600,
+    manifest_type: str = "",
 ) -> tuple[str, str]:
     """Create a job and return ``(job_id, browser_url)``."""
     job = secrets.token_urlsafe(18)
@@ -140,6 +142,7 @@ async def create_transcode_job(
         "job": job,
         "source_url": source_url,
         "host": host,
+        "manifest_type": manifest_type,
         "media": media,
         "audio_copy": bool(audio_copy),
         "created_at": time.time(),
@@ -204,6 +207,26 @@ async def _stop_job(job: str) -> None:
     shutil.rmtree(running.log_path.parent, ignore_errors=True)
 
 
+def _log_ffmpeg_tail(job: str, log_path: Path) -> None:
+    """Surface FFmpeg's stderr in the app log; it is otherwise invisible."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-12:]
+    except OSError:
+        return
+    if lines:
+        logger.error("[transcode] job=%s ffmpeg stderr: %s", job, " | ".join(lines))
+
+
+async def _watch_process(job: str, process: asyncio.subprocess.Process, log_path: Path) -> None:
+    returncode = await process.wait()
+    running = _RUNNING.get(job)
+    # A deliberate stop removes the job first; only report unexpected exits.
+    if running is None or running.process is not process or returncode == 0:
+        return
+    logger.error("[transcode] job=%s ffmpeg exited with %s", job, returncode)
+    _log_ffmpeg_tail(job, log_path)
+
+
 async def ensure_started(job: str, payload: dict[str, Any]) -> None:
     """Start FFmpeg once per job, coordinating across workers with Redis."""
     if shutil.which("ffmpeg") is None:
@@ -242,7 +265,15 @@ async def ensure_started(job: str, payload: dict[str, Any]) -> None:
         _RUNNING[job] = _RunningJob(
             job, process, time.monotonic(), time.monotonic(), log_path, log_file
         )
-        logger.info("[transcode] job=%s host=%s hevc->h264 started", job, payload.get("host"))
+        watcher = asyncio.create_task(_watch_process(job, process, log_path))
+        _WATCH_TASKS.add(watcher)
+        watcher.add_done_callback(_WATCH_TASKS.discard)
+        logger.info(
+            "[transcode] job=%s host=%s manifest=%s hevc->h264 started",
+            job,
+            payload.get("host"),
+            payload.get("manifest_type") or "-",
+        )
     except Exception as exc:
         logger.error("[transcode] job=%s failed to start: %s: %s", job, type(exc).__name__, exc)
         await release_lock(_job_key(job))
@@ -256,6 +287,7 @@ async def wait_ready(job: str, timeout: int | None = None) -> bool:
     while time.monotonic() < limit:
         running = _RUNNING.get(job)
         if running and running.process.returncode not in (None, 0):
+            _log_ffmpeg_tail(job, running.log_path)
             return False
         if playlist.exists() and playlist.stat().st_size > 0:
             if any(

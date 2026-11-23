@@ -240,6 +240,19 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
     endpoint = result.get("mediaflow_endpoint") or "hls_manifest_proxy"
     destination = result["destination_url"]
 
+    # A DASH source routed through the raw stream endpoint cannot resolve its
+    # relative segments, and a DASH->HLS conversion endpoint returns an HLS
+    # playlist even though the probe still reports `dash`. Correct both the
+    # endpoint and the playback type here so the browser never hands an m3u8 to
+    # dash.js (and FFmpeg always receives a playlist with absolute URLs).
+    converted_dash = probe.manifest_type == "dash" and endpoint in (
+        "proxy_stream_endpoint",
+        "hls_manifest_proxy",
+    )
+    if converted_dash:
+        endpoint = "mpd_manifest_proxy"
+    manifest_type = "hls" if converted_dash else probe.manifest_type
+
     primary = _sign_asset_url(
         request,
         result,
@@ -312,8 +325,10 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
                     "type": request.query_params.get("type") or "",
                     "id": request.query_params.get("id") or "",
                     "host": host,
+                    "manifest_type": probe.manifest_type,
                 },
                 audio_copy=_audio_can_be_copied(probe),
+                manifest_type=probe.manifest_type,
             )
         except Exception as exc:
             # A failed job registration must not discard an otherwise playable
@@ -329,7 +344,7 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
     return Candidate(
         host=host,
         url=primary,
-        manifest_type=probe.manifest_type,
+        manifest_type=manifest_type,
         sources=sources,
         subtitles=subtitles,
         score=probe.score,
@@ -337,7 +352,7 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
         needs_transcode=needs_transcode,
         transcode_url=transcode_url,
         transcode_job=transcode_job,
-        playback_type="hls" if needs_transcode else probe.manifest_type,
+        playback_type="hls" if needs_transcode or converted_dash else probe.manifest_type,
     )
 
 

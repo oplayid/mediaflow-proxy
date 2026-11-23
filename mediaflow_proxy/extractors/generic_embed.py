@@ -32,8 +32,10 @@ from mediaflow_proxy.utils.packed import eval_solver
 
 logger = logging.getLogger(__name__)
 
-_CFG_RE = re.compile(r"window\.CFG\s*=\s*(\{.*?\})\s*;", re.DOTALL)
-_CONFIG_RE = re.compile(r"window\.CONFIG\s*=\s*(\{.*?\})\s*;", re.DOTALL)
+# Only locate the assignment; the JSON object is read with balanced braces so
+# nested objects and a missing trailing semicolon do not break extraction.
+_CFG_RE = re.compile(r"window\.CFG\s*=", re.DOTALL)
+_CONFIG_RE = re.compile(r"window\.CONFIG\s*=", re.DOTALL)
 _IFRAME_RE = re.compile(r"<iframe\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I | re.S)
 _DATA_API_RE = re.compile(r"\bdata-api\s*=\s*[\"']([^\"']+)[\"']", re.I | re.S)
 
@@ -238,13 +240,42 @@ def _normalise_audio(items) -> list[dict]:
 
 
 def _extract_json_object(pattern: re.Pattern, html: str, name: str) -> Dict[str, Any]:
+    """Read the first balanced ``{...}`` after a JS assignment.
+
+    Upstream player pages sometimes drop the trailing semicolon or nest objects
+    inside the config; a lazy regex cannot handle either case reliably.
+    """
     match = pattern.search(html)
     if not match:
         raise ExtractorError(f"{name}: config object not found")
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        raise ExtractorError(f"{name}: invalid config JSON") from exc
+    start = html.find("{", match.start())
+    if start < 0:
+        raise ExtractorError(f"{name}: config object not found")
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(html)):
+        char = html[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start : index + 1])
+                except json.JSONDecodeError as exc:
+                    raise ExtractorError(f"{name}: invalid config JSON") from exc
+    raise ExtractorError(f"{name}: unterminated config object")
 
 
 def _set_query_param(url: str, key: str, value: str) -> str:
@@ -443,10 +474,18 @@ class GenericEmbedExtractor(BaseExtractor):
         if capabilities:
             default_capabilities.update(capabilities)
 
+        # Some hosts (notably VidLink) now return DASH manifests even though
+        # their registry entry was written for direct MP4 files. Serving an MPD
+        # through the raw stream endpoint breaks relative segment resolution,
+        # both in the browser and in the transcode prewarm.
+        endpoint = self.mediaflow_endpoint
+        if urlparse(destination_url).path.lower().endswith(".mpd"):
+            endpoint = "mpd_manifest_proxy"
+
         return {
             "destination_url": destination_url,
             "request_headers": base_headers,
-            "mediaflow_endpoint": self.mediaflow_endpoint,
+            "mediaflow_endpoint": endpoint,
             "expiration": 120,
             "force_playlist_proxy": True,
             "sources": normalised_sources,
@@ -601,17 +640,25 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={"Referer": nested_url, "Accept": "text/html"},
         )
         player_cfg = _extract_json_object(_CONFIG_RE, player.text, self.config.canonical)
-        # Movie pages still expose `api`; TV pages now expose `streamBase`.
-        api_url = player_cfg.get("api") or player_cfg.get("streamBase")
-        api_token = player_cfg.get("apiToken")
+        # Movie pages expose `api`; TV pages expose `streamBase`. Upstream has
+        # also been seen with camel/snake aliases for both API and token, so
+        # accept all of them and log the received keys when they change again.
+        stream_base = player_cfg.get("streamBase") or player_cfg.get("stream_base") or ""
+        api_url = player_cfg.get("api") or stream_base or player_cfg.get("apiUrl") or player_cfg.get("api_url")
+        api_token = player_cfg.get("apiToken") or player_cfg.get("api_token") or player_cfg.get("token")
         if not api_url or not api_token:
+            logger.info(
+                "[%s] stream API config missing; keys=%s",
+                self.config.canonical,
+                sorted(player_cfg),
+            )
             raise ExtractorError(f"{self.config.canonical}: stream API config missing")
 
         # The player's apiFor(s, e) appends `season`/`episode` plus the bare
         # `stream_urls` flag. keep_blank_values in _set_query_param preserves
         # the flag. `s`/`e` are not valid here and yield `403 invalid api token`
         # with an episode-bound token.
-        if player_cfg.get("streamBase"):
+        if stream_base:
             api_url = _set_query_param(api_url, "stream_urls", "")
             if media_type == "tv":
                 api_url = _set_query_param(api_url, "season", season or "1")
@@ -619,7 +666,7 @@ class GenericEmbedExtractor(BaseExtractor):
 
         # The player first reads metadata to learn which pool host serves the
         # stream_urls API for this request. Mirror that before calling the API.
-        meta_url = player_cfg.get("metaApi")
+        meta_url = player_cfg.get("metaApi") or player_cfg.get("meta_api")
         if meta_url:
             try:
                 meta = await self._make_request(

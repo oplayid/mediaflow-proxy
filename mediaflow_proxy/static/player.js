@@ -148,7 +148,9 @@
   function waitForTranscode(url, token) {
     return new Promise(function (resolve, reject) {
       var started = Date.now();
-      var deadline = 60000;
+      // Do not keep the viewer on a spinner for a minute when FFmpeg stalls;
+      // playUrl() falls back to the native source once this lapses.
+      var deadline = 25000;
       function check() {
         if (token !== generation) return;
         var elapsed = Date.now() - started;
@@ -263,7 +265,9 @@
       startPlayback(candidate, candidate.transcode_url, startTime, "hls");
     }).catch(function () {
       if (token !== generation) return;
-      handleError("transcode", true);
+      // Last chance before discarding this host: play the native (already
+      // proxied) source. Errors from here go through the normal host fallback.
+      startPlayback(candidate, candidate.url, startTime, candidate.playback_type || candidate.manifest_type);
     });
   }
 

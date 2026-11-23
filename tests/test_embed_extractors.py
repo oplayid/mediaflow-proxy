@@ -314,6 +314,45 @@ async def test_vidsrc_to_follows_wrapper_and_source_gate():
 
 
 @pytest.mark.asyncio
+async def test_vsembed_accepts_aliased_config_without_semicolon():
+    config = EMBED_HOSTS["VSEmbed"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://stream.oplay.id/embed/movie/550"
+    gate_url = "https://stream.oplay.id/vs_src.php?type=movie&id=550"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html"
+    api_url = "https://vsapi.example/api.php?id=550&api_token=tok"
+    destination = "https://cdn.example/master.m3u8"
+
+    _mock_requests(
+        extractor,
+        {
+            gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+            nested_url: _response(
+                nested_url,
+                # No trailing semicolon, nested object before playerUrl.
+                text='<script>window.CFG={"meta":{"a":1},"playerUrl":"' + player_url + '"}</script>',
+            ),
+            player_url: _response(
+                player_url,
+                text=(
+                    '<script>window.CONFIG={"apiUrl":"https://vsapi.example/api.php?id=550",'
+                    '"token":"tok","extra":{"nested":true}}</script>'
+                ),
+            ),
+            api_url: _response(
+                api_url,
+                text=f'{{"data":{{"stream_urls":["{destination}"],"cast_urls":[]}}}}',
+            ),
+        },
+    )
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == destination
+
+
+@pytest.mark.asyncio
 async def test_vsembed_tv_uses_stream_base_and_preserves_stream_urls_flag():
     config = EMBED_HOSTS["VSEmbed"]
     extractor = GenericEmbedExtractor({}, config)
@@ -622,6 +661,30 @@ def _vidlink_api_response(url: str) -> HttpResponse:
         },
     }
     return _response(url, text=json.dumps(payload))
+
+
+@pytest.mark.asyncio
+async def test_vidlink_dash_uses_mpd_conversion_endpoint():
+    config = EMBED_HOSTS["VidLink"]
+    extractor = GenericEmbedExtractor({}, config)
+    token = "C" * 64
+    embed_url = f"https://vidlink.pro/movie/533535?adv_token={token}"
+    api_url = f"https://vidlink.pro/api/b/movie/{token}?multiLang=0"
+    mpd = "https://cdn.example/dash/1080_h265/index_web.mpd"
+    payload = {
+        "sourceId": "mbVault",
+        "stream": {
+            "id": "primary",
+            "qualities": {"1080": {"type": "dash", "url": mpd}},
+            "captions": [],
+        },
+    }
+
+    _mock_requests(extractor, {api_url: _response(api_url, text=json.dumps(payload))})
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == mpd
+    assert result["mediaflow_endpoint"] == "mpd_manifest_proxy"
 
 
 @pytest.mark.asyncio
