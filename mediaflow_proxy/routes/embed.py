@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -157,6 +157,51 @@ async def _extract(
     return filter_extractor_result(result, AdFilterReport())
 
 
+def _headers_for_destination(result: dict, destination_url: str) -> dict | None:
+    """Prefer per-source headers (e.g. VidLink CloudFront cookies).
+
+    ``result["request_headers"]`` only carries generic base headers. Signing the
+    primary ``stream_url`` with those silently dropped VidLink's
+    ``Cookie: CloudFront-Policy=...`` and made MPD requests return 403.
+    """
+    for source in result.get("sources") or []:
+        if isinstance(source, dict) and source.get("url") == destination_url:
+            return source.get("request_headers") or None
+    return result.get("request_headers") or None
+
+
+def _sign_player_url(
+    request: Request,
+    media_type: str,
+    media_id: str,
+    season: str | None,
+    episode: str | None,
+) -> str:
+    """Build the iframe URL consumed by StreamFlix.
+
+    The token is encrypted with ``api_password`` server-side, so the browser
+    only ever sees an opaque path. StreamFlix holds no provider URL, proxy URL
+    or secret; the player on this origin resolves everything internally.
+    """
+    scheme = get_original_scheme(request)
+    authority = request.headers.get("host") or request.url.netloc
+    path = f"/player/{media_type}/{media_id}"
+    if media_type == "tv":
+        path += f"/{season or '1'}/{episode or '1'}"
+    payload = {
+        "type": media_type,
+        "id": media_id,
+        "s": season or "",
+        "e": episode or "",
+        "retry": request.query_params.get("retry") == "1",
+    }
+    handler = EncryptionHandler(settings.api_password) if settings.api_password else None
+    if handler:
+        token = handler.encrypt_data(payload, expiration=600)
+        return f"{scheme}://{authority}/_token_{token}{path}"
+    return f"{scheme}://{authority}{path}?{urlencode(payload)}"
+
+
 def _sign_asset_url(
     request: Request,
     result: dict,
@@ -198,7 +243,7 @@ def _sign_asset_url(
         mediaflow_proxy_url=proxy_base,
         destination_url=destination_url,
         query_params=query_params,
-        request_headers=request_headers or result.get("request_headers"),
+        request_headers=request_headers if request_headers is not None else _headers_for_destination(result, destination_url),
         response_headers=proxy_headers.response,
         encryption_handler=encryption_handler,
         expiration=expiration or result.get("expiration", 300),
@@ -400,6 +445,9 @@ async def _probe_gateway(
         config,
         {
             "host": config.canonical,
+            # StreamFlix embeds this opaque URL in an iframe. All provider and
+            # proxy URLs stay inside mfp.oplay.id.
+            "player_url": _sign_player_url(request, media_type, media_id, season, episode),
             "stream_url": stream_url,
             "sources": sources,
             # Native/host captions: safe to auto-enable.

@@ -1,0 +1,289 @@
+(function () {
+  "use strict";
+
+  var session = window.__MFP_SESSION__ || { candidates: [], subtitles: [], audit: {} };
+  var candidates = Array.isArray(session.candidates) ? session.candidates : [];
+  var subtitles = Array.isArray(session.subtitles) ? session.subtitles : [];
+
+  var video = document.getElementById("video");
+  var overlay = document.getElementById("overlay");
+  var overlayStatus = document.getElementById("overlay-status");
+  var overlayBar = document.getElementById("overlay-bar");
+  var errorBox = document.getElementById("error-box");
+  var errorStatus = document.getElementById("error-status");
+  var hostBadge = document.getElementById("host-badge");
+  var simBadge = document.getElementById("sim-badge");
+  var title = document.getElementById("title");
+  var hostSelect = document.getElementById("host-select");
+  var qualitySelect = document.getElementById("quality-select");
+  var subtitleSelect = document.getElementById("subtitle-select");
+  var retryButton = document.getElementById("retry-button");
+  var errorRetry = document.getElementById("error-retry");
+
+  var hls = null;
+  var dashPlayer = null;
+  var activeIndex = -1;
+  var failed = {};
+  var readySent = false;
+  var lastTimeUpdate = 0;
+  var trackElements = {};
+  var allowedParents = ["https://movie.oplay.id", window.location.origin];
+
+  function parentWindow() {
+    return window.parent && window.parent !== window ? window.parent : null;
+  }
+
+  function post(type, payload) {
+    var target = parentWindow();
+    if (!target) return;
+    var message = { source: "mfp-player", type: type };
+    Object.keys(payload || {}).forEach(function (key) { message[key] = payload[key]; });
+    target.postMessage(message, "*");
+  }
+
+  function setOverlay(text, percent) {
+    overlayStatus.textContent = text;
+    overlayBar.style.width = (percent || 0) + "%";
+  }
+
+  function hideOverlay() {
+    overlay.classList.add("hidden");
+    errorBox.classList.add("hidden");
+  }
+
+  function showError(text) {
+    overlay.classList.add("hidden");
+    errorStatus.textContent = text || "Tidak ada host yang bisa diputar.";
+    errorBox.classList.remove("hidden");
+    post("error", { message: errorStatus.textContent });
+  }
+
+  function currentCandidate() {
+    return candidates[activeIndex] || null;
+  }
+
+  function buildTracks() {
+    Array.prototype.slice.call(video.querySelectorAll("track")).forEach(function (element) { element.remove(); });
+    trackElements = {};
+    subtitles.forEach(function (item) {
+      var element = document.createElement("track");
+      element.kind = "subtitles";
+      element.label = (item.origin === "provider" ? "API • " : "") + (item.host ? item.host + " • " : "") + item.label;
+      element.srclang = item.language || "";
+      element.src = item.url;
+      video.appendChild(element);
+      trackElements[item.id] = element;
+    });
+  }
+
+  function preferredSubtitle() {
+    var id = subtitles.find(function (item) { return (item.language || "").toLowerCase().startsWith("id"); });
+    if (id) return id.id;
+    var en = subtitles.find(function (item) { return (item.language || "").toLowerCase().startsWith("en"); });
+    if (en) return en.id;
+    return subtitles.length ? subtitles[0].id : "";
+  }
+
+  function fillSubtitles() {
+    subtitleSelect.innerHTML = "";
+    var off = document.createElement("option");
+    off.value = "";
+    off.textContent = "Mati";
+    subtitleSelect.appendChild(off);
+    subtitles.forEach(function (item) {
+      var option = document.createElement("option");
+      option.value = item.id;
+      option.textContent = (item.origin === "provider" ? "API • " : "") + (item.host ? item.host + " • " : "") + item.label;
+      subtitleSelect.appendChild(option);
+    });
+    subtitleSelect.value = preferredSubtitle();
+    applySubtitle();
+  }
+
+  function applySubtitle() {
+    var selected = subtitleSelect.value;
+    Object.keys(trackElements).forEach(function (id) {
+      try { trackElements[id].track.mode = id === selected ? "showing" : "disabled"; } catch (error) {}
+    });
+  }
+
+  function fillHosts() {
+    hostSelect.innerHTML = "";
+    candidates.forEach(function (candidate, index) {
+      var option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = candidate.host + " • " + candidate.manifest_type + " • " + candidate.score;
+      hostSelect.appendChild(option);
+    });
+    if (candidates.length) hostSelect.value = "0";
+  }
+
+  function fillQualities() {
+    qualitySelect.innerHTML = "";
+    var auto = document.createElement("option");
+    auto.value = "";
+    auto.textContent = "Auto";
+    qualitySelect.appendChild(auto);
+    var candidate = currentCandidate();
+    (candidate && candidate.sources ? candidate.sources : []).forEach(function (source) {
+      var option = document.createElement("option");
+      option.value = source.url;
+      option.textContent = source.label || source.id;
+      qualitySelect.appendChild(option);
+    });
+  }
+
+  function cleanup() {
+    if (hls) { try { hls.destroy(); } catch (error) {} hls = null; }
+    if (dashPlayer) { try { dashPlayer.reset(); } catch (error) {} dashPlayer = null; }
+  }
+
+  function handleError(source, fatal) {
+    if (!fatal) return;
+    var candidate = currentCandidate();
+    if (!candidate) return;
+    failed[activeIndex] = true;
+    var next = candidates.findIndex(function (_item, index) { return !failed[index]; });
+    if (next >= 0) {
+      setOverlay("Host " + candidate.host + " gagal. Mencoba " + candidates[next].host + "…", 70);
+      overlay.classList.remove("hidden");
+      playCandidate(next, video.currentTime);
+      return;
+    }
+    showError("Semua host gagal diputar. Silakan cari ulang host.");
+  }
+
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    hideOverlay();
+    post("ready", {
+      duration: Number.isFinite(video.duration) ? video.duration : 0,
+      host: currentCandidate() ? currentCandidate().host : null,
+      audit: session.audit || {}
+    });
+  }
+
+  function attachCommon(startTime) {
+    applySubtitle();
+    if (Number.isFinite(startTime) && startTime > 0) {
+      video.addEventListener("loadedmetadata", function once() {
+        try { video.currentTime = startTime; } catch (error) {}
+        video.removeEventListener("loadedmetadata", once);
+      });
+    }
+  }
+
+  function playUrl(candidate, url, startTime) {
+    cleanup();
+    setOverlay("Memutar " + candidate.host + "…", 90);
+    attachCommon(startTime);
+
+    if (candidate.manifest_type === "hls") {
+      if (window.Hls && window.Hls.isSupported()) {
+        hls = new window.Hls({ enableWorker: true, capLevelToPlayerSize: true });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hls.on(window.Hls.Events.MANIFEST_PARSED, sendReady);
+        hls.on(window.Hls.Events.ERROR, function (event, data) { handleError("hls", data && data.fatal); });
+      } else {
+        video.src = url;
+        video.addEventListener("loadedmetadata", sendReady, { once: true });
+      }
+    } else if (candidate.manifest_type === "dash" && window.dashjs) {
+      dashPlayer = window.dashjs.MediaPlayer().create();
+      dashPlayer.initialize(video, url, false);
+      dashPlayer.on(window.dashjs.MediaPlayer.events.ERROR, function (event) {
+        handleError("dash", !!(event && event.error));
+      });
+      video.addEventListener("loadedmetadata", sendReady, { once: true });
+    } else {
+      video.src = url;
+      video.addEventListener("loadedmetadata", sendReady, { once: true });
+    }
+
+    video.play().catch(function () {});
+    post("sourcechange", { host: candidate.host, type: candidate.manifest_type });
+  }
+
+  function playCandidate(index, startTime) {
+    var candidate = candidates[index];
+    if (!candidate) { showError("Host tidak tersedia."); return; }
+    activeIndex = index;
+    hostSelect.value = String(index);
+    fillQualities();
+    hostBadge.textContent = candidate.host + " • " + candidate.manifest_type;
+    hostBadge.classList.add("good");
+    playUrl(candidate, candidate.url, startTime || 0);
+  }
+
+  function retry() {
+    var path = window.location.pathname.replace(/\/?retry\/?$/, "");
+    window.location.href = path.replace(/\/$/, "") + "/retry";
+  }
+
+  retryButton.addEventListener("click", retry);
+  errorRetry.addEventListener("click", retry);
+
+  hostSelect.addEventListener("change", function () {
+    playCandidate(Number(hostSelect.value), video.currentTime);
+  });
+
+  qualitySelect.addEventListener("change", function () {
+    if (!qualitySelect.value) { playCandidate(activeIndex, video.currentTime); return; }
+    var candidate = currentCandidate();
+    if (candidate) playUrl(candidate, qualitySelect.value, video.currentTime);
+  });
+
+  subtitleSelect.addEventListener("change", applySubtitle);
+
+  video.addEventListener("timeupdate", function () {
+    var now = Date.now();
+    if (now - lastTimeUpdate < 1000) return;
+    lastTimeUpdate = now;
+    post("timeupdate", {
+      currentTime: video.currentTime || 0,
+      duration: Number.isFinite(video.duration) ? video.duration : 0
+    });
+  });
+
+  video.addEventListener("ended", function () { post("ended", {}); });
+  video.addEventListener("play", function () { post("playing", {}); });
+  video.addEventListener("pause", function () { post("paused", {}); });
+
+  window.addEventListener("message", function (event) {
+    if (allowedParents.indexOf(event.origin) === -1) return;
+    var data = event.data || {};
+    if (typeof data !== "object") return;
+    if (data.type === "mfp:seek" && Number.isFinite(data.time)) {
+      try { video.currentTime = data.time; } catch (error) {}
+    } else if (data.type === "mfp:setSubtitle") {
+      var match = subtitles.find(function (item) { return (item.language || "") === data.language; });
+      if (match) { subtitleSelect.value = match.id; applySubtitle(); }
+    } else if (data.type === "mfp:pause") {
+      video.pause();
+    } else if (data.type === "mfp:play") {
+      video.play().catch(function () {});
+    } else if (data.type === "mfp:host") {
+      var index = Number(data.index);
+      if (index >= 0 && index < candidates.length) playCandidate(index, video.currentTime);
+    }
+  });
+
+  var media = session.media || {};
+  title.textContent = media.type === "tv"
+    ? "TV " + media.id + " • S" + (media.season || 1) + " E" + (media.episode || 1)
+    : (media.id ? media.type + " • " + media.id : "MediaFlow Player");
+  simBadge.textContent = "simulasi " + ((session.audit || {}).simulation_ms || 0) + "ms";
+
+  if (!candidates.length) {
+    showError("Tidak ada host embed yang lolos simulasi. Tambahkan atau perbaiki host di MediaFlow.");
+    return;
+  }
+
+  buildTracks();
+  fillSubtitles();
+  fillHosts();
+  setOverlay("Simulasi selesai. Menyiapkan " + candidates[0].host + "…", 100);
+  playCandidate(0, 0);
+})();

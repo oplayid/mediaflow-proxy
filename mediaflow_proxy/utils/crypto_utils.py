@@ -62,6 +62,12 @@ class EncryptionMiddleware(BaseHTTPMiddleware):
         self.encryption_handler = encryption_handler
 
     async def dispatch(self, request: Request, call_next):
+        # Save the tokenized scope. Uvicorn's access log reads the scope after
+        # call_next, so leaving decrypted params there would print api_password.
+        original_path = request.scope.get("path")
+        original_raw_path = request.scope.get("raw_path")
+        original_query_string = request.scope.get("query_string")
+
         path = request.url.path
         token_marker = "/_token_"
         encrypted_token = None
@@ -128,6 +134,15 @@ class EncryptionMiddleware(BaseHTTPMiddleware):
                 content={"error": "An error occurred while processing the request, check the server for logs"},
                 status_code=500,
             )
+        finally:
+            # Restore the opaque tokenized path/query for access logs and any
+            # downstream task that still inspects the raw scope after response.
+            if original_path is not None:
+                request.scope["path"] = original_path
+            if original_raw_path is not None:
+                request.scope["raw_path"] = original_raw_path
+            if original_query_string is not None:
+                request.scope["query_string"] = original_query_string
         return response
 
     @staticmethod

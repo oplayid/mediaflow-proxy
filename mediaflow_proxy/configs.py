@@ -132,6 +132,13 @@ class Settings(BaseSettings):
         None  # MediaFlow's own public IP. Used to substitute {mediaflow_ip} in forwarded requests. Auto-detected if not set.
     )
 
+    # Smart player settings. The player is served by MediaFlow itself and
+    # embedded by StreamFlix; StreamFlix never sees provider/proxy URLs.
+    player_hosts: str = ""  # Comma-separated canonical hosts. Empty = all known embed hosts.
+    player_simulation_budget: float = 10.0  # Max seconds spent scoring hosts before playback.
+    player_cache_ttl: int = 600  # Seconds a simulated session is reused across workers.
+    player_frame_ancestors: str = "https://movie.oplay.id"  # CSP frame-ancestors for the iframe.
+
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.
 

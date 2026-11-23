@@ -1,0 +1,13 @@
+Bundled player libraries
+========================
+
+hls.js 1.6.13 — MIT License
+  https://github.com/video-dev/hls.js
+  Copyright (c) 2015-2026 video-dev contributors
+
+dash.js 4.7.4 — Apache License 2.0
+  https://github.com/Dash-Industry-Forum/dash.js
+  Copyright (c) Dash Industry Forum contributors
+
+The minified builds are vendored so mfp.oplay.id remains fully self-contained
+and no third-party CDN is contacted by the embedded player.

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="id" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>MediaFlow Player</title>
+  <link rel="icon" href="/logo.png">
+  <link rel="stylesheet" href="/player.css">
+</head>
+<body>
+  <div id="app">
+    <video id="video" controls playsinline preload="metadata"></video>
+
+    <div class="topbar">
+      <span class="title" id="title">MediaFlow</span>
+      <span class="badge" id="host-badge">menyiapkan…</span>
+      <span class="badge" id="sim-badge">simulasi host</span>
+    </div>
+
+    <div class="controls">
+      <label>Host
+        <select id="host-select" aria-label="Sumber video"></select>
+      </label>
+      <label>Kualitas
+        <select id="quality-select" aria-label="Kualitas video"></select>
+      </label>
+      <label>Subtitle
+        <select id="subtitle-select" aria-label="Subtitle"></select>
+      </label>
+      <span class="spacer"></span>
+      <button id="retry-button" type="button">Cari ulang host</button>
+    </div>
+
+    <div class="overlay" id="overlay">
+      <div class="status" id="overlay-status">Mensimulasikan seluruh host embed…</div>
+      <div class="bar"><span id="overlay-bar"></span></div>
+      <div class="hint" id="overlay-hint">Maksimal 10 detik. MediaFlow menguji video dan subtitle sebelum memutar.</div>
+    </div>
+
+    <div class="error-box hidden" id="error-box">
+      <div class="status" id="error-status">Tidak ada host yang bisa diputar.</div>
+      <div class="hint" id="error-hint">Coba “Cari ulang host” atau tambahkan host lain di MediaFlow.</div>
+      <button id="error-retry" type="button">Cari ulang host</button>
+    </div>
+  </div>
+
+  <script src="/vendor/hls.min.js"></script>
+  <script src="/vendor/dash.all.min.js"></script>
+  <script>
+    window.__MFP_SESSION__ = /*__MFP_SESSION__*/null;
+  </script>
+  <script src="/player.js"></script>
+</body>
+</html>

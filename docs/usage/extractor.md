@@ -113,19 +113,21 @@ GET /extractor/video.m3u8?host=TurboVidPlay&d=https://turbovidhls.com/t/abc123&a
 
 This redirects to the proxied HLS manifest URL, and because the request URL contains `.m3u8`, players like ExoPlayer will correctly use HLS playback.
 
-## StreamFlix gateway (output only)
+## StreamFlix gateway and smart player
 
-MediaFlow is **not** a player and does not serve a provider list, a relay page, a server switcher, or a player iframe. Streamflix sends only media identity; MediaFlow visits the provider embed page server-side, scrubs ads, resolves the clean HLS/MP4 URL plus subtitle URLs, caches the result, and returns JSON containing MediaFlow-signed proxy URLs. Streamflix owns the UI, the player, watch progress, and history.
+`/gateway/resolve/...` is kept for backwards compatibility, but Streamflix no longer plays the returned `stream_url`. The important field is `player_url`: an opaque, short-lived URL that Streamflix renders directly in an iframe. Playback, host selection, quality, subtitles, failover, and proxy URLs are fully owned by the player on `mfp.oplay.id`.
 
 | Endpoint | Description |
 |---|---|
-| `/gateway/resolve/movie/<tmdb_id>` | Resolve a movie |
+| `/gateway/resolve/movie/<tmdb_id>` | Resolve a movie and return `player_url` |
 | `/gateway/resolve/tv/<tmdb_id>` | Show, defaults to season 1 episode 1 |
 | `/gateway/resolve/tv/<tmdb_id>/<season>` | Show, defaults to episode 1 |
 | `/gateway/resolve/tv/<tmdb_id>/<season>/<episode>` | Exact TV episode |
+| `/_token_<token>/player/<type>/<id>[/<season>/<episode>]` | Smart player iframe (tokenized, no `api_password`) |
+| `/_token_<token>/player/<type>/<id>[/<season>[/<episode>]]/retry` | Re-run simulation with a clean cache |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The gateway resolves three hosts, in order: **VidCore, VSEmbed, then VidLink**. Add `?host=vidcore`, `?host=vsembed`, or `?host=vidlink` to force one host (useful for diagnostics). Each probe has a 10 second timeout and selection is capped at 40 seconds; failed hosts are skipped for 30 seconds. Historical hosts remain in the extractor registry for backwards-compatible `host=` lookups but are never probed by this gateway. If all three hosts fail the gateway returns `503` with a readable `detail`; it never returns a player shell, a provider page, or a raw proxy error.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway still resolves **VidCore, VSEmbed, then VidLink** (10 seconds per host, 40 seconds total). The player uses a different, broader order: **VSEmbed, VidCore, VidLink**, followed by every host registered in `EMBED_HOSTS`. Set `PLAYER_HOSTS=VidLink,VSEmbed,...` to override that order. Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
 
 Example:
 
@@ -136,6 +138,7 @@ GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1
 ```json
 {
   "host": "VidCore",
+  "player_url": "https://mfp.oplay.id/_token_<encrypted>/player/tv/94997/1/1",
   "stream_url": "https://mfp.oplay.id/proxy/hls/manifest.m3u8?d=...&exp=...",
   "sources": [{"id": "auto", "label": "Auto", "url": "..."}],
   "subtitles": [
@@ -151,19 +154,25 @@ GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1
 }
 ```
 
-`stream_url` and every URL in `sources`/`subtitles`/`provider_subtitles` is signed: upstream headers, query parameters, and `api_password` are encrypted into the token, so the browser never sees `api_password` in plaintext. `expires_in` is the token lifetime in seconds. Streamflix should re-fetch the gateway when the token approaches expiry (or when the user retries) instead of contacting the provider again.
+`stream_url`, `sources`, and subtitle URLs remain in the response only for older clients. The browser never receives `api_password`: every upstream header and query parameter is encrypted into the token path (`/_token_...`). The player validates the token against the path and renders its own signed, same-origin URLs.
 
-`subtitles` are the host's own captions and are safe to auto-enable. `provider_subtitles` come from a separate subtitle API (for example VidCore's subtitle list) and must stay opt-in. Both lists are ordered Indonesian first, English second; Streamflix selects the Indonesian host track by default and falls back to English.
+### Player simulation
+
+Simulation starts when the iframe mounts, not on every play click. With a hard budget of `PLAYER_SIMULATION_BUDGET=10` seconds, the player resolves hosts concurrently (`RESOLVE_TIMEOUT=5.5`, `PROBE_TIMEOUT=2.5`, `PROBE_CONCURRENCY=4`), fetches a manifest plus one tiny segment range, detects HLS/DASH/MP4 and codecs, checks subtitle availability, then ranks candidates. HTTP 200 manifest +40, segment 200/206 +25, HLS +20, DASH +8, HEVC −25, latency bonus up to +10, Indonesian subtitle +5.
+
+All playable candidates are kept in order. The browser can switch host or quality; if the active host fails, the player moves to the next candidate at the same `currentTime`. Native subtitles from every host are merged, deduplicated by language/label, and ordered `id` > `en` > others while retaining `host`/`origin` metadata. hls.js `1.6.13` and dash.js `4.7.4` are bundled locally, so no third-party CDN is contacted.
+
+Streamflix only listens to `postMessage` events (`ready`, `timeupdate`, `playing`, `paused`, `ended`, `error`) and may send `mfp:seek`, `mfp:setSubtitle`, `mfp:pause`, `mfp:play`, or `mfp:host`. CSP `frame-ancestors` is `https://movie.oplay.id` by default; override with `PLAYER_FRAME_ANCESTORS` if needed.
 
 ### Caching and retry
 
-The provider is contacted **once** per media identity. The extracted result is cached in MediaFlow for at most 6 hours, or for a shorter time when the upstream URL advertises its own expiry (`expires`, `exp`, or `e`). Signed token lifetime matches the cache entry. Playback then goes only through `mfp.oplay.id/proxy/hls/...`; the embed host is not contacted again until the cache expires. `?retry=1` clears both positive and negative cache entries for that movie/episode and forces a fresh extraction, e.g.:
+The provider is contacted **once** per media identity. The extracted result is cached in MediaFlow for at most 6 hours, or for a shorter time when the upstream URL advertises its own expiry (`expires`, `exp`, or `e`). The simulated player session has a separate, shorter cache (`PLAYER_CACHE_TTL=600`, default 10 minutes) shared across workers via Redis when configured. `?retry=1` on the gateway clears the positive extractor cache; the player's **Cari ulang host** button uses `/player/.../retry` to bypass the player cache and re-run the simulation, e.g.:
 
 ```
 GET https://mfp.oplay.id/gateway/resolve/tv/94997/1/1?retry=1
 ```
 
-There are no `?mode=`, `?server=`, `?slug=`, or `/embed/...` routes: server selection is internal and cannot be overridden by the browser.
+There are no `?mode=`, `?server=`, `?slug=`, or legacy `/embed/...` routes: server selection is internal and cannot be overridden by the browser.
 
 ### Ad filtering
 
@@ -175,6 +184,6 @@ Ad filtering runs at three layers and writes an audit trail:
 
 ### Removed legacy surfaces
 
-`/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, and the in-iframe player with its `OPLAY_EMBED_*` postMessage contract have been removed entirely. Streamflix keeps its navbar, Play button, `/watch/...` page, and progress/history; MediaFlow only outputs clean URLs.
+`/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, and the old `OPLAY_EMBED_*` postMessage contract have been removed entirely. They are replaced by the tokenized `/player/...` iframe described above. Streamflix keeps its navbar, Play button, `/watch/...` page, and progress/history; MediaFlow owns playback and host logic.
 
 These endpoints are intentionally public: they resolve the upstream stream and sign a short-lived MediaFlow proxy URL internally, so `api_password` is never exposed to the browser. The TMDB API key used by trailer/banner endpoints also stays server-side.

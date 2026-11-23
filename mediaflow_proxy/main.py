@@ -18,6 +18,7 @@ from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
 from mediaflow_proxy.routes.embed import gateway_router
+from mediaflow_proxy.routes.player import player_router
 from mediaflow_proxy.routes.trailer import banner_router, trailer_router
 from mediaflow_proxy.routes.speedtest import speedtest_router
 from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
@@ -327,6 +328,10 @@ app.include_router(extractor_router, prefix="/extractor", tags=["extractors"], d
 # scrubs provider pages server-side and returns clean, signed proxy URLs. There
 # is deliberately no /embed provider list, relay route or player iframe here.
 app.include_router(gateway_router, prefix="/gateway", tags=["gateway"])
+
+# Smart iframe player. Provider/proxy URLs are resolved and signed on this
+# origin only; StreamFlix embeds the opaque URL from /gateway/resolve.
+app.include_router(player_router, prefix="/player", tags=["player"])
 # Public trailer pages: MediaFlow selects the YouTube trailer from TMDB and
 # renders an iframe; no API password is needed in the browser.
 app.include_router(trailer_router, prefix="/trailer", tags=["trailer"])
