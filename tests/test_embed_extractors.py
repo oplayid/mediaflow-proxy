@@ -1185,3 +1185,39 @@ async def test_generic_flow_skips_ad_script_and_uses_clean_stream():
 
     assert result["destination_url"] == destination
     assert result["ad_filter"]["sanitized_scripts"] == 1
+
+
+def test_native_subtitles_are_collected_from_common_api_payload_shapes():
+    """Every host must ship its subtitle package together with the video URL."""
+    payload = {
+        "data": {
+            "stream_urls": ["https://cdn.example/master.m3u8"],
+            "textTracks": {
+                "en": "https://cdn.example/en.srt",
+                "id": {"url": "https://cdn.example/id.srt", "label": "Bahasa Indonesia"},
+            },
+        },
+        "default_subs": [
+            {"lang": "English-SDH", "code": "en", "url": "https://cdn.example/en-sdh.srt"},
+            {"lang": "Indonesian", "code": "id", "url": "https://cdn.example/id-2.srt"},
+        ],
+        "stream": {"captions": ["https://cdn.example/fr.srt"]},
+    }
+
+    collected = generic_embed._collect_api_subtitles(payload)
+    normalised = generic_embed._normalise_subtitles(
+        collected, "https://player.example/", {"User-Agent": "test"}
+    )
+
+    urls = [item["url"] for item in normalised]
+    assert urls == [
+        "https://cdn.example/id.srt",
+        "https://cdn.example/id-2.srt",
+        "https://cdn.example/en.srt",
+        "https://cdn.example/en-sdh.srt",
+        "https://cdn.example/fr.srt",
+    ]
+    # `lang` is the only label some hosts expose; it must survive normalisation.
+    assert normalised[0]["label"] == "Bahasa Indonesia"
+    assert normalised[2]["language"] == "en"
+    assert normalised[3]["label"] == "English-SDH"

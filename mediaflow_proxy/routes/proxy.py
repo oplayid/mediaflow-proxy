@@ -12,6 +12,7 @@ from fastapi import Request, Depends, APIRouter, Query, HTTPException, Response
 from fastapi.datastructures import QueryParams
 
 from mediaflow_proxy.configs import settings
+from mediaflow_proxy.subtitles.subdl import srt_to_vtt
 from mediaflow_proxy.handlers import (
     handle_hls_stream_proxy,
     handle_stream_request,
@@ -242,6 +243,45 @@ HLS_SEGMENT_MIME_TYPES = {
 }
 
 
+def _decode_subtitle_body(raw: bytes) -> str:
+    """Decode subtitle bytes; host .srt files are often Windows-1252."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+async def _as_webvtt_response(response: Response) -> Response:
+    """Serve upstream SRT captions as real WebVTT for browser <track> elements.
+
+    Native host tracks are signed to `/hls/segment.vtt`, but many hosts store
+    them as `.srt`. Without conversion the browser receives SRT bytes with a
+    VTT content type and silently drops every subtitle track.
+    """
+    if response.status_code >= 400:
+        return response
+
+    # Both Starlette StreamingResponse and the project's EnhancedStreamingResponse
+    # expose an async body_iterator, so detect it structurally.
+    if hasattr(response, "body_iterator"):
+        chunks = [chunk async for chunk in response.body_iterator]
+    else:
+        body = getattr(response, "body", b"")
+        chunks = [body if isinstance(body, bytes) else str(body).encode("utf-8")]
+
+    converted = srt_to_vtt(_decode_subtitle_body(b"".join(chunks))).encode("utf-8")
+    headers = dict(response.headers)
+    for key in ("content-length", "content-encoding", "transfer-encoding"):
+        headers.pop(key, None)
+    headers["content-type"] = "text/vtt; charset=utf-8"
+    return Response(
+        content=converted,
+        status_code=response.status_code,
+        headers=headers,
+        media_type="text/vtt; charset=utf-8",
+    )
+
+
 @proxy_router.get("/hls/segment.{ext}", name="hls_segment_proxy")
 async def hls_segment_proxy(
     request: Request,
@@ -314,7 +354,8 @@ async def hls_segment_proxy(
                 "access-control-allow-origin": "*",
             }
             response_headers = apply_header_manipulation(base_headers, proxy_headers)
-            return Response(content=segment_data, media_type=mime_type, headers=response_headers)
+            segment_response = Response(content=segment_data, media_type=mime_type, headers=response_headers)
+            return await _as_webvtt_response(segment_response) if ext.lower() == "vtt" else segment_response
 
         # get_or_download returned None (timeout or error) - fall through to direct fetch
         logger.warning(f"[hls_segment_proxy] Prebuffer timeout, using direct fetch: {segment_url}")
@@ -324,7 +365,8 @@ async def hls_segment_proxy(
     # are not interpreted as a non-video format.
     if mime_type != "application/octet-stream":
         proxy_headers.response["content-type"] = mime_type
-    return await handle_stream_request("GET", segment_url, proxy_headers, transformer)
+    stream_response = await handle_stream_request("GET", segment_url, proxy_headers, transformer)
+    return await _as_webvtt_response(stream_response) if ext.lower() == "vtt" else stream_response
 
 
 # =============================================================================

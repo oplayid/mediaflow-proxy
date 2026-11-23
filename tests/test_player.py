@@ -19,6 +19,7 @@ from mediaflow_proxy.player.simulator import (
     _classify_manifest,
     _merge_subtitles,
     _needs_transcode,
+    has_indonesian_subtitle,
     host_configs,
 )
 from mediaflow_proxy.player.transcoder import (
@@ -196,6 +197,75 @@ async def test_simulate_session_refresh_bypasses_cached_session(monkeypatch):
     assert [host for kind, host in calls if kind == "resolve"] == ["VidCore"]
 
 
+def _native_track(language: str, label: str) -> dict:
+    return {
+        "id": f"native-{language}",
+        "language": language,
+        "label": label,
+        "host": "VidCore",
+        "origin": "host",
+        "url": f"https://proxy/vs/{language}",
+    }
+
+
+def _patch_signed_with_subtitles(monkeypatch, tracks: list[dict]) -> None:
+    async def fake_signed(request, result, proxy_headers, expiration, host, probe):
+        return Candidate(
+            host=host,
+            url="https://mfp.example/hls/master.m3u8",
+            manifest_type="hls",
+            playback_type="hls",
+            subtitles=tracks,
+            probe=probe,
+        )
+
+    monkeypatch.setattr(simulator, "_signed_candidate", fake_signed)
+
+
+@pytest.mark.asyncio
+async def test_simulate_session_skips_subdl_when_native_indonesian_exists(monkeypatch):
+    _patch_simulation(monkeypatch, {"VidCore"})
+    _patch_signed_with_subtitles(monkeypatch, [_native_track("id", "Bahasa Indonesia")])
+    collect_calls: list[tuple] = []
+
+    async def fake_collect(*args, **kwargs):
+        collect_calls.append(args)
+        return [{"id": "subdl-1", "language": "id", "label": "SubDL • ID", "origin": "subdl", "url": "https://proxy/sub/1"}]
+
+    monkeypatch.setattr(simulator.subdl, "collect", fake_collect)
+
+    session = await simulator.simulate_session(
+        _request("/player/movie/550"), "movie", "550", None, None
+    )
+
+    assert collect_calls == []
+    assert session["audit"]["native_indonesian_subtitle"] is True
+    assert session["audit"]["subdl_used"] is False
+    assert [item["origin"] for item in session["subtitles"]] == ["host"]
+
+
+@pytest.mark.asyncio
+async def test_simulate_session_offers_subdl_without_native_indonesian(monkeypatch):
+    _patch_simulation(monkeypatch, {"VidCore"})
+    _patch_signed_with_subtitles(monkeypatch, [_native_track("en", "English")])
+    collect_calls: list[tuple] = []
+
+    async def fake_collect(*args, **kwargs):
+        collect_calls.append(args)
+        return [{"id": "subdl-1", "language": "id", "label": "SubDL • ID", "origin": "subdl", "url": "https://proxy/sub/1"}]
+
+    monkeypatch.setattr(simulator.subdl, "collect", fake_collect)
+
+    session = await simulator.simulate_session(
+        _request("/player/movie/550"), "movie", "550", None, None
+    )
+
+    assert len(collect_calls) == 1
+    assert session["audit"]["native_indonesian_subtitle"] is False
+    assert session["audit"]["subdl_used"] is True
+    assert [item["origin"] for item in session["subtitles"]] == ["host", "subdl"]
+
+
 def test_player_ui_has_no_host_selector_or_retry_controls():
     static_dir = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static"
     html = (static_dir / "player.html").read_text(encoding="utf-8")
@@ -320,6 +390,32 @@ def test_merge_subtitles_prefers_indonesian_and_deduplicates():
     assert len([item for item in merged if item["language"] == "en"]) == 1
 
 
+def test_merge_subtitles_keeps_the_whole_native_package():
+    tracks = [
+        {
+            "id": f"sub-{index}",
+            "language": "en" if index else "id",
+            "label": f"Track {index}",
+            "host": "VSEmbed",
+            "origin": "host",
+            "url": f"https://proxy/vs/{index}",
+        }
+        for index in range(25)
+    ]
+    candidate = Candidate(
+        host="VSEmbed",
+        url="https://proxy/vs",
+        manifest_type="hls",
+        subtitles=tracks,
+        probe=ProbeResult(ok=True, score=90),
+    )
+
+    merged = _merge_subtitles([candidate])
+    assert len(merged) == 25
+    assert has_indonesian_subtitle(merged) is True
+    assert has_indonesian_subtitle([item for item in merged if item["language"] == "en"]) is False
+
+
 def test_srt_to_vtt_converts_timestamps_and_keeps_webvtt():
     from mediaflow_proxy.subtitles.subdl import srt_to_vtt
 
@@ -332,6 +428,39 @@ def test_srt_to_vtt_converts_timestamps_and_keeps_webvtt():
 
     already_vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nTeks\n"
     assert srt_to_vtt(already_vtt).strip() == already_vtt.strip()
+
+
+@pytest.mark.asyncio
+async def test_hls_segment_vtt_converts_upstream_srt_for_browser_tracks():
+    from mediaflow_proxy.routes.proxy import _as_webvtt_response
+
+    upstream = Response(
+        content=b"1\r\n00:00:00,000 --> 00:00:01,000\r\nHalo\r\n",
+        status_code=200,
+        headers={"content-type": "application/octet-stream", "x-upstream": "keep"},
+    )
+    converted = await _as_webvtt_response(upstream)
+
+    assert converted.status_code == 200
+    assert converted.headers["content-type"] == "text/vtt; charset=utf-8"
+    assert converted.headers["x-upstream"] == "keep"
+    body = converted.body.decode("utf-8")
+    assert converted.headers["content-length"] == str(len(converted.body))
+    assert body.startswith("WEBVTT\n\n")
+    assert "00:00:00.000 --> 00:00:01.000" in body
+
+    from mediaflow_proxy.utils.http_utils import EnhancedStreamingResponse
+
+    async def upstream_chunks():
+        yield b"1\r\n00:00:00,000 --> 00:00:01,000\r\nHalo\r\n"
+
+    streamed = await _as_webvtt_response(
+        EnhancedStreamingResponse(upstream_chunks(), media_type="application/octet-stream")
+    )
+    assert streamed.body.decode("utf-8").startswith("WEBVTT\n\n")
+
+    error = Response(status_code=404, content=b"missing")
+    assert await _as_webvtt_response(error) is error
 
 
 @pytest.mark.asyncio

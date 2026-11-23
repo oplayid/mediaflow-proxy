@@ -32,7 +32,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
    | `TMDB_API_KEY` | `your-tmdb-v3-key` | Optional. Enables `/trailer/...` YouTube trailer pages; the key is never sent to the browser. |
 
     | `REDIS_URL` | `redis://redis:6379` | Keep enabled. Shares the transcode registry and caches across workers. |
-    | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Enables SubDL subtitle alternatives inside the player. |
+    | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Adds SubDL alternatives only when the winning host has no Indonesian subtitle. |
     | `ENABLE_HEADLESS_FALLBACK` | `true` | Optional. Last-resort Chromium fallback for Turnstile-gated VSEmbed/VidSrcTo pages. Off by default. |
     | `HEADLESS_FALLBACK_TIMEOUT` | `15` | Optional. Seconds allowed per gated player page. |
 

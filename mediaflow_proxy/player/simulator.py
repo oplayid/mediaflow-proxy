@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Resolution/probe budget for the single host walk.
 RESOLVE_TIMEOUT = 7.5
 PROBE_TIMEOUT = 2.5
-CACHE_PREFIX = "mfp:player-session:"
+CACHE_PREFIX = "mfp:player-session:v2:"
 SESSION_TTL = 600
 
 _LANGUAGE_RANK = {"id": 0, "en": 1}
@@ -347,8 +347,20 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
     )
 
 
-def _merge_subtitles(candidates: list[Candidate], limit: int = 16) -> list[dict]:
-    """Normalise native tracks, preferring Indonesian/English."""
+def has_indonesian_subtitle(items) -> bool:
+    """True when the winning host already carries an Indonesian track."""
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        language = str(item.get("language") or "").strip().lower()
+        label = str(item.get("label") or "").strip().lower()
+        if language.startswith("id") or re.search(r"\b(indonesia|indonesian|bahasa)\b", label):
+            return True
+    return False
+
+
+def _merge_subtitles(candidates: list[Candidate], limit: int | None = None) -> list[dict]:
+    """Keep the whole subtitle package from each candidate, ID/EN first."""
     merged: dict[tuple[str, str], dict] = {}
     for candidate in candidates:
         for item in candidate.subtitles:
@@ -363,7 +375,7 @@ def _merge_subtitles(candidates: list[Candidate], limit: int = 16) -> list[dict]
         merged.values(),
         key=lambda item: (_language_rank(item), 0 if item.get("origin") == "host" else 1, item.get("label") or ""),
     )
-    return ordered[:limit]
+    return ordered if limit is None else ordered[:limit]
 
 
 async def simulate_session(
@@ -446,7 +458,12 @@ async def simulate_session(
         _prewarm(winner.transcode_job)
 
     subtitles = _merge_subtitles(candidates)
-    if winner:
+    native_has_indonesian = has_indonesian_subtitle(subtitles)
+    subdl_used = False
+    # SubDL is only an alternative when the winning host did not ship an
+    # Indonesian track with its video. Otherwise the native package is the
+    # single default source for this playback session.
+    if winner and not native_has_indonesian:
         try:
             external = await asyncio.wait_for(
                 subdl.collect(
@@ -458,10 +475,14 @@ async def simulate_session(
                 ),
                 timeout=subdl.COLLECT_TIMEOUT,
             )
-            # Native tracks from the winning video host stay first/default.
-            subtitles.extend(external)
+            if external:
+                # Native tracks from the winning video host stay first/default.
+                subtitles.extend(external)
+                subdl_used = True
         except Exception as exc:
             logger.info("[player] subtitle collection skipped: %s: %s", type(exc).__name__, exc)
+    elif native_has_indonesian:
+        logger.info("[player] SubDL skipped: winning host has a native Indonesian subtitle")
 
     audit = {
         "hosts_tried": len(tried) + (1 if winner else 0),
@@ -472,6 +493,8 @@ async def simulate_session(
         "transcode_hosts": [winner.host] if winner and winner.needs_transcode else [],
         "tried_hosts": tried,
         "subtitle_origins": sorted({str(item.get("origin") or "") for item in subtitles if item.get("origin")}),
+        "native_indonesian_subtitle": native_has_indonesian,
+        "subdl_used": subdl_used,
         "simulation_ms": int((time.monotonic() - started) * 1000),
     }
     session = session_to_dict(

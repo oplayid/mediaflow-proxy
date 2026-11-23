@@ -57,8 +57,10 @@ LANGUAGE_ALIASES = {
     "id": "id",
     "id-id": "id",
     "ind": "id",
+    "indo": "id",
     "indonesian": "id",
     "bahasa": "id",
+    "bahasa indonesia": "id",
     "in": "id",
     "en": "en",
     "en-us": "en",
@@ -183,7 +185,18 @@ def _normalise_subtitles(
             continue
         seen.add(url)
 
-        label = raw.get("label") or raw.get("name") or raw.get("title") or ""
+        # Embed APIs frequently describe a track only through `lang`/`code`.
+        # Falling back to those fields keeps the upstream label in the player
+        # instead of anonymous "Subtitle 1" entries.
+        label = (
+            raw.get("label")
+            or raw.get("name")
+            or raw.get("title")
+            or raw.get("lang")
+            or raw.get("language")
+            or raw.get("code")
+            or ""
+        )
         language = _language_code(
             raw.get("language"), raw.get("lang"), raw.get("code"), label
         )
@@ -204,21 +217,115 @@ def _normalise_subtitles(
     return normalised
 
 
-def _collect_api_subtitles(payload: dict) -> list:
-    """Collect subtitles from the common `subtitles`/`captions`/`tracks` shapes."""
-    collected: list = []
-    for key in ("subtitles", "captions", "tracks", "default_subs"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            collected.extend(value)
-        elif isinstance(value, dict):
-            for label, item in value.items():
-                if isinstance(item, str):
-                    collected.append({"url": item, "label": label})
-                elif isinstance(item, dict):
-                    merged = dict(item)
-                    merged.setdefault("label", label)
-                    collected.append(merged)
+_SUBTITLE_KEYS = {
+    "subtitles",
+    "subtitle",
+    "subs",
+    "captions",
+    "caption",
+    "tracks",
+    "track",
+    "default_subs",
+    "default_subtitles",
+    "defaultsubtitles",
+    "text_tracks",
+    "texttracks",
+    "subtitle_tracks",
+    "subtitletracks",
+    "caption_tracks",
+    "captiontracks",
+    "closed_captions",
+    "closedcaptions",
+    "cc",
+    "cc_tracks",
+}
+_SUBTITLE_CONTAINERS = {
+    "data",
+    "result",
+    "payload",
+    "response",
+    "media",
+    "meta",
+    "metadata",
+    "info",
+    "player",
+    "config",
+    "stream",
+    "streams",
+    "video",
+}
+
+
+def _subtitle_values(value) -> list:
+    """Turn one subtitle field into normalisable track dictionaries."""
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        collected: list = []
+        for item in value:
+            collected.extend(_subtitle_values(item))
+        return collected
+    if not isinstance(value, dict):
+        return []
+
+    url = next(
+        (
+            str(value[key]).strip()
+            for key in ("url", "src", "file", "path", "uri", "link")
+            if isinstance(value.get(key), str) and value[key].strip()
+        ),
+        None,
+    )
+    if url:
+        item = dict(value)
+        item["url"] = url
+        return [item]
+
+    # Common map form: {"en": "https://...", "id": {"url": "..."}}
+    collected = []
+    for label, item in value.items():
+        if isinstance(item, str):
+            collected.append({"url": item, "label": label, "lang": label})
+        elif isinstance(item, dict):
+            merged = dict(item)
+            merged.setdefault("label", label)
+            merged.setdefault("lang", merged.get("lang") or label)
+            collected.append(merged)
+        elif isinstance(item, list):
+            for entry in _subtitle_values(item):
+                if isinstance(entry, dict):
+                    entry.setdefault("label", label)
+                    entry.setdefault("lang", entry.get("lang") or label)
+                collected.append(entry)
+    return collected
+
+
+def _collect_api_subtitles(payload, _depth: int = 0) -> list:
+    """Collect every native subtitle package exposed by a host API response.
+
+    Hosts disagree on both the field name and the nesting: VSEmbed/VidSrcTo
+    put ``default_subs`` next to ``data``, VidLink nests ``subtitles`` inside
+    ``stream``, and smaller APIs use a ``{language: url}`` map. The walk is
+    bounded and only descends into known metadata containers so unrelated
+    video fields are never treated as captions.
+    """
+    if _depth > 4:
+        return []
+    if isinstance(payload, list):
+        collected: list = []
+        for item in payload:
+            collected.extend(_collect_api_subtitles(item, _depth + 1))
+        return collected
+    if not isinstance(payload, dict):
+        return []
+
+    collected = []
+    for key, value in payload.items():
+        normalised = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower().replace("-", "_")
+        if normalised in _SUBTITLE_KEYS and value:
+            collected.extend(_subtitle_values(value))
+        elif normalised in _SUBTITLE_CONTAINERS and isinstance(value, (dict, list)):
+            collected.extend(_collect_api_subtitles(value, _depth + 1))
     return collected
 
 
