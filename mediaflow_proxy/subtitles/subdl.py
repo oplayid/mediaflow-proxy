@@ -23,6 +23,17 @@ from mediaflow_proxy.utils.redis_utils import get_redis
 
 logger = logging.getLogger(__name__)
 
+
+class SubdlImportError(Exception):
+    """A manual SubDL import failure with a browser-safe explanation."""
+
+    def __init__(self, detail: str, *, code: str = "import_failed", http_status: int = 502):
+        super().__init__(detail)
+        self.detail = detail
+        self.code = code
+        self.http_status = http_status
+
+
 SEARCH_URL = "https://api.subdl.com/api/v1/subtitles"
 DOWNLOAD_BASE = "https://dl.subdl.com"
 USER_AGENT = "OPLAY.ID-SubDL/1.0"
@@ -232,30 +243,54 @@ async def search(media_type: str, media_id: str, season: str | None, episode: st
     return found
 
 
-async def _download(download_path: str) -> str | None:
+async def _download(download_path: str) -> str:
+    """Download one unpacked SubDL file, raising a browser-safe error."""
     api_key = (settings.subdl_api_key or "").strip()
     if not api_key:
-        return None
+        raise SubdlImportError(
+            "SUBDL_API_KEY belum dikonfigurasi di server",
+            code="missing_key",
+            http_status=503,
+        )
     path = _clean_path(download_path)
     if not path:
-        return None
+        raise SubdlImportError(
+            "Path subtitle SubDL tidak valid", code="invalid_path", http_status=400
+        )
     url = f"{DOWNLOAD_BASE}{path}?api_key={api_key}"
     streamer = await create_streamer(DOWNLOAD_BASE)
     try:
         async with streamer.session.get(
             url,
-            headers={"Accept": "*/*", "User-Agent": USER_AGENT},
+            headers={"Accept": "*/*", "User-Agent": USER_AGENT, "x-api-key": api_key},
             timeout=ClientTimeout(total=DOWNLOAD_TIMEOUT),
         ) as response:
             if response.status != 200:
-                logger.info("[subdl] download HTTP %s", response.status)
-                return None
-            return await response.text(errors="ignore")
+                logger.warning("[subdl] download HTTP %s", response.status)
+                if response.status in (401, 403, 429):
+                    raise SubdlImportError(
+                        f"SubDL menolak unduhan (HTTP {response.status}). "
+                        "Periksa kuota atau API key SubDL.",
+                        code="download_rejected",
+                    )
+                raise SubdlImportError(
+                    f"SubDL mengembalikan HTTP {response.status} saat mengunduh subtitle.",
+                    code="download_failed",
+                )
+            text = await response.text(errors="ignore")
+    except SubdlImportError:
+        raise
     except Exception as exc:
-        logger.info("[subdl] download failed: %s: %s", type(exc).__name__, exc)
-        return None
+        # Never echo the exception text: aiohttp may include the signed URL.
+        logger.warning("[subdl] download failed: %s", type(exc).__name__)
+        raise SubdlImportError(
+            "Gagal menghubungi server download SubDL.", code="network"
+        ) from exc
     finally:
         await streamer.session.close()
+    if not text.strip():
+        raise SubdlImportError("File SubDL kosong.", code="empty")
+    return text
 
 
 def track_id(download_path: str, language: str) -> str:
@@ -264,28 +299,44 @@ def track_id(download_path: str, language: str) -> str:
     return f"subdl-{digest}"
 
 
-async def import_one(result: dict, *, signer: Callable[[str], str]) -> dict | None:
+async def import_one(result: dict, *, signer: Callable[[str], str]) -> dict:
     """Download one manually chosen SubDL result and return a signed VTT track."""
     path = _clean_path(str(result.get("downloadPath") or ""))
     if not path:
-        return None
+        raise SubdlImportError(
+            "Path subtitle SubDL tidak valid", code="invalid_path", http_status=400
+        )
     raw = await _download(path)
-    if raw is None:
-        return None
     try:
         vtt = to_webvtt(raw)
     except ValueError as exc:
-        logger.info("[subdl] import rejected: %s", exc)
-        return None
+        message = str(exc)
+        logger.warning("[subdl] import rejected: %s", message)
+        lowered = message.lower()
+        if "kosong" in lowered:
+            detail = "File SubDL kosong."
+        elif "terlalu besar" in lowered:
+            detail = "Subtitle SubDL terlalu besar (maksimal 2 MB)."
+        else:
+            detail = "File SubDL bukan subtitle SRT/VTT yang valid."
+        raise SubdlImportError(detail, code="invalid_content") from exc
+
     language = normalise_language(str(result.get("lang") or "en"))
     label = str(result.get("label") or language_label(language)).strip()[:120]
-    key = await store_vtt(vtt)
+    try:
+        key = await store_vtt(vtt)
+        url = signer(key)
+    except Exception as exc:
+        logger.warning("[subdl] store failed: %s", type(exc).__name__)
+        raise SubdlImportError(
+            "Gagal menyimpan subtitle di server.", code="storage"
+        ) from exc
     return {
         "id": track_id(path, language),
         "label": f"SubDL • {label}" if not label.lower().startswith("subdl") else label,
         "language": language,
         "format": "vtt",
         "origin": "subdl",
-        "url": signer(key),
+        "url": url,
         "downloadPath": path,
     }

@@ -656,9 +656,46 @@ async def test_subdl_import_one_rejects_unsafe_path():
     assert subdl.safe_path("https://evil.example/subtitle/1") is False
     assert subdl.safe_path("/subtitle/../etc/passwd") is False
     assert subdl.safe_path("/subtitle/1/2?api_key=leak") is True  # query stripped before use
-    assert await subdl.import_one(
-        {"downloadPath": "../evil", "lang": "id"}, signer=lambda key: key
-    ) is None
+    with pytest.raises(subdl.SubdlImportError) as exc:
+        await subdl.import_one(
+            {"downloadPath": "../evil", "lang": "id"}, signer=lambda key: key
+        )
+    assert exc.value.code == "invalid_path"
+    assert exc.value.http_status == 400
+
+
+@pytest.mark.asyncio
+async def test_subdl_import_one_reports_quota_rejection(monkeypatch):
+    from mediaflow_proxy.subtitles import subdl
+
+    async def fake_download(path):
+        raise subdl.SubdlImportError(
+            "SubDL menolak unduhan (HTTP 429). Periksa kuota atau API key SubDL.",
+            code="download_rejected",
+        )
+
+    monkeypatch.setattr(subdl, "_download", fake_download)
+    with pytest.raises(subdl.SubdlImportError) as exc:
+        await subdl.import_one(
+            {"downloadPath": "/subtitle/1/2", "lang": "id"}, signer=lambda key: key
+        )
+    assert exc.value.code == "download_rejected"
+    assert "429" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_subdl_import_one_rejects_html_download(monkeypatch):
+    from mediaflow_proxy.subtitles import subdl
+
+    async def fake_download(path):
+        return "<html><body>Download quota exceeded</body></html>"
+
+    monkeypatch.setattr(subdl, "_download", fake_download)
+    with pytest.raises(subdl.SubdlImportError) as exc:
+        await subdl.import_one(
+            {"downloadPath": "/subtitle/1/2", "lang": "id"}, signer=lambda key: key
+        )
+    assert exc.value.code == "invalid_content"
 
 
 @pytest.mark.asyncio
@@ -846,6 +883,28 @@ async def test_player_subdl_import_validates_and_signs(monkeypatch):
     assert payload["url"].startswith("https://mfp.oplay.id/_token_")
     assert "/player/subtitle/" in payload["url"]
     assert "api_password" not in payload["url"]
+
+
+@pytest.mark.asyncio
+async def test_player_subdl_import_surfaces_subdl_detail(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    async def fake_import(result, *, signer):
+        raise player_routes.subdl.SubdlImportError(
+            "SubDL menolak unduhan (HTTP 429). Periksa kuota atau API key SubDL.",
+            code="download_rejected",
+        )
+
+    monkeypatch.setattr(player_routes.subdl, "import_one", fake_import)
+    with pytest.raises(HTTPException) as exc:
+        await player_routes.player_subdl_import(
+            _subdl_request(
+                b"type=movie&id=550&subdl=1",
+                {"downloadPath": "/subtitle/1/2", "lang": "id"},
+            )
+        )
+    assert exc.value.status_code == 502
+    assert "429" in exc.value.detail
 
 
 def test_encryption_middleware_restores_tokenized_scope(monkeypatch):

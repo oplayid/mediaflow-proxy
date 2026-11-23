@@ -23,6 +23,7 @@ from mediaflow_proxy.routes.embed import _sign_subdl_url, _sign_subtitle_upload_
 from mediaflow_proxy.subtitles import subdl
 from mediaflow_proxy.subtitles.subdl import (
     SUBTITLE_CACHE_TTL,
+    SubdlImportError,
     load_vtt,
     normalise_language,
     srt_to_vtt,
@@ -210,11 +211,11 @@ async def player_subdl_import(request: Request):
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Unduhan SubDL timeout")
+    except SubdlImportError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail)
     except Exception as exc:
-        logger.info("[player] SubDL import failed: %s: %s", type(exc).__name__, exc)
+        logger.warning("[player] SubDL import failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Gagal mengunduh subtitle SubDL")
-    if not track:
-        raise HTTPException(status_code=502, detail="SubDL tidak mengembalikan subtitle yang valid")
     return JSONResponse(track, headers=_security_headers())
 
 
