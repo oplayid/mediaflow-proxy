@@ -36,7 +36,16 @@
       </select>
       <button type="button" id="subtitle-upload-button" title="Unggah subtitle .srt atau .vtt">Unggah Subtitle</button>
       <input type="file" id="subtitle-file" class="hidden" accept=".srt,.vtt,text/vtt,application/x-subrip">
+      <button type="button" id="subdl-search-button" title="Cari subtitle di SubDL">Cari SubDL</button>
       <span class="subtitle-status" id="subtitle-status" role="status" aria-live="polite"></span>
+    </div>
+
+    <div id="subdl-panel" class="subdl-panel hidden">
+      <div class="subdl-head">
+        <span id="subdl-status" role="status" aria-live="polite">SubDL</span>
+        <button type="button" id="subdl-close" title="Tutup hasil SubDL">Tutup</button>
+      </div>
+      <div id="subdl-results"></div>
     </div>
 
     <div class="overlay" id="overlay">

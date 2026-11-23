@@ -22,8 +22,7 @@ from mediaflow_proxy.extractors.embed_hosts import build_embed_url
 from mediaflow_proxy.player.adapters import ServerAdapter, configured_servers, get_adapter
 from mediaflow_proxy.player.models import Candidate, ProbeResult, session_to_dict
 from mediaflow_proxy.player.transcoder import create_transcode_job, prepare_transcode
-from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url, _sign_subtitle_url
-from mediaflow_proxy.subtitles import subdl
+from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url
 from mediaflow_proxy.utils.http_utils import create_streamer, get_proxy_headers
 from mediaflow_proxy.utils.redis_utils import (
     delete_cached_extractor,
@@ -463,33 +462,8 @@ async def simulate_session(
 
     subtitles = _merge_subtitles(candidates)
     native_has_indonesian = has_indonesian_subtitle(subtitles)
-    subdl_used = False
-    # Every source is offered in the one player menu. SubDL is collected even
-    # when a server already has an Indonesian track: the default stays native,
-    # but the viewer may switch to any alternative manually. Custom tracks are
-    # added client-side and never enter this cached session.
-    if candidates:
-        try:
-            external = await asyncio.wait_for(
-                subdl.collect(
-                    media_type,
-                    media_id,
-                    season,
-                    episode,
-                    signer=lambda key: _sign_subtitle_url(request, key, expiration=MEDIA_TOKEN_TTL),
-                ),
-                timeout=subdl.COLLECT_TIMEOUT,
-            )
-            if external:
-                known_ids = {str(item.get("id") or "") for item in subtitles}
-                for item in external:
-                    if str(item.get("id") or "") not in known_ids:
-                        subtitles.append(item)
-                        known_ids.add(str(item.get("id") or ""))
-                subdl_used = bool(external)
-        except Exception as exc:
-            logger.info("[player] SubDL collection skipped: %s: %s", type(exc).__name__, exc)
-
+    # SubDL and viewer uploads are added by the player after mount. Keeping them
+    # out of the cached session avoids leaking one viewer's choices to another.
     audit = {
         "hosts_tried": len(tried) + len(candidates),
         "hosts_playable": len(candidates),
@@ -502,7 +476,7 @@ async def simulate_session(
         "subtitle_origins": sorted({str(item.get("origin") or "") for item in subtitles if item.get("origin")}),
         "subtitle_count": len(subtitles),
         "native_indonesian_subtitle": native_has_indonesian,
-        "subdl_used": subdl_used,
+        "subdl_used": False,  # manual SubDL tracks are added client-side
         "simulation_ms": int((time.monotonic() - started) * 1000),
     }
     session = session_to_dict(

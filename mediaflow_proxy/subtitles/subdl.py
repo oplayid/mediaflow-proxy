@@ -1,14 +1,13 @@
-"""Optional SubDL subtitle tracks for the MediaFlow player.
+"""Manual SubDL subtitle search/import for the MediaFlow player.
 
 Everything here runs server-side. The SubDL API key is never sent to the
 browser: only signed, same-origin URLs that serve converted WebVTT content.
-Failures are non-fatal — native tracks from the winning video host remain the
-default and the player still works without any external subtitle service.
+Search and import are viewer-initiated, mirroring Streamflix's original flow;
+nothing is collected automatically when the iframe mounts.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import re
@@ -27,11 +26,12 @@ logger = logging.getLogger(__name__)
 SEARCH_URL = "https://api.subdl.com/api/v1/subtitles"
 DOWNLOAD_BASE = "https://dl.subdl.com"
 USER_AGENT = "OPLAY.ID-SubDL/1.0"
-SEARCH_TIMEOUT = 4.0
-DOWNLOAD_TIMEOUT = 5.0
-COLLECT_TIMEOUT = 9.0
-MAX_TRACKS = 8
+SEARCH_TIMEOUT = 15.0
+DOWNLOAD_TIMEOUT = 20.0
+MAX_RESULTS = 40
+MAX_SUBTITLE_BYTES = 2 * 1024 * 1024
 SUBTITLE_CACHE_TTL = 6 * 60 * 60  # Cap at 6h, matching the extraction cache.
+LANGUAGE_LABELS = {"id": "Bahasa Indonesia", "en": "English"}
 
 _SAFE_PATH = re.compile(r"^/subtitle/[A-Za-z0-9/_-]+$")
 _KEY_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -61,9 +61,51 @@ def normalise_language(value: str) -> str:
     return match.group(1) if match else (cleaned[:2] or "und")
 
 
+def language_label(value: str) -> str:
+    code = normalise_language(value)
+    return LANGUAGE_LABELS.get(code, value)
+
+
+
+
+def to_webvtt(raw: str) -> str:
+    """Convert SRT/VTT to validated WebVTT, matching Streamflix's converter."""
+    text = (raw or "").replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise ValueError("Subtitle kosong")
+    if len(text.encode("utf-8")) > MAX_SUBTITLE_BYTES:
+        raise ValueError("Subtitle terlalu besar (maksimal 2 MB)")
+    if re.match(r"^WEBVTT\b", text, re.I):
+        # Normalise the header but keep the converter idempotent.
+        return "WEBVTT" + text[6:]
+
+    cues: list[str] = []
+    for block in re.split(r"\n{2,}", text):
+        lines = [line for line in block.split("\n") if line.strip()]
+        index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        if index < 0:
+            continue
+        # Same normalisation as Streamflix's toWebVtt: exactly one space around
+        # the arrow, then comma milliseconds to periods.
+        times = re.sub(r"\s*-->\s*", " --> ", lines[index])
+        times = re.sub(r"(\d),(\d{3})", r"\1.\2", times)
+        payload = "\n".join(lines[index + 1 :]).strip()
+        if not payload:
+            continue
+        cues.append(f"{times}\n{payload}".strip())
+    if not cues:
+        raise ValueError("Tidak ada cue subtitle yang valid")
+    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+
+
 def _clean_path(raw: str) -> str | None:
     path = (raw or "").split("?", 1)[0].strip()
     return path if _SAFE_PATH.match(path) else None
+
+
+def safe_path(raw: str) -> bool:
+    """Public validation used by the import endpoint."""
+    return _clean_path(raw) is not None
 
 
 async def store_vtt(content: str, ttl: int = SUBTITLE_CACHE_TTL) -> str:
@@ -152,36 +194,52 @@ async def search(media_type: str, media_id: str, season: str | None, episode: st
     for item in payload.get("subtitles") or []:
         if not isinstance(item, dict):
             continue
-        files = item.get("unpack_files") or [{}]
-        for file in files:
+        # Streamflix's proven flow only uses unpack_files. The item-level
+        # ``url`` is a .zip wrapper and is intentionally never downloaded.
+        for file in item.get("unpack_files") or []:
             if not isinstance(file, dict):
                 continue
-            path = _clean_path(str(file.get("url") or item.get("url") or ""))
+            path = _clean_path(str(file.get("url") or ""))
             if not path or path in seen:
                 continue
             seen.add(path)
-            language = normalise_language(str(file.get("language") or item.get("language") or item.get("lang") or "en"))
+            language = normalise_language(
+                str(file.get("language") or item.get("language") or item.get("lang") or "en")
+            )
+            hi = bool(file.get("hi") if file.get("hi") is not None else item.get("hi"))
             release = str(
-                file.get("release_name") or file.get("name") or item.get("release_name") or item.get("name") or "Subtitle"
-            )[:60]
+                file.get("release_name")
+                or file.get("name")
+                or item.get("release_name")
+                or item.get("name")
+                or "Subtitle"
+            )[:200]
+            label = f"{language_label(language)}{' (HI)' if hi else ''} · {release}"[:120]
             found.append(
                 {
-                    "id": hashlib.sha1(f"{path}:{language}".encode()).hexdigest()[:12],
-                    "language": language,
-                    "label": f"SubDL • {language.upper()} • {release}",
-                    "download_path": path,
+                    "id": f"{path}:{language}:{'hi' if hi else 'n'}",
+                    "lang": language,
+                    "label": label,
+                    "releaseName": release,
+                    "author": str(item.get("author") or "")[:120],
+                    "hi": hi,
+                    "downloadPath": path,
+                    "format": str(file.get("format") or "srt").lower()[:10],
                 }
             )
-            if len(found) >= MAX_TRACKS:
+            if len(found) >= MAX_RESULTS:
                 return found
     return found
 
 
-async def _download(item: dict) -> str | None:
+async def _download(download_path: str) -> str | None:
     api_key = (settings.subdl_api_key or "").strip()
     if not api_key:
         return None
-    url = f"{DOWNLOAD_BASE}{item['download_path']}?api_key={api_key}"
+    path = _clean_path(download_path)
+    if not path:
+        return None
+    url = f"{DOWNLOAD_BASE}{path}?api_key={api_key}"
     streamer = await create_streamer(DOWNLOAD_BASE)
     try:
         async with streamer.session.get(
@@ -190,54 +248,44 @@ async def _download(item: dict) -> str | None:
             timeout=ClientTimeout(total=DOWNLOAD_TIMEOUT),
         ) as response:
             if response.status != 200:
+                logger.info("[subdl] download HTTP %s", response.status)
                 return None
-            raw = await response.text(errors="ignore")
+            return await response.text(errors="ignore")
     except Exception as exc:
         logger.info("[subdl] download failed: %s: %s", type(exc).__name__, exc)
         return None
     finally:
         await streamer.session.close()
-    return srt_to_vtt(raw)
 
 
-async def collect(
-    media_type: str,
-    media_id: str,
-    season: str | None,
-    episode: str | None,
-    *,
-    signer: Callable[[str], str],
-) -> list[dict]:
-    """Return signed, same-origin VTT tracks for the player session."""
-    if not (settings.subdl_api_key or "").strip():
-        return []
+def track_id(download_path: str, language: str) -> str:
+    """Stable id used for dedupe in the player and in Streamflix Mongo."""
+    digest = hashlib.sha1(f"{download_path}:{language}".encode()).hexdigest()[:12]
+    return f"subdl-{digest}"
+
+
+async def import_one(result: dict, *, signer: Callable[[str], str]) -> dict | None:
+    """Download one manually chosen SubDL result and return a signed VTT track."""
+    path = _clean_path(str(result.get("downloadPath") or ""))
+    if not path:
+        return None
+    raw = await _download(path)
+    if raw is None:
+        return None
     try:
-        results = await search(media_type, media_id, season, episode)
-    except Exception as exc:  # keep native subtitles/playback unaffected
-        logger.info("[subdl] collect failed: %s: %s", type(exc).__name__, exc)
-        return []
-    if not results:
-        return []
-
-    semaphore = asyncio.Semaphore(3)
-
-    async def one(item: dict) -> dict | None:
-        async with semaphore:
-            content = await _download(item)
-        if not content:
-            return None
-        key = await store_vtt(content)
-        return {
-            "id": f"subdl-{item['id']}",
-            "label": item["label"],
-            "language": item["language"],
-            "format": "vtt",
-            "origin": "subdl",
-            "url": signer(key),
-        }
-
-    tracks = await asyncio.gather(*(one(item) for item in results), return_exceptions=True)
-    signed = [track for track in tracks if isinstance(track, dict)]
-    if signed:
-        logger.info("[subdl] added %s external tracks for %s/%s", len(signed), media_type, media_id)
-    return signed
+        vtt = to_webvtt(raw)
+    except ValueError as exc:
+        logger.info("[subdl] import rejected: %s", exc)
+        return None
+    language = normalise_language(str(result.get("lang") or "en"))
+    label = str(result.get("label") or language_label(language)).strip()[:120]
+    key = await store_vtt(vtt)
+    return {
+        "id": track_id(path, language),
+        "label": f"SubDL • {label}" if not label.lower().startswith("subdl") else label,
+        "language": language,
+        "format": "vtt",
+        "origin": "subdl",
+        "url": signer(key),
+        "downloadPath": path,
+    }

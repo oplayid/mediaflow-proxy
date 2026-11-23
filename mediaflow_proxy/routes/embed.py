@@ -133,6 +133,36 @@ def _sign_subtitle_url(request: Request, key: str, expiration: int = 600) -> str
     return f"{scheme}://{authority}{path}?sub={key}"
 
 
+def _sign_subdl_url(
+    request: Request,
+    media_type: str,
+    media_id: str,
+    season: str | None = None,
+    episode: str | None = None,
+    expiration: int = 6 * 60 * 60,
+) -> str:
+    """Sign the base URL for manual SubDL search/import in the player.
+
+    The 6-hour lifetime matches uploads: a viewer may look for subtitles long
+    after the 10-minute iframe token was minted. The key stays server-side.
+    """
+    scheme = get_original_scheme(request)
+    authority = request.headers.get("host") or request.url.netloc
+    path = "/player/subtitle/subdl"
+    payload = {
+        "type": media_type,
+        "id": str(media_id),
+        "s": str(season or ""),
+        "e": str(episode or ""),
+        "subdl": True,
+    }
+    handler = EncryptionHandler(settings.api_password) if settings.api_password else None
+    if handler:
+        token = handler.encrypt_data(payload, expiration=expiration)
+        return f"{scheme}://{authority}/_token_{token}{path}"
+    return f"{scheme}://{authority}{path}?{urlencode(payload)}"
+
+
 def _sign_subtitle_upload_url(
     request: Request,
     media_type: str,

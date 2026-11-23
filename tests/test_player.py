@@ -37,6 +37,7 @@ from mediaflow_proxy.player.transcoder import (
 from mediaflow_proxy.routes.embed import (
     _headers_for_destination,
     _sign_player_url,
+    _sign_subdl_url,
     _sign_subtitle_upload_url,
 )
 from mediaflow_proxy.utils import crypto_utils
@@ -127,6 +128,34 @@ def test_sign_subtitle_upload_url_is_opaque_and_long_lived(monkeypatch):
     assert seen["expiration"] == 6 * 60 * 60
 
 
+def test_sign_subdl_url_is_opaque_and_long_lived(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+    seen: dict[str, object] = {}
+
+    class SpyHandler(EncryptionHandler):
+        def encrypt_data(self, data, expiration=None, ip=None):
+            seen["expiration"] = expiration
+            return super().encrypt_data(data, expiration=expiration, ip=ip)
+
+    monkeypatch.setattr(embed_routes, "EncryptionHandler", SpyHandler)
+    url = _sign_subdl_url(_request(), "tv", "246473", "2", "3")
+
+    assert url.startswith("https://mfp.oplay.id/_token_")
+    assert url.endswith("/player/subtitle/subdl")
+    assert "api_password" not in url
+
+    token = url.split("/_token_", 1)[1].split("/player/", 1)[0]
+    payload = EncryptionHandler("unit-secret").decrypt_data(token, None)
+    assert payload["type"] == "tv"
+    assert payload["id"] == "246473"
+    assert payload["s"] == "2"
+    assert payload["e"] == "3"
+    assert payload["subdl"] is True
+    assert seen["expiration"] == 6 * 60 * 60
+
+
 def test_host_configs_uses_only_the_shared_host_order():
     from mediaflow_proxy.extractors.embed_hosts import HOST_ORDER
 
@@ -207,9 +236,6 @@ def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
     async def no_delete(*args, **kwargs):
         return None
 
-    async def no_subtitles(*args, **kwargs):
-        return []
-
     monkeypatch.setattr(simulator, "create_streamer", fake_streamer)
     monkeypatch.setattr(simulator, "_resolve_host", fake_resolve)
     monkeypatch.setattr(simulator, "probe_candidate", fake_probe)
@@ -217,7 +243,6 @@ def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
     monkeypatch.setattr(simulator, "get_cached_extractor", no_cache)
     monkeypatch.setattr(simulator, "set_cached_extractor", no_set)
     monkeypatch.setattr(simulator, "delete_cached_extractor", no_delete)
-    monkeypatch.setattr(simulator.subdl, "collect", no_subtitles)
     monkeypatch.setattr(simulator, "_prewarm", lambda job: None)
     return calls
 
@@ -304,51 +329,34 @@ def _patch_signed_with_subtitles(monkeypatch, tracks: list[dict]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_keeps_native_default_but_collects_subdl_anyway(monkeypatch):
+async def test_simulate_session_never_auto_collects_subdl(monkeypatch):
+    """SubDL is viewer-initiated only; the session never carries those tracks."""
     _patch_simulation(monkeypatch, {"VidCore"})
     _patch_signed_with_subtitles(monkeypatch, [_native_track("id", "Bahasa Indonesia")])
-    collect_calls: list[tuple] = []
-
-    async def fake_collect(*args, **kwargs):
-        collect_calls.append(args)
-        return [{"id": "subdl-1", "language": "id", "label": "SubDL • ID", "origin": "subdl", "url": "https://proxy/sub/1"}]
-
-    monkeypatch.setattr(simulator.subdl, "collect", fake_collect)
 
     session = await simulator.simulate_session(
         _request("/player/movie/550"), "movie", "550", None, None
     )
 
-    # The viewer may pick either source manually; the Indonesian host track is
-    # only the default, never a reason to hide SubDL from the merged menu.
-    assert len(collect_calls) == 1
     assert session["audit"]["native_indonesian_subtitle"] is True
-    assert session["audit"]["subdl_used"] is True
-    assert session["audit"]["subtitle_count"] == 2
-    assert [item["origin"] for item in session["subtitles"]] == ["host", "subdl"]
+    assert session["audit"]["subdl_used"] is False
+    assert session["audit"]["subtitle_count"] == 1
+    assert [item["origin"] for item in session["subtitles"]] == ["host"]
     assert session["subtitles"][0]["id"] == "native-id"
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_offers_subdl_without_native_indonesian(monkeypatch):
+async def test_simulate_session_keeps_native_default_without_indonesian(monkeypatch):
     _patch_simulation(monkeypatch, {"VidCore"})
     _patch_signed_with_subtitles(monkeypatch, [_native_track("en", "English")])
-    collect_calls: list[tuple] = []
-
-    async def fake_collect(*args, **kwargs):
-        collect_calls.append(args)
-        return [{"id": "subdl-1", "language": "id", "label": "SubDL • ID", "origin": "subdl", "url": "https://proxy/sub/1"}]
-
-    monkeypatch.setattr(simulator.subdl, "collect", fake_collect)
 
     session = await simulator.simulate_session(
         _request("/player/movie/550"), "movie", "550", None, None
     )
 
-    assert len(collect_calls) == 1
     assert session["audit"]["native_indonesian_subtitle"] is False
-    assert session["audit"]["subdl_used"] is True
-    assert [item["origin"] for item in session["subtitles"]] == ["host", "subdl"]
+    assert session["audit"]["subdl_used"] is False
+    assert [item["origin"] for item in session["subtitles"]] == ["host"]
 
 
 def test_player_ui_has_manual_server_picker_but_no_retry_controls():
@@ -378,12 +386,22 @@ def test_player_ui_has_manual_server_picker_but_no_retry_controls():
     assert "preferredSubtitle" in js
     assert 'item.origin === "subdl"' in js
     assert 'item.origin === "custom"' in js
+    assert 'item.origin === "shared"' in js  # Streamflix-restored tracks
     assert 'subtitleGroup' in js
     assert 'document.createElement("optgroup")' in js
     assert "/^subdl\\b/i.test(label)" in js  # avoid "SubDL • SubDL • ..." labels
     assert "/^custom\\b/i.test(label)" in js
+    assert "/^bersama\\b/i.test(label)" in js
     assert 'data.id' in js  # mfp:setSubtitle can target one merged track by id
     assert "session.upload_url" in js  # upload survives iframe token expiry
+    assert 'id="subdl-search-button"' in html
+    assert 'id="subdl-panel"' in html
+    assert 'id="subdl-results"' in html
+    assert "session.subdl_url" in js
+    assert "searchSubdl" in js and "importSubdl" in js
+    assert 'post("subdlImported"' in js
+    assert 'data.type === "mfp:restoreSubtitles"' in js
+    assert "URL.createObjectURL" in js
 
 
 
@@ -581,47 +599,66 @@ async def test_hls_segment_vtt_converts_upstream_srt_for_browser_tracks():
     assert await _as_webvtt_response(error) is error
 
 
+def test_subdl_to_webvtt_validates_cues_and_size():
+    from mediaflow_proxy.subtitles.subdl import to_webvtt
+
+    assert to_webvtt("1\n00:00:00,500 --> 00:00:02,000\nHalo\n") == (
+        "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nHalo\n"
+    )
+    assert to_webvtt("webvtt\n\n00:00:01.000 --> 00:00:02.000\nTeks\n").startswith("WEBVTT")
+    with pytest.raises(ValueError):
+        to_webvtt("tidak ada cue di sini")
+    with pytest.raises(ValueError):
+        to_webvtt("x" * (2 * 1024 * 1024 + 1))
+
+
 @pytest.mark.asyncio
-async def test_subdl_collect_returns_signed_same_origin_tracks(monkeypatch):
+async def test_subdl_import_one_returns_signed_same_origin_track(monkeypatch):
     from mediaflow_proxy.subtitles import subdl
 
     monkeypatch.setattr(settings, "subdl_api_key", "secret-subdl-key")
-    monkeypatch.setattr(
-        subdl,
-        "search",
-        lambda *args, **kwargs: asyncio.sleep(
-            0,
-            result=[
-                {
-                    "id": "track1",
-                    "label": "SubDL • ID • Release",
-                    "language": "id",
-                    "download_path": "/subtitle/123/4.srt",
-                }
-            ],
-        ),
-    )
-    monkeypatch.setattr(
-        subdl, "_download", lambda item: asyncio.sleep(0, result="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHalo\n")
-    )
-    monkeypatch.setattr(
-        subdl, "store_vtt", lambda content: asyncio.sleep(0, result="a" * 32)
+    downloaded: list[str] = []
+
+    async def fake_download(path):
+        downloaded.append(path)
+        return "1\r\n00:00:00,500 --> 00:00:02,000\r\nHalo\r\n"
+
+    async def fake_store(content):
+        return "a" * 32
+
+    monkeypatch.setattr(subdl, "_download", fake_download)
+    monkeypatch.setattr(subdl, "store_vtt", fake_store)
+
+    path = "/subtitle/123/4"
+    track = await subdl.import_one(
+        {"downloadPath": path, "lang": "id", "label": "Bahasa Indonesia · Release"},
+        signer=lambda key: f"https://mfp.oplay.id/_token_x/player/subtitle/{key}.vtt",
     )
 
-    tracks = await subdl.collect(
-        "movie", "550", None, None, signer=lambda key: f"https://mfp.oplay.id/_token_x/player/subtitle/{key}.vtt"
-    )
-
-    assert len(tracks) == 1
-    assert tracks[0] == {
-        "id": "subdl-track1",
-        "label": "SubDL • ID • Release",
+    assert downloaded == [path]
+    assert track == {
+        "id": subdl.track_id(path, "id"),
+        "label": "SubDL • Bahasa Indonesia · Release",
         "language": "id",
         "format": "vtt",
         "origin": "subdl",
         "url": f"https://mfp.oplay.id/_token_x/player/subtitle/{'a' * 32}.vtt",
+        "downloadPath": path,
     }
-    assert "secret-subdl-key" not in str(tracks)
+    assert "secret-subdl-key" not in str(track)
+
+
+@pytest.mark.asyncio
+async def test_subdl_import_one_rejects_unsafe_path():
+    from mediaflow_proxy.subtitles import subdl
+
+    assert subdl.safe_path("/subtitle/123/4") is True
+    assert subdl.safe_path("https://evil.example/subtitle/1") is False
+    assert subdl.safe_path("/subtitle/../etc/passwd") is False
+    assert subdl.safe_path("/subtitle/1/2?api_key=leak") is True  # query stripped before use
+    assert await subdl.import_one(
+        {"downloadPath": "../evil", "lang": "id"}, signer=lambda key: key
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -727,6 +764,88 @@ async def test_player_subtitle_upload_rejects_bad_input(monkeypatch):
             _upload_request(b"type=movie&id=550", b"x" * (player_routes._MAX_CUSTOM_SUBTITLE_BYTES + 1))
         )
     assert oversize.value.status_code == 400
+
+
+def _subdl_request(query: bytes, body: dict | None = None) -> Request:
+    path = "/player/subtitle/subdl/search"
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query,
+        "headers": [(b"host", b"mfp.oplay.id"), (b"content-type", b"application/json")],
+        "client": ("10.0.0.1", 12345),
+    }
+    payload = json.dumps(body or {}).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.asyncio
+async def test_player_subdl_search_requires_token_and_returns_results(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    monkeypatch.setattr(settings, "subdl_api_key", "secret-subdl-key")
+
+    async def fake_search(media_type, media_id, season, episode):
+        assert (media_type, media_id, season, episode) == ("tv", "550", "2", "3")
+        return [{"downloadPath": "/subtitle/1/2", "lang": "id", "label": "Indonesia"}]
+
+    monkeypatch.setattr(player_routes.subdl, "search", fake_search)
+
+    with pytest.raises(HTTPException) as denied:
+        await player_routes.player_subdl_search(_subdl_request(b"type=tv&id=550"))
+    assert denied.value.status_code == 403
+
+    response = await player_routes.player_subdl_search(
+        _subdl_request(b"type=tv&id=550&s=2&e=3&subdl=1")
+    )
+    assert response.status_code == 200
+    assert json.loads(response.body)["results"][0]["lang"] == "id"
+    assert "secret-subdl-key" not in response.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_player_subdl_import_validates_and_signs(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+
+    async def fake_import(result, *, signer):
+        assert result["downloadPath"] == "/subtitle/1/2"
+        return {
+            "id": "subdl-x",
+            "language": "id",
+            "label": "SubDL • Indonesia",
+            "format": "vtt",
+            "origin": "subdl",
+            "url": signer("a" * 32),
+            "downloadPath": "/subtitle/1/2",
+        }
+
+    monkeypatch.setattr(player_routes.subdl, "import_one", fake_import)
+    query = b"type=movie&id=550&subdl=1"
+
+    with pytest.raises(HTTPException) as bad:
+        await player_routes.player_subdl_import(
+            _subdl_request(query, {"downloadPath": "../evil", "lang": "id"})
+        )
+    assert bad.value.status_code == 400
+
+    response = await player_routes.player_subdl_import(
+        _subdl_request(query, {"downloadPath": "/subtitle/1/2", "lang": "id"})
+    )
+    payload = json.loads(response.body)
+    assert payload["origin"] == "subdl"
+    assert payload["url"].startswith("https://mfp.oplay.id/_token_")
+    assert "/player/subtitle/" in payload["url"]
+    assert "api_password" not in payload["url"]
 
 
 def test_encryption_middleware_restores_tokenized_scope(monkeypatch):

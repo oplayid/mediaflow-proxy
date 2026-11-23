@@ -32,7 +32,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
    | `TMDB_API_KEY` | `your-tmdb-v3-key` | Optional. Enables `/trailer/...` YouTube trailer pages; the key is never sent to the browser. |
 
     | `REDIS_URL` | `redis://redis:6379` | Keep enabled. Shares the transcode registry and caches across workers. |
-    | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Adds SubDL alternatives only when the winning host has no Indonesian subtitle. |
+    | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Enables the manual **Cari SubDL** button in the player; the key stays server-side. |
     | `TRANSPORT_CONFIG` | see below | Optional. Routes upstream requests through a clean egress proxy when a host is Turnstile-gated. |
 
 3. Set your domain and enable HTTPS in Coolify as usual; Traefik routes to port `8888`.

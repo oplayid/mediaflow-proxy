@@ -7,7 +7,9 @@ video/quality/subtitle settings belong to this player.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -17,7 +19,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.player import simulate_session
 from mediaflow_proxy.player.transcoder import serve_transcode_file
-from mediaflow_proxy.routes.embed import _sign_subtitle_upload_url, _sign_subtitle_url
+from mediaflow_proxy.routes.embed import _sign_subdl_url, _sign_subtitle_upload_url, _sign_subtitle_url
+from mediaflow_proxy.subtitles import subdl
 from mediaflow_proxy.subtitles.subdl import (
     SUBTITLE_CACHE_TTL,
     load_vtt,
@@ -26,6 +29,7 @@ from mediaflow_proxy.subtitles.subdl import (
     store_vtt,
 )
 
+logger = logging.getLogger(__name__)
 player_router = APIRouter()
 transcode_router = APIRouter()
 
@@ -137,6 +141,83 @@ async def player_subtitle_upload(request: Request):
     )
 
 
+def _subdl_identity(request: Request) -> tuple[str, str, str, str]:
+    """Read media identity from the dedicated SubDL token, not from the body."""
+    flag = request.query_params.get("subdl")
+    if not (flag is True or str(flag or "").lower() in ("1", "true")):
+        raise HTTPException(status_code=403, detail="SubDL token missing")
+
+    media_type = str(request.query_params.get("type") or "").strip().lower()
+    media_id = str(request.query_params.get("id") or "").strip()
+    if media_type not in _VALID_TYPES or not re.match(r"^(tv-)?\d+$", media_id):
+        raise HTTPException(status_code=400, detail="Player token media identity missing")
+    season = str(request.query_params.get("s") or "1")
+    episode = str(request.query_params.get("e") or "1")
+    return media_type, media_id, season, episode
+
+
+@player_router.post("/subtitle/subdl/search", name="player_subdl_search")
+async def player_subdl_search(request: Request):
+    """Manual SubDL search. The API key is only ever read on the server."""
+    media_type, media_id, season, episode = _subdl_identity(request)
+    if not (settings.subdl_api_key or "").strip():
+        raise HTTPException(status_code=503, detail="SUBDL_API_KEY belum dikonfigurasi di server")
+    try:
+        results = await asyncio.wait_for(
+            subdl.search(media_type, media_id, season, episode), timeout=subdl.SEARCH_TIMEOUT + 2
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Pencarian SubDL timeout")
+    except Exception as exc:
+        logger.info("[player] SubDL search failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=502, detail="Gagal mencari subtitle SubDL")
+    return JSONResponse({"results": results}, headers=_security_headers())
+
+
+@player_router.post("/subtitle/subdl/import", name="player_subdl_import")
+async def player_subdl_import(request: Request):
+    """Download one chosen SubDL result and return a signed WebVTT track."""
+    _subdl_identity(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body tidak valid")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body tidak valid")
+
+    download_path = str(body.get("downloadPath") or "")
+    language = str(body.get("lang") or "").strip().lower()
+    label = re.sub(r"\s+", " ", str(body.get("label") or "")).strip()[:120]
+    if not subdl.safe_path(download_path):
+        raise HTTPException(status_code=400, detail="Path subtitle SubDL tidak valid")
+    if not re.match(r"^[a-z]{2,20}$", language):
+        raise HTTPException(status_code=400, detail="Bahasa subtitle tidak valid")
+
+    def signer(key: str) -> str:
+        return _sign_subtitle_url(request, key, expiration=SUBTITLE_CACHE_TTL)
+
+    try:
+        track = await asyncio.wait_for(
+            subdl.import_one(
+                {
+                    "downloadPath": download_path,
+                    "lang": language,
+                    "label": label or subdl.language_label(language),
+                },
+                signer=signer,
+            ),
+            timeout=subdl.DOWNLOAD_TIMEOUT + 5,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Unduhan SubDL timeout")
+    except Exception as exc:
+        logger.info("[player] SubDL import failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=502, detail="Gagal mengunduh subtitle SubDL")
+    if not track:
+        raise HTTPException(status_code=502, detail="SubDL tidak mengembalikan subtitle yang valid")
+    return JSONResponse(track, headers=_security_headers())
+
+
 @player_router.get("/{media_type}/{media_id}/{season}/{episode}", name="player_page")
 @player_router.get("/{media_type}/{media_id}", name="player_page_short")
 async def player_page(
@@ -172,4 +253,8 @@ async def player_page(
     # not be written back into the shared cache entry.
     view = dict(session)
     view["upload_url"] = _sign_subtitle_upload_url(request, media_type, media_id)
+    view["subdl_url"] = _sign_subdl_url(
+        request, media_type, media_id, season or request.query_params.get("s"),
+        episode or request.query_params.get("e"),
+    )
     return HTMLResponse(_render_player(view), headers=_security_headers())

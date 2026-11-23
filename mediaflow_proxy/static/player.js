@@ -34,6 +34,11 @@
   var subtitleUploadButton = document.getElementById("subtitle-upload-button");
   var subtitleFile = document.getElementById("subtitle-file");
   var subtitleStatus = document.getElementById("subtitle-status");
+  var subdlSearchButton = document.getElementById("subdl-search-button");
+  var subdlPanel = document.getElementById("subdl-panel");
+  var subdlStatus = document.getElementById("subdl-status");
+  var subdlResults = document.getElementById("subdl-results");
+  var subdlClose = document.getElementById("subdl-close");
 
   var hls = null;
   var dashPlayer = null;
@@ -44,6 +49,7 @@
   var trackElements = {};
   var generation = 0;
   var allowedParents = ["https://movie.oplay.id", window.location.origin];
+  var subdlResultsData = [];
   var customKey = "mfp:custom-subtitles:" + [
     media.type || "", media.id || "", media.season || "", media.episode || ""
   ].join(":");
@@ -128,6 +134,7 @@
   function subtitleGroup(item) {
     if (item.origin === "subdl") return "SubDL";
     if (item.origin === "custom") return "Custom";
+    if (item.origin === "shared") return "Bersama";
     return "Host"; // host + API tracks are both shipped by the winning embed host
   }
 
@@ -138,6 +145,9 @@
     }
     if (item.origin === "subdl") {
       return /^subdl\b/i.test(label) ? label : "SubDL • " + label;
+    }
+    if (item.origin === "shared") {
+      return /^bersama\b/i.test(label) ? label : "Bersama • " + label;
     }
     return item.origin === "provider" && !/^api\b/i.test(label) ? "API • " + label : label;
   }
@@ -262,6 +272,130 @@
       setSubtitleStatus("Gagal: " + (error && error.message ? error.message : "upload subtitle"));
     } finally {
       if (subtitleFile) subtitleFile.value = "";
+    }
+  }
+
+  async function responseDetail(response, fallback) {
+    try {
+      var body = await response.json();
+      return (body && (body.detail || body.error)) || fallback;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function setSubdlStatus(text) {
+    if (subdlStatus) subdlStatus.textContent = text || "";
+  }
+
+  // session.subdl_url is a dedicated 6h tokenized URL. Only the action suffix
+  // is added here; the media identity stays encrypted in the token prefix.
+  function subdlEndpoint(action) {
+    var base = session.subdl_url || "";
+    if (!base) return "";
+    try {
+      var url = new URL(base, window.location.origin);
+      url.pathname = url.pathname.replace(/\/+$/, "") + "/" + action;
+      return url.toString();
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function renderSubdlResults() {
+    subdlResults.innerHTML = "";
+    if (!subdlResultsData.length) {
+      var empty = document.createElement("div");
+      empty.className = "subdl-row";
+      empty.textContent = "Tidak ada subtitle ditemukan.";
+      subdlResults.appendChild(empty);
+      return;
+    }
+    subdlResultsData.forEach(function (item) {
+      var row = document.createElement("div");
+      row.className = "subdl-row";
+      var text = document.createElement("span");
+      text.textContent = (item.label || item.lang || "Subtitle")
+        + (item.author ? " • " + item.author : "");
+      var button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Pakai";
+      button.addEventListener("click", function () { importSubdl(item, button); });
+      row.appendChild(text);
+      row.appendChild(button);
+      subdlResults.appendChild(row);
+    });
+  }
+
+  async function searchSubdl() {
+    var endpoint = subdlEndpoint("search");
+    if (!endpoint) {
+      setSubdlStatus("Token SubDL tidak tersedia.");
+      return;
+    }
+    subdlPanel.classList.remove("hidden");
+    setSubdlStatus("Mencari subtitle di SubDL…");
+    subdlResults.innerHTML = "";
+    try {
+      var response = await fetch(endpoint, { method: "POST", cache: "no-store" });
+      if (!response.ok) throw new Error(await responseDetail(response, "HTTP " + response.status));
+      var body = await response.json();
+      subdlResultsData = Array.isArray(body && body.results) ? body.results : [];
+      renderSubdlResults();
+      setSubdlStatus(subdlResultsData.length + " hasil ditemukan.");
+    } catch (error) {
+      subdlResultsData = [];
+      subdlResults.innerHTML = "";
+      setSubdlStatus("Gagal: " + (error && error.message ? error.message : "pencarian SubDL"));
+    }
+  }
+
+  async function importSubdl(item, button) {
+    var endpoint = subdlEndpoint("import");
+    if (!endpoint || !item || !item.downloadPath) {
+      setSubdlStatus("Hasil SubDL tidak valid.");
+      return;
+    }
+    if (button) button.disabled = true;
+    setSubdlStatus("Mengunduh " + (item.label || "subtitle") + "…");
+    try {
+      var response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          downloadPath: item.downloadPath,
+          lang: item.lang || "en",
+          label: item.label || ""
+        }),
+        cache: "no-store"
+      });
+      if (!response.ok) throw new Error(await responseDetail(response, "HTTP " + response.status));
+      var track = await response.json();
+      addCustomTracks([track], false);
+      rebuildSubtitles();
+      selectSubtitleById(track.id);
+      setSubdlStatus("Subtitle aktif: " + (track.label || track.language));
+      setSubtitleStatus("SubDL aktif");
+      // Streamflix persists this track as a shared subtitle so other viewers
+      // can restore it; the VTT bytes stay behind mfp's signed /_token_ URL.
+      post("subdlImported", {
+        mediaId: media.id || "",
+        mediaType: media.type || "",
+        season: media.season || 1,
+        episode: media.episode || 1,
+        track: {
+          id: track.id,
+          lang: track.language || item.lang || "en",
+          label: track.label || item.label || "SubDL",
+          url: track.url || "",
+          downloadPath: track.downloadPath || item.downloadPath,
+          origin: "mfp.oplay.id"
+        }
+      });
+    } catch (error) {
+      setSubdlStatus("Gagal: " + (error && error.message ? error.message : "unduhan SubDL"));
+    } finally {
+      if (button) button.disabled = false;
     }
   }
 
@@ -458,6 +592,14 @@
       if (file) uploadSubtitle(file);
     });
   }
+  if (subdlSearchButton) {
+    subdlSearchButton.addEventListener("click", searchSubdl);
+  }
+  if (subdlClose) {
+    subdlClose.addEventListener("click", function () {
+      subdlPanel.classList.add("hidden");
+    });
+  }
 
   video.addEventListener("timeupdate", function () {
     var now = Date.now();
@@ -488,6 +630,34 @@
       video.pause();
     } else if (data.type === "mfp:play") {
       video.play().catch(function () {});
+    } else if (data.type === "mfp:restoreSubtitles") {
+      // Streamflix sends the shared VTT content it stores in Mongo. Blob URLs
+      // keep the signed mfp subtitle token server-side and survive a re-mount.
+      var incoming = Array.isArray(data.tracks) ? data.tracks : [];
+      var restored = [];
+      incoming.forEach(function (item) {
+        if (!item || !item.content) return;
+        var language = item.lang || item.language || "id";
+        var id = item.id || ("shared-" + String(item.externalId || item.label || language)
+          .replace(/[^A-Za-z0-9_-]/g, "_"));
+        try {
+          restored.push({
+            id: id,
+            label: item.label || language,
+            language: language,
+            format: "vtt",
+            origin: "shared",
+            url: URL.createObjectURL(new Blob([item.content], { type: "text/vtt" })),
+            downloadPath: item.externalId
+              ? String(item.externalId).replace(/^subdl:/, "") : ""
+          });
+        } catch (error) {}
+      });
+      if (restored.length) {
+        addCustomTracks(restored, false);
+        rebuildSubtitles();
+        post("subtitlesRestored", { count: restored.length });
+      }
     }
   });
 
