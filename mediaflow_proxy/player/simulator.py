@@ -18,9 +18,8 @@ from urllib.parse import urljoin, urlparse
 from aiohttp import ClientTimeout
 
 from mediaflow_proxy.configs import settings
-from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS, HOST_ORDER, build_embed_url
-from mediaflow_proxy.extractors.factory import ExtractorFactory
-from mediaflow_proxy.gateway.ad_filter import AdFilterReport, filter_extractor_result
+from mediaflow_proxy.extractors.embed_hosts import build_embed_url
+from mediaflow_proxy.player.adapters import ServerAdapter, configured_servers, get_adapter
 from mediaflow_proxy.player.models import Candidate, ProbeResult, session_to_dict
 from mediaflow_proxy.player.transcoder import create_transcode_job, prepare_transcode
 from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url, _sign_subtitle_url
@@ -38,7 +37,10 @@ logger = logging.getLogger(__name__)
 RESOLVE_TIMEOUT = 7.5
 PROBE_TIMEOUT = 2.5
 CACHE_PREFIX = "mfp:player-session:v3:"
-SESSION_TTL = 600
+# Media and subtitle URLs must stay usable when a viewer switches servers long
+# after the 10-minute iframe token was minted. These are same-origin capability
+# URLs only; headers and api_password still never reach the browser.
+MEDIA_TOKEN_TTL = 6 * 60 * 60
 
 _LANGUAGE_RANK = {"id": 0, "en": 1}
 _CODEC_RE = re.compile(r'codecs=["\']([^"\']+)["\']', re.I)
@@ -81,20 +83,14 @@ def _prewarm(job: str) -> None:
 
 
 def host_configs() -> list[Any]:
-    """Return the shared first-success host order.
-
-    ``HOST_ORDER`` in ``embed_hosts.py`` is the single source of truth. Adding a
-    host is a one-line registry change there; the player needs no code change.
-    """
-    return [EMBED_HOSTS[name] for name in HOST_ORDER if name in EMBED_HOSTS]
+    """Return the configs of the active server adapters, in priority order."""
+    return [adapter.config for adapter in configured_servers()]
 
 
 async def _resolve_host(config, request, media_type: str, media_id: str, season: str, episode: str) -> dict:
-    """Resolve one embed host into an ad-filtered extractor result."""
-    embed_url = build_embed_url(config, media_type, media_id, season, episode)
-    extractor = ExtractorFactory.get_extractor(config.canonical, get_proxy_headers(request).request)
-    result = await extractor.extract(embed_url)
-    return filter_extractor_result(result, AdFilterReport())
+    """Resolve one server through its adapter (custom resolver or generic)."""
+    adapter = get_adapter(config.canonical) or ServerAdapter(config)
+    return await adapter.resolve(request, media_type, media_id, season, episode)
 
 
 def _classify_manifest(text: str, content_type: str, url: str) -> str:
@@ -387,11 +383,14 @@ async def simulate_session(
     *,
     refresh: bool = False,
 ) -> dict:
-    """Check hosts once, stop at the first playable one and return its session.
+    """Check each configured server once and return every playable candidate.
+
+    The first playable server stays the default. The other candidates feed the
+    player's manual Server picker, so this is still a single server walk at
+    iframe mount with no automatic failover after playback starts.
 
     ``refresh`` is set by ``?retry=1`` on the gateway; it clears the positive
-    session cache so the host check runs again. There is no exclude/retry path:
-    once playback starts, a failure is shown as an error in the player.
+    session cache so the server check runs again.
     """
     season = season or "1"
     episode = episode or "1"
@@ -407,14 +406,18 @@ async def simulate_session(
     started = time.monotonic()
     budget = max(1.0, float(settings.player_simulation_budget))
     configs = host_configs()
+    max_servers = max(1, int(settings.player_max_servers))
     proxy_headers = get_proxy_headers(request)
     tried: list[dict] = []
-    winner: Candidate | None = None
+    candidates: list[Candidate] = []
 
     if configs:
         streamer = await create_streamer(build_embed_url(configs[0], media_type, media_id, season, episode))
         try:
             for config in configs:
+                if len(candidates) >= max_servers:
+                    tried.append({"host": config.canonical, "reason": "candidate_limit"})
+                    continue
                 remaining = budget - (time.monotonic() - started)
                 if remaining <= 0.5:
                     tried.append({"host": config.canonical, "reason": "budget_exhausted"})
@@ -446,25 +449,26 @@ async def simulate_session(
                     tried.append({"host": config.canonical, "reason": probe.reason or "probe_failed"})
                     continue
 
-                winner = await _signed_candidate(
-                    request, raw, proxy_headers, SESSION_TTL, config.canonical, probe
+                candidates.append(
+                    await _signed_candidate(
+                        request, raw, proxy_headers, MEDIA_TOKEN_TTL, config.canonical, probe
+                    )
                 )
-                break
         finally:
             await streamer.session.close()
 
-    candidates = [winner] if winner else []
-    if winner and winner.needs_transcode and winner.transcode_job:
-        _prewarm(winner.transcode_job)
+    default = candidates[0] if candidates else None
+    if default and default.needs_transcode and default.transcode_job:
+        _prewarm(default.transcode_job)
 
     subtitles = _merge_subtitles(candidates)
     native_has_indonesian = has_indonesian_subtitle(subtitles)
     subdl_used = False
     # Every source is offered in the one player menu. SubDL is collected even
-    # when the winning host already has an Indonesian track: the default stay
-    # native, but the viewer may switch to any alternative manually. Custom
-    # tracks are added client-side and never enter this cached session.
-    if winner:
+    # when a server already has an Indonesian track: the default stays native,
+    # but the viewer may switch to any alternative manually. Custom tracks are
+    # added client-side and never enter this cached session.
+    if candidates:
         try:
             external = await asyncio.wait_for(
                 subdl.collect(
@@ -472,7 +476,7 @@ async def simulate_session(
                     media_id,
                     season,
                     episode,
-                    signer=lambda key: _sign_subtitle_url(request, key, expiration=SESSION_TTL),
+                    signer=lambda key: _sign_subtitle_url(request, key, expiration=MEDIA_TOKEN_TTL),
                 ),
                 timeout=subdl.COLLECT_TIMEOUT,
             )
@@ -487,12 +491,13 @@ async def simulate_session(
             logger.info("[player] SubDL collection skipped: %s: %s", type(exc).__name__, exc)
 
     audit = {
-        "hosts_tried": len(tried) + (1 if winner else 0),
+        "hosts_tried": len(tried) + len(candidates),
         "hosts_playable": len(candidates),
         "hosts_available": len(configs),
-        "chosen_video_host": winner.host if winner else None,
+        "chosen_video_host": default.host if default else None,
+        "available_video_hosts": [item.host for item in candidates],
         "chosen_subtitle_hosts": sorted({item.get("host") for item in subtitles if item.get("host")}),
-        "transcode_hosts": [winner.host] if winner and winner.needs_transcode else [],
+        "transcode_hosts": [item.host for item in candidates if item.needs_transcode],
         "tried_hosts": tried,
         "subtitle_origins": sorted({str(item.get("origin") or "") for item in subtitles if item.get("origin")}),
         "subtitle_count": len(subtitles),
@@ -513,10 +518,12 @@ async def simulate_session(
     if candidates:
         await set_cached_extractor(cache_key, session, ttl=settings.player_cache_ttl)
     logger.info(
-        "[player] checked %s/%s: winner=%s after %s/%s hosts, %sms",
+        "[player] checked %s/%s: default=%s, %s/%s playable, %s/%s servers tried, %sms",
         media_type,
         media_id,
         audit["chosen_video_host"],
+        len(candidates),
+        len(configs),
         audit["hosts_tried"],
         len(configs),
         audit["simulation_ms"],

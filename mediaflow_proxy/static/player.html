@@ -17,6 +17,9 @@
     </div>
 
     <div class="controls">
+      <label>Server
+        <select id="server-select" aria-label="Server video"></select>
+      </label>
       <label>Kualitas
         <select id="quality-select" aria-label="Kualitas video"></select>
       </label>
@@ -39,7 +42,7 @@
     <div class="overlay" id="overlay">
       <div class="status" id="overlay-status">Memilih sumber video…</div>
       <div class="bar"><span id="overlay-bar"></span></div>
-      <div class="hint" id="overlay-hint">MediaFlow memeriksa host yang tersedia sekali saja, lalu langsung memutar sumber pertama yang valid.</div>
+      <div class="hint" id="overlay-hint">MediaFlow memeriksa server sekali saat player dibuka. Gunakan pilihan Server untuk mengganti sumber secara manual.</div>
     </div>
 
     <div class="error-box hidden" id="error-box">

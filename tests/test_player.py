@@ -13,7 +13,13 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from mediaflow_proxy.configs import settings
+from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS
 from mediaflow_proxy.player import simulator
+from mediaflow_proxy.player.adapters import (
+    configured_server_names,
+    configured_servers,
+    register_server,
+)
 from mediaflow_proxy.player.models import Candidate, ProbeResult
 from mediaflow_proxy.player.simulator import (
     _audio_can_be_copied,
@@ -129,6 +135,32 @@ def test_host_configs_uses_only_the_shared_host_order():
     assert "VidKing" not in names  # historical registry entries are never probed
 
 
+def test_configured_servers_accept_slugs_and_skip_unknown_names(monkeypatch):
+    monkeypatch.setattr(settings, "player_hosts", "vidcore, not-a-server, stream.oplay.id")
+    assert configured_server_names() == ["VidCore", "VSEmbed"]
+    assert [adapter.name for adapter in configured_servers()] == ["VidCore", "VSEmbed"]
+
+
+@pytest.mark.asyncio
+async def test_server_adapter_can_override_resolution(monkeypatch):
+    config = EMBED_HOSTS["VidKing"]
+    calls: list[tuple] = []
+
+    async def resolver(adapter, request, media_type, media_id, season, episode):
+        calls.append((adapter.name, media_type, media_id))
+        return {"destination_url": "https://cdn.example/custom.m3u8"}
+
+    adapter = register_server(config, resolver=resolver)
+    try:
+        monkeypatch.setattr(settings, "player_hosts", "vidking")
+        assert configured_server_names() == ["VidKing"]
+        result = await adapter.resolve(_request(), "movie", "42", "1", "1")
+        assert result["destination_url"] == "https://cdn.example/custom.m3u8"
+        assert calls == [("VidKing", "movie", "42")]
+    finally:
+        register_server(config)  # restore the generic adapter for other tests
+
+
 def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
     """Stub network work so first-success ordering can be asserted offline."""
     calls: list[tuple[str, str]] = []
@@ -191,23 +223,36 @@ def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_checks_each_host_at_most_once_and_stops_at_first(monkeypatch):
-    calls = _patch_simulation(monkeypatch, {"VidCore"})
+async def test_simulate_session_checks_each_server_once_and_keeps_all_playable(monkeypatch):
+    calls = _patch_simulation(monkeypatch, {"VidCore", "VSEmbed"})
 
     session = await simulator.simulate_session(
         _request("/player/movie/1263337"), "movie", "1263337", None, None
     )
 
-    assert [item for item in calls if item[0] in ("resolve", "probe")] == [
-        ("resolve", "VidCore"),
-        ("probe", "VidCore"),
-    ]
-    assert calls.count(("resolve", "VidCore")) == 1
-    assert len(session["candidates"]) == 1
-    assert session["audit"]["chosen_video_host"] == "VidCore"
+    resolved = [host for kind, host in calls if kind == "resolve"]
+    assert resolved == ["VidCore", "VSEmbed", "VidSrcTo", "VidLink"]
+    assert len(resolved) == len(set(resolved))  # each server checked at most once
+    assert [item["host"] for item in session["candidates"]] == ["VidCore", "VSEmbed"]
+    assert session["audit"]["chosen_video_host"] == "VidCore"  # first success is the default
+    assert session["audit"]["available_video_hosts"] == ["VidCore", "VSEmbed"]
+    assert session["audit"]["hosts_playable"] == 2
     assert "retry_available" not in session["audit"]
     assert "excluded_hosts" not in session["audit"]
     assert "start_time" not in session
+
+
+@pytest.mark.asyncio
+async def test_simulate_session_honours_player_max_servers(monkeypatch):
+    _patch_simulation(monkeypatch, {"VidCore", "VSEmbed", "VidSrcTo", "VidLink"})
+    monkeypatch.setattr(settings, "player_max_servers", 2)
+
+    session = await simulator.simulate_session(
+        _request("/player/movie/1263337"), "movie", "1263337", None, None
+    )
+
+    assert [item["host"] for item in session["candidates"]] == ["VidCore", "VSEmbed"]
+    assert {"host": "VidSrcTo", "reason": "candidate_limit"} in session["audit"]["tried_hosts"]
 
 
 @pytest.mark.asyncio
@@ -225,7 +270,12 @@ async def test_simulate_session_refresh_bypasses_cached_session(monkeypatch):
 
     assert len(deleted) == 1
     assert "movie:1263337" in deleted[0]
-    assert [host for kind, host in calls if kind == "resolve"] == ["VidCore"]
+    assert [host for kind, host in calls if kind == "resolve"] == [
+        "VidCore",
+        "VSEmbed",
+        "VidSrcTo",
+        "VidLink",
+    ]
 
 
 def _native_track(language: str, label: str) -> dict:
@@ -301,11 +351,13 @@ async def test_simulate_session_offers_subdl_without_native_indonesian(monkeypat
     assert [item["origin"] for item in session["subtitles"]] == ["host", "subdl"]
 
 
-def test_player_ui_has_no_host_selector_or_retry_controls():
+def test_player_ui_has_manual_server_picker_but_no_retry_controls():
     static_dir = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static"
     html = (static_dir / "player.html").read_text(encoding="utf-8")
     js = (static_dir / "player.js").read_text(encoding="utf-8")
 
+    # Server switching is internal to the iframe: no gateway override, no retry.
+    assert 'id="server-select"' in html
     assert 'id="host-select"' not in html
     assert 'id="retry-button"' not in html
     assert 'id="error-retry"' not in html
@@ -314,6 +366,8 @@ def test_player_ui_has_no_host_selector_or_retry_controls():
     assert "/retry" not in js
     assert "retryExcluding" not in js
     assert "mfp:host" not in js
+    assert "fillServers" in js
+    assert "playCandidate(Number(serverSelect.value))" in js
     # Video settings stay in the mfp player.
     assert 'id="quality-select"' in html
     assert 'id="subtitle-select"' in html

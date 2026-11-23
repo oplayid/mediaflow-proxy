@@ -27,6 +27,11 @@ Set the following environment variables:
 - `DASH_PREBUFFER_INACTIVITY_TIMEOUT`: Optional. Seconds of inactivity before cleaning up DASH stream state. Default: `60`. Helps clean up resources when streams are stopped.
 - `DASH_SEGMENT_CACHE_TTL`: Optional. TTL in seconds for cached DASH segments. Default: `60`. Longer values help with slow network playback.
 - `FORWARDED_ALLOW_IPS`: Optional. Controls which IP addresses are trusted to provide forwarded headers (X-Forwarded-For, X-Forwarded-Proto, etc.) when MediaFlow Proxy is deployed behind reverse proxies or load balancers. Default: `127.0.0.1`. See [Forwarded Headers Configuration](networking.md#forwarded-headers-configuration) for detailed usage.
+- `PLAYER_HOSTS`: Optional. Comma-separated server names (canonical names, slugs or domains) the mfp player may check, in priority order. Empty (default) uses `HOST_ORDER`: `VidCore,VSEmbed,VidSrcTo,VidLink`. The first playable server is the default; the rest appear in the player's Server picker.
+- `PLAYER_MAX_SERVERS`: Optional. Maximum number of playable candidates signed into one player session. Default: `4`.
+- `PLAYER_SIMULATION_BUDGET`: Optional. Maximum seconds spent checking servers when the iframe mounts. Default: `10`.
+- `PLAYER_CACHE_TTL`: Optional. Seconds a player session is reused across workers. Default: `600`.
+- `PLAYER_FRAME_ANCESTORS`: Optional. CSP `frame-ancestors` value for the player iframe. Default: `https://movie.oplay.id`.
 
 ### `/proxy/forward` settings
 

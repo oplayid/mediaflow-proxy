@@ -12,8 +12,8 @@ from starlette.staticfiles import StaticFiles
 
 from mediaflow_proxy import __version__
 from mediaflow_proxy.configs import settings
-from mediaflow_proxy.extractors.embed_hosts import HOST_ORDER
 from mediaflow_proxy.middleware import UIAccessControlMiddleware
+from mediaflow_proxy.player.adapters import configured_server_names
 from mediaflow_proxy.routes.proxy import proxy_router
 from mediaflow_proxy.routes.epg import epg_router
 from mediaflow_proxy.routes.extractor import extractor_router
@@ -121,7 +121,7 @@ async def health_check():
     return {
         "status": "healthy",
         "version": __version__,
-        "gateway_hosts": list(HOST_ORDER),
+        "gateway_hosts": configured_server_names(),
     }
 
 

@@ -27,6 +27,7 @@
   var errorStatus = document.getElementById("error-status");
   var sourceBadge = document.getElementById("source-badge");
   var title = document.getElementById("title");
+  var serverSelect = document.getElementById("server-select");
   var qualitySelect = document.getElementById("quality-select");
   var subtitleSelect = document.getElementById("subtitle-select");
   var subtitleLanguage = document.getElementById("subtitle-language");
@@ -37,6 +38,7 @@
   var hls = null;
   var dashPlayer = null;
   var activeIndex = -1;
+  var resumeAt = 0;
   var readySent = false;
   var lastTimeUpdate = 0;
   var trackElements = {};
@@ -263,6 +265,19 @@
     }
   }
 
+  function fillServers() {
+    if (!serverSelect) return;
+    serverSelect.innerHTML = "";
+    candidates.forEach(function (candidate, index) {
+      var option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = "Server " + (index + 1) + " • " + (candidate.host || "MediaFlow");
+      serverSelect.appendChild(option);
+    });
+    // A single candidate is still selectable, but the control adds no value.
+    serverSelect.disabled = candidates.length < 2;
+  }
+
   function fillQualities() {
     qualitySelect.innerHTML = "";
     var auto = document.createElement("option");
@@ -318,8 +333,8 @@
     });
   }
 
-  // Decision A: there is no post-playback failover. The host was already
-  // checked once and the winner is the only candidate in the session.
+  // No automatic failover: every server was already checked when the iframe
+  // mounted. The viewer may switch manually with the Server picker.
   function handleError(source, fatal) {
     if (!fatal) return;
     showError(source === "transcode"
@@ -346,6 +361,12 @@
   function startPlayback(candidate, url, playbackType) {
     setOverlay("Memutar video…", 90);
     attachCommon();
+    video.addEventListener("loadedmetadata", function () {
+      if (resumeAt > 0) {
+        try { video.currentTime = resumeAt; } catch (error) {}
+        resumeAt = 0;
+      }
+    }, { once: true });
 
     if (playbackType === "hls") {
       if (window.Hls && window.Hls.isSupported()) {
@@ -399,17 +420,27 @@
   function playCandidate(index) {
     var candidate = candidates[index];
     if (!candidate) { showError("Sumber video tidak tersedia."); return; }
+    if (activeIndex >= 0 && Number.isFinite(video.currentTime)) resumeAt = video.currentTime;
     activeIndex = index;
+    if (serverSelect) serverSelect.value = String(index);
     fillQualities();
-    sourceBadge.textContent = (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type) + " • siap";
+    sourceBadge.textContent = (candidate.host ? candidate.host + " • " : "")
+      + (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type) + " • siap";
     sourceBadge.classList.add("good");
     sourceBadge.classList.toggle("transcode", !!candidate.needs_transcode);
     playUrl(candidate, candidate.url);
   }
 
+  if (serverSelect) {
+    serverSelect.addEventListener("change", function () {
+      playCandidate(Number(serverSelect.value));
+    });
+  }
+
   qualitySelect.addEventListener("change", function () {
     var candidate = currentCandidate();
     if (!candidate) return;
+    if (Number.isFinite(video.currentTime)) resumeAt = video.currentTime;
     if (!qualitySelect.value) { playUrl(candidate, candidate.url); return; }
     playUrl(candidate, qualitySelect.value);
   });
@@ -471,6 +502,7 @@
 
   addCustomTracks(readCustomTracks(), false);
   rebuildSubtitles();
+  fillServers();
   setOverlay("Sumber ditemukan. Menyiapkan video…", 100);
   playCandidate(0);
 })();

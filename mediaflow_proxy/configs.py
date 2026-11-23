@@ -134,8 +134,14 @@ class Settings(BaseSettings):
 
     # Smart player settings. The player is served by MediaFlow itself and
     # embedded by StreamFlix; StreamFlix never sees provider/proxy URLs.
-    player_simulation_budget: float = 10.0  # Max seconds spent checking hosts before playback.
+    player_simulation_budget: float = 10.0  # Max seconds spent checking servers before playback.
     player_cache_ttl: int = 600  # Seconds a simulated session is reused across workers.
+    # Comma-separated canonical names, slugs or domains of the servers the player
+    # may use, in priority order. Empty = HOST_ORDER from embed_hosts.py.
+    player_hosts: str = ""
+    # How many servers may be resolved and signed into one session. The first
+    # playable one stays the default; the rest feed the manual Server picker.
+    player_max_servers: int = 4
     player_frame_ancestors: str = "https://movie.oplay.id"  # CSP frame-ancestors for the iframe.
     # HEVC browsers/TV boxes often cannot decode hvc1/hev1. Transcode to H.264.
     player_transcode_hevc: bool = True
