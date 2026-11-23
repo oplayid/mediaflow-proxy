@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Resolution/probe budget for the single host walk.
 RESOLVE_TIMEOUT = 7.5
 PROBE_TIMEOUT = 2.5
-CACHE_PREFIX = "mfp:player-session:v2:"
+CACHE_PREFIX = "mfp:player-session:v3:"
 SESSION_TTL = 600
 
 _LANGUAGE_RANK = {"id": 0, "en": 1}
@@ -460,10 +460,11 @@ async def simulate_session(
     subtitles = _merge_subtitles(candidates)
     native_has_indonesian = has_indonesian_subtitle(subtitles)
     subdl_used = False
-    # SubDL is only an alternative when the winning host did not ship an
-    # Indonesian track with its video. Otherwise the native package is the
-    # single default source for this playback session.
-    if winner and not native_has_indonesian:
+    # Every source is offered in the one player menu. SubDL is collected even
+    # when the winning host already has an Indonesian track: the default stay
+    # native, but the viewer may switch to any alternative manually. Custom
+    # tracks are added client-side and never enter this cached session.
+    if winner:
         try:
             external = await asyncio.wait_for(
                 subdl.collect(
@@ -476,13 +477,14 @@ async def simulate_session(
                 timeout=subdl.COLLECT_TIMEOUT,
             )
             if external:
-                # Native tracks from the winning video host stay first/default.
-                subtitles.extend(external)
-                subdl_used = True
+                known_ids = {str(item.get("id") or "") for item in subtitles}
+                for item in external:
+                    if str(item.get("id") or "") not in known_ids:
+                        subtitles.append(item)
+                        known_ids.add(str(item.get("id") or ""))
+                subdl_used = bool(external)
         except Exception as exc:
-            logger.info("[player] subtitle collection skipped: %s: %s", type(exc).__name__, exc)
-    elif native_has_indonesian:
-        logger.info("[player] SubDL skipped: winning host has a native Indonesian subtitle")
+            logger.info("[player] SubDL collection skipped: %s: %s", type(exc).__name__, exc)
 
     audit = {
         "hosts_tried": len(tried) + (1 if winner else 0),
@@ -493,6 +495,7 @@ async def simulate_session(
         "transcode_hosts": [winner.host] if winner and winner.needs_transcode else [],
         "tried_hosts": tried,
         "subtitle_origins": sorted({str(item.get("origin") or "") for item in subtitles if item.get("origin")}),
+        "subtitle_count": len(subtitles),
         "native_indonesian_subtitle": native_has_indonesian,
         "subdl_used": subdl_used,
         "simulation_ms": int((time.monotonic() - started) * 1000),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 
@@ -27,7 +28,11 @@ from mediaflow_proxy.player.transcoder import (
     serve_transcode_file,
     sign_transcode_url,
 )
-from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_player_url
+from mediaflow_proxy.routes.embed import (
+    _headers_for_destination,
+    _sign_player_url,
+    _sign_subtitle_upload_url,
+)
 from mediaflow_proxy.utils import crypto_utils
 from mediaflow_proxy.utils.crypto_utils import EncryptionHandler
 
@@ -88,6 +93,32 @@ def test_sign_player_url_is_opaque_and_decryptable(monkeypatch):
     assert payload["id"] == "246473"
     assert payload["s"] == "1"
     assert payload["e"] == "1"
+
+
+def test_sign_subtitle_upload_url_is_opaque_and_long_lived(monkeypatch):
+    from mediaflow_proxy.routes import embed as embed_routes
+
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+    seen: dict[str, object] = {}
+
+    class SpyHandler(EncryptionHandler):
+        def encrypt_data(self, data, expiration=None, ip=None):
+            seen["expiration"] = expiration
+            return super().encrypt_data(data, expiration=expiration, ip=ip)
+
+    monkeypatch.setattr(embed_routes, "EncryptionHandler", SpyHandler)
+    url = _sign_subtitle_upload_url(_request(), "movie", "550")
+
+    assert url.startswith("https://mfp.oplay.id/_token_")
+    assert url.endswith("/player/subtitle/upload")
+    assert "api_password" not in url
+
+    token = url.split("/_token_", 1)[1].split("/player/", 1)[0]
+    payload = EncryptionHandler("unit-secret").decrypt_data(token, None)
+    assert payload["type"] == "movie"
+    assert payload["id"] == "550"
+    assert payload["upload"] is True
+    assert seen["expiration"] == 6 * 60 * 60
 
 
 def test_host_configs_uses_only_the_shared_host_order():
@@ -223,7 +254,7 @@ def _patch_signed_with_subtitles(monkeypatch, tracks: list[dict]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_skips_subdl_when_native_indonesian_exists(monkeypatch):
+async def test_simulate_session_keeps_native_default_but_collects_subdl_anyway(monkeypatch):
     _patch_simulation(monkeypatch, {"VidCore"})
     _patch_signed_with_subtitles(monkeypatch, [_native_track("id", "Bahasa Indonesia")])
     collect_calls: list[tuple] = []
@@ -238,10 +269,14 @@ async def test_simulate_session_skips_subdl_when_native_indonesian_exists(monkey
         _request("/player/movie/550"), "movie", "550", None, None
     )
 
-    assert collect_calls == []
+    # The viewer may pick either source manually; the Indonesian host track is
+    # only the default, never a reason to hide SubDL from the merged menu.
+    assert len(collect_calls) == 1
     assert session["audit"]["native_indonesian_subtitle"] is True
-    assert session["audit"]["subdl_used"] is False
-    assert [item["origin"] for item in session["subtitles"]] == ["host"]
+    assert session["audit"]["subdl_used"] is True
+    assert session["audit"]["subtitle_count"] == 2
+    assert [item["origin"] for item in session["subtitles"]] == ["host", "subdl"]
+    assert session["subtitles"][0]["id"] == "native-id"
 
 
 @pytest.mark.asyncio
@@ -282,9 +317,19 @@ def test_player_ui_has_no_host_selector_or_retry_controls():
     # Video settings stay in the mfp player.
     assert 'id="quality-select"' in html
     assert 'id="subtitle-select"' in html
+    assert 'id="subtitle-upload-button"' in html
+    assert 'id="subtitle-file"' in html
+    assert 'id="subtitle-language"' in html
+    assert 'id="subtitle-status"' in html
     assert "preferredSubtitle" in js
     assert 'item.origin === "subdl"' in js
+    assert 'item.origin === "custom"' in js
+    assert 'subtitleGroup' in js
+    assert 'document.createElement("optgroup")' in js
     assert "/^subdl\\b/i.test(label)" in js  # avoid "SubDL • SubDL • ..." labels
+    assert "/^custom\\b/i.test(label)" in js
+    assert 'data.id' in js  # mfp:setSubtitle can target one merged track by id
+    assert "session.upload_url" in js  # upload survives iframe token expiry
 
 
 
@@ -318,6 +363,25 @@ def test_render_player_injects_session_into_data_block():
     block = rendered.split(marker, 1)[1].split("</script>", 1)[0]
     assert "<\\/script>" in block
     assert "</script>" not in block
+
+
+@pytest.mark.asyncio
+async def test_player_page_injects_long_lived_upload_url_without_mutating_cache(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    cached = {"candidates": [], "subtitles": [], "audit": {}, "generated_at": 0}
+
+    async def fake_session(*args, **kwargs):
+        return cached
+
+    monkeypatch.setattr(player_routes, "simulate_session", fake_session)
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+
+    response = await player_routes.player_page(_request("/player/movie/550"), "movie", "550")
+    rendered = response.body.decode()
+    assert "/_token_" in rendered
+    assert "player/subtitle/upload" in rendered
+    assert "upload_url" not in cached
 
 
 def test_classify_manifest():
@@ -531,6 +595,84 @@ async def test_player_subtitle_endpoint_serves_signed_vtt(monkeypatch):
     assert response.body == b"WEBVTT\n\nHalo\n"
     assert "frame-ancestors https://movie.oplay.id" in response.headers["content-security-policy"]
     assert "api_password" not in response.body.decode()
+
+
+def _upload_request(query: bytes, body: bytes) -> Request:
+    path = "/player/subtitle/upload"
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query,
+        "headers": [(b"host", b"mfp.oplay.id"), (b"content-type", b"application/octet-stream")],
+        "client": ("10.0.0.1", 12345),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.asyncio
+async def test_player_subtitle_upload_returns_signed_custom_track(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    key = "c" * 32
+    stored: dict[str, object] = {}
+
+    async def fake_store(content, ttl=player_routes.SUBTITLE_CACHE_TTL):
+        stored["content"] = content
+        stored["ttl"] = ttl
+        return key
+
+    monkeypatch.setattr(player_routes, "store_vtt", fake_store)
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+
+    srt = b"1\r\n00:00:00,000 --> 00:00:01,000\r\nHalo\r\n"
+    response = await player_routes.player_subtitle_upload(
+        _upload_request(b"type=movie&id=550&language=id&label=Film+Saya", srt)
+    )
+
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    assert payload["id"] == f"custom-{key[:12]}"
+    assert payload["origin"] == "custom"
+    assert payload["language"] == "id"
+    assert payload["label"] == "Custom • Film Saya"
+    assert stored["content"].startswith("WEBVTT\n\n")
+    assert "00:00:00.000 --> 00:00:01.000" in stored["content"]
+    assert stored["ttl"] == player_routes.SUBTITLE_CACHE_TTL
+    assert payload["url"].startswith("https://mfp.oplay.id/_token_")
+    assert "/player/subtitle/" in payload["url"]
+    assert "api_password" not in payload["url"]
+    assert "frame-ancestors https://movie.oplay.id" in response.headers["content-security-policy"]
+
+
+@pytest.mark.asyncio
+async def test_player_subtitle_upload_rejects_bad_input(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    with pytest.raises(HTTPException) as missing:
+        await player_routes.player_subtitle_upload(
+            _upload_request(b"type=movie", b"1\r\n00:00 --> 00:01\r\nHalo\r\n")
+        )
+    assert missing.value.status_code == 400
+
+    with pytest.raises(HTTPException) as invalid:
+        await player_routes.player_subtitle_upload(
+            _upload_request(b"type=movie&id=550", b"bukan subtitle")
+        )
+    assert invalid.value.status_code == 400
+
+    with pytest.raises(HTTPException) as oversize:
+        await player_routes.player_subtitle_upload(
+            _upload_request(b"type=movie&id=550", b"x" * (player_routes._MAX_CUSTOM_SUBTITLE_BYTES + 1))
+        )
+    assert oversize.value.status_code == 400
 
 
 def test_encryption_middleware_restores_tokenized_scope(monkeypatch):

@@ -133,6 +133,29 @@ def _sign_subtitle_url(request: Request, key: str, expiration: int = 600) -> str
     return f"{scheme}://{authority}{path}?sub={key}"
 
 
+def _sign_subtitle_upload_url(
+    request: Request,
+    media_type: str,
+    media_id: str,
+    expiration: int = 6 * 60 * 60,
+) -> str:
+    """Sign a longer-lived URL for viewer subtitle uploads.
+
+    The iframe token expires in 10 minutes, but a viewer may upload a subtitle
+    later in the film. This token carries only the media identity, never a
+    provider URL or ``api_password``.
+    """
+    scheme = get_original_scheme(request)
+    authority = request.headers.get("host") or request.url.netloc
+    path = "/player/subtitle/upload"
+    payload = {"type": media_type, "id": str(media_id), "upload": True}
+    handler = EncryptionHandler(settings.api_password) if settings.api_password else None
+    if handler:
+        token = handler.encrypt_data(payload, expiration=expiration)
+        return f"{scheme}://{authority}/_token_{token}{path}"
+    return f"{scheme}://{authority}{path}"
+
+
 def _normalise_media(
     media_type: str,
     media_id: str,

@@ -17,6 +17,7 @@
   var session = readSession();
   var candidates = Array.isArray(session.candidates) ? session.candidates : [];
   var subtitles = Array.isArray(session.subtitles) ? session.subtitles : [];
+  var media = session.media || {};
 
   var video = document.getElementById("video");
   var overlay = document.getElementById("overlay");
@@ -28,6 +29,10 @@
   var title = document.getElementById("title");
   var qualitySelect = document.getElementById("quality-select");
   var subtitleSelect = document.getElementById("subtitle-select");
+  var subtitleLanguage = document.getElementById("subtitle-language");
+  var subtitleUploadButton = document.getElementById("subtitle-upload-button");
+  var subtitleFile = document.getElementById("subtitle-file");
+  var subtitleStatus = document.getElementById("subtitle-status");
 
   var hls = null;
   var dashPlayer = null;
@@ -37,6 +42,43 @@
   var trackElements = {};
   var generation = 0;
   var allowedParents = ["https://movie.oplay.id", window.location.origin];
+  var customKey = "mfp:custom-subtitles:" + [
+    media.type || "", media.id || "", media.season || "", media.episode || ""
+  ].join(":");
+
+  function setSubtitleStatus(text) {
+    if (subtitleStatus) subtitleStatus.textContent = text || "";
+  }
+
+  // A cross-origin iframe may deny localStorage; uploads still work for the
+  // current page session because the track is kept in `subtitles` as well.
+  function readCustomTracks() {
+    try {
+      var raw = window.localStorage.getItem(customKey);
+      var parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter(function (item) {
+        return item && item.id && item.url && item.origin === "custom";
+      }) : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveCustomTracks() {
+    var custom = subtitles.filter(function (item) { return item.origin === "custom"; });
+    try { window.localStorage.setItem(customKey, JSON.stringify(custom)); } catch (error) {}
+  }
+
+  function addCustomTracks(tracks, persist) {
+    var known = {};
+    subtitles.forEach(function (item) { known[item.id] = true; });
+    (tracks || []).forEach(function (item) {
+      if (!item || !item.id || known[item.id]) return;
+      subtitles.push(item);
+      known[item.id] = true;
+    });
+    if (persist) saveCustomTracks();
+  }
 
   function parentWindow() {
     return window.parent && window.parent !== window ? window.parent : null;
@@ -81,8 +123,17 @@
     });
   }
 
+  function subtitleGroup(item) {
+    if (item.origin === "subdl") return "SubDL";
+    if (item.origin === "custom") return "Custom";
+    return "Host"; // host + API tracks are both shipped by the winning embed host
+  }
+
   function subtitleLabel(item) {
     var label = item.label || item.language || "Subtitle";
+    if (item.origin === "custom") {
+      return /^custom\b/i.test(label) ? label : "Custom • " + label;
+    }
     if (item.origin === "subdl") {
       return /^subdl\b/i.test(label) ? label : "SubDL • " + label;
     }
@@ -117,14 +168,27 @@
     off.value = "";
     off.textContent = "Mati";
     subtitleSelect.appendChild(off);
+    var groups = {};
     subtitles.forEach(function (item) {
+      var name = subtitleGroup(item);
+      if (!groups[name]) {
+        var group = document.createElement("optgroup");
+        group.label = name;
+        subtitleSelect.appendChild(group);
+        groups[name] = group;
+      }
       var option = document.createElement("option");
       option.value = item.id;
       option.textContent = subtitleLabel(item);
-      subtitleSelect.appendChild(option);
+      groups[name].appendChild(option);
     });
     subtitleSelect.value = preferredSubtitle();
     applySubtitle();
+  }
+
+  function rebuildSubtitles() {
+    buildTracks();
+    fillSubtitles();
   }
 
   function applySubtitle() {
@@ -132,6 +196,71 @@
     Object.keys(trackElements).forEach(function (id) {
       try { trackElements[id].track.mode = id === selected ? "showing" : "disabled"; } catch (error) {}
     });
+  }
+
+  // Keep the opaque /_token_<...> prefix: EncryptionMiddleware restores the
+  // media identity from it, so type/id are only needed when api_password is off.
+  function uploadEndpoint(language, label) {
+    var path = window.location.pathname || "/player/";
+    var prefix = "";
+    if (path.indexOf("/_token_") === 0) {
+      var slash = path.indexOf("/", "/_token_".length);
+      if (slash !== -1) {
+        prefix = path.slice(0, slash);
+        path = path.slice(slash);
+      }
+    }
+    var endpoint = path.replace(/\/player\/.*$/, "/player/subtitle/upload");
+    if (endpoint === path) endpoint = "/player/subtitle/upload";
+    var query = new URLSearchParams();
+    query.set("type", media.type || "");
+    query.set("id", media.id || "");
+    query.set("language", language || "id");
+    query.set("label", label || "Subtitle");
+    // The session carries a 6h upload token so uploads keep working after the
+    // 10-minute iframe token expires. The fallback covers older sessions.
+    var base = session.upload_url || (prefix + endpoint);
+    return base + (base.indexOf("?") === -1 ? "?" : "&") + query.toString();
+  }
+
+  function selectSubtitleById(id) {
+    var match = subtitles.find(function (item) { return item.id === id; });
+    if (!match) return false;
+    if (!trackElements[id]) rebuildSubtitles();
+    subtitleSelect.value = id;
+    applySubtitle();
+    return true;
+  }
+
+  async function uploadSubtitle(file) {
+    var language = subtitleLanguage ? subtitleLanguage.value : "id";
+    var label = (file.name || "Subtitle").replace(/\.(srt|vtt)$/i, "");
+    setSubtitleStatus("Mengunggah subtitle…");
+    try {
+      var response = await fetch(uploadEndpoint(language, label), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: file,
+        cache: "no-store"
+      });
+      if (!response.ok) {
+        var detail = "HTTP " + response.status;
+        try {
+          var body = await response.json();
+          detail = (body && (body.detail || body.error)) || detail;
+        } catch (error) {}
+        throw new Error(detail);
+      }
+      var track = await response.json();
+      addCustomTracks([track], true);
+      rebuildSubtitles();
+      selectSubtitleById(track.id);
+      setSubtitleStatus("Subtitle " + label + " aktif");
+    } catch (error) {
+      setSubtitleStatus("Gagal: " + (error && error.message ? error.message : "upload subtitle"));
+    } finally {
+      if (subtitleFile) subtitleFile.value = "";
+    }
   }
 
   function fillQualities() {
@@ -287,6 +416,18 @@
 
   subtitleSelect.addEventListener("change", applySubtitle);
 
+  if (subtitleUploadButton) {
+    subtitleUploadButton.addEventListener("click", function () {
+      if (subtitleFile) subtitleFile.click();
+    });
+  }
+  if (subtitleFile) {
+    subtitleFile.addEventListener("change", function () {
+      var file = subtitleFile.files && subtitleFile.files[0];
+      if (file) uploadSubtitle(file);
+    });
+  }
+
   video.addEventListener("timeupdate", function () {
     var now = Date.now();
     if (now - lastTimeUpdate < 1000) return;
@@ -308,8 +449,10 @@
     if (data.type === "mfp:seek" && Number.isFinite(data.time)) {
       try { video.currentTime = data.time; } catch (error) {}
     } else if (data.type === "mfp:setSubtitle") {
-      var match = subtitles.find(function (item) { return (item.language || "") === data.language; });
-      if (match) { subtitleSelect.value = match.id; applySubtitle(); }
+      var match = data.id
+        ? subtitles.find(function (item) { return item.id === data.id; })
+        : subtitles.find(function (item) { return (item.language || "") === data.language; });
+      if (match) selectSubtitleById(match.id);
     } else if (data.type === "mfp:pause") {
       video.pause();
     } else if (data.type === "mfp:play") {
@@ -317,7 +460,6 @@
     }
   });
 
-  var media = session.media || {};
   title.textContent = media.type === "tv"
     ? "TV " + media.id + " • S" + (media.season || 1) + " E" + (media.episode || 1)
     : (media.id ? media.type + " • " + media.id : "MediaFlow Player");
@@ -327,8 +469,8 @@
     return;
   }
 
-  buildTracks();
-  fillSubtitles();
+  addCustomTracks(readCustomTracks(), false);
+  rebuildSubtitles();
   setOverlay("Sumber ditemukan. Menyiapkan video…", 100);
   playCandidate(0);
 })();

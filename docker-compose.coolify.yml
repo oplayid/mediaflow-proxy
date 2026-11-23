@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.9.1.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.9.1}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.9.2.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.9.2}
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -39,7 +39,7 @@ services:
       # SubDL through the proxy, so use a proxy with enough bandwidth. For a
       # narrower route, use transport_routes instead, for example:
       # TRANSPORT_CONFIG: '{"proxy_url":"http://user:pass@proxy:8080","all_proxy":true}'
-      # TRANSPORT_CONFIG: '{"transport_routes":[{"pattern":"*.example.com","proxy_url":"http://user:pass@proxy:8080"}]}'
+      # TRANSPORT_CONFIG: '{"proxy_url":"http://user:pass@proxy:8080","transport_routes":{"all://*.example.com":{"proxy":true}}}'
     depends_on:
       redis:
         condition: service_healthy

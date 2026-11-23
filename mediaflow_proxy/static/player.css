@@ -104,6 +104,11 @@ button:hover, select:hover { border-color: rgba(74, 222, 128, 0.5); }
 
 .spacer { flex: 1; }
 
+#subtitle-language { max-width: 72px; }
+#subtitle-upload-button { white-space: nowrap; }
+.subtitle-status { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.subtitle-status:not(:empty) { color: var(--accent); }
+
 .overlay, .error-box {
   position: absolute;
   inset: 0;
@@ -118,7 +123,7 @@ button:hover, select:hover { border-color: rgba(74, 222, 128, 0.5); }
   padding: 24px;
 }
 
-.overlay.hidden, .error-box.hidden { display: none; }
+.hidden { display: none; }
 
 .status { font-size: 14px; color: #e5e7eb; }
 .hint { font-size: 12px; color: var(--muted); max-width: 520px; }

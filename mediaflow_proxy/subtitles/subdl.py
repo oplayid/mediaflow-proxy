@@ -52,7 +52,7 @@ def srt_to_vtt(text: str) -> str:
     return "WEBVTT\n\n" + stripped + "\n"
 
 
-def _normalise_language(value: str) -> str:
+def normalise_language(value: str) -> str:
     cleaned = (value or "").strip().lower()
     names = {"indonesian": "id", "english": "en", "bahasa indonesia": "id"}
     if cleaned in names:
@@ -160,7 +160,7 @@ async def search(media_type: str, media_id: str, season: str | None, episode: st
             if not path or path in seen:
                 continue
             seen.add(path)
-            language = _normalise_language(str(file.get("language") or item.get("language") or item.get("lang") or "en"))
+            language = normalise_language(str(file.get("language") or item.get("language") or item.get("lang") or "en"))
             release = str(
                 file.get("release_name") or file.get("name") or item.get("release_name") or item.get("name") or "Subtitle"
             )[:60]

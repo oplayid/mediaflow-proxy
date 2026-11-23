@@ -23,6 +23,17 @@
       <label>Subtitle
         <select id="subtitle-select" aria-label="Subtitle"></select>
       </label>
+      <select id="subtitle-language" aria-label="Bahasa subtitle yang diunggah" title="Bahasa subtitle custom">
+        <option value="id">ID</option>
+        <option value="en">EN</option>
+        <option value="ja">JA</option>
+        <option value="ko">KO</option>
+        <option value="zh">ZH</option>
+        <option value="und">Lainnya</option>
+      </select>
+      <button type="button" id="subtitle-upload-button" title="Unggah subtitle .srt atau .vtt">Unggah Subtitle</button>
+      <input type="file" id="subtitle-file" class="hidden" accept=".srt,.vtt,text/vtt,application/x-subrip">
+      <span class="subtitle-status" id="subtitle-status" role="status" aria-live="polite"></span>
     </div>
 
     <div class="overlay" id="overlay">
