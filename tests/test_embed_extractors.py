@@ -472,7 +472,7 @@ async def test_vsembed_refreshes_missing_api_token():
 
 
 def _gated_vsembed_extractor():
-    """Player page with a Turnstile gate and no token until a browser solves it."""
+    """Player page with a Turnstile gate that cannot mint an API token here."""
     config = EMBED_HOSTS["VSEmbed"]
     extractor = GenericEmbedExtractor({}, config)
     embed_url = "https://stream.oplay.id/embed/tv/293610/1/4"
@@ -512,85 +512,19 @@ def _gated_vsembed_extractor():
         return responses[url]
 
     extractor._make_request = fake_request  # type: ignore[method-assign]
-    return extractor, embed_url, player_url, nested_url, destination
+    return extractor, embed_url
 
 
 @pytest.mark.asyncio
-async def test_vsembed_gated_uses_headless_fallback_when_enabled(monkeypatch):
-    from mediaflow_proxy.configs import settings
+async def test_vsembed_gated_fails_cleanly_with_transport_config_hint():
+    extractor, embed_url = _gated_vsembed_extractor()
 
-    extractor, embed_url, player_url, nested_url, destination = _gated_vsembed_extractor()
-    monkeypatch.setattr(settings, "enable_headless_fallback", True)
-    calls = []
-
-    async def fake_resolve(url, *, referer, timeout, cache_key):
-        calls.append((url, referer, cache_key))
-        return {
-            "streamBase": "https://vsapi.example/api.php?type=tv&tmdb=293610",
-            "apiToken": "tok",
-        }
-
-    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
-
-    result = await extractor.extract(embed_url)
-
-    assert result["destination_url"] == destination
-    assert len(calls) == 1
-    assert calls[0][0] == player_url
-    assert calls[0][1] == nested_url
-    assert "293610:1:4" in calls[0][2]
-
-
-@pytest.mark.asyncio
-async def test_vsembed_gated_fails_cleanly_when_fallback_disabled(monkeypatch):
-    from mediaflow_proxy.configs import settings
-
-    extractor, embed_url, *_ = _gated_vsembed_extractor()
-    monkeypatch.setattr(settings, "enable_headless_fallback", False)
-    calls = []
-
-    async def fake_resolve(*args, **kwargs):
-        calls.append(args)
-
-    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
-
-    with pytest.raises(ExtractorError, match="playback gated"):
-        await extractor.extract(embed_url)
-    assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_vsembed_gated_fails_cleanly_when_fallback_has_no_token(monkeypatch):
-    from mediaflow_proxy.configs import settings
-
-    extractor, embed_url, *_ = _gated_vsembed_extractor()
-    monkeypatch.setattr(settings, "enable_headless_fallback", True)
-
-    async def fake_resolve(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
-
-    with pytest.raises(ExtractorError, match="playback gated"):
+    with pytest.raises(ExtractorError, match="playback gated.*TRANSPORT_CONFIG"):
         await extractor.extract(embed_url)
 
 
 @pytest.mark.asyncio
-async def test_headless_helper_is_noop_when_disabled(monkeypatch):
-    from mediaflow_proxy.configs import settings
-    from mediaflow_proxy.utils import headless_browser
-
-    monkeypatch.setattr(settings, "enable_headless_fallback", False)
-    assert (
-        await headless_browser.resolve_gated_config(
-            "https://vsplayer.example/player.html", referer="https://vsplayer.example/"
-        )
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_vsembed_cast_playlist_falls_back_to_browser_sandbox(monkeypatch):
+async def test_vsembed_cast_playlist_uses_challenge_sandbox(monkeypatch):
     config = EMBED_HOSTS["VSEmbed"]
     extractor = GenericEmbedExtractor({}, config)
     embed_url = "https://stream.oplay.id/embed/movie/550"
@@ -634,11 +568,11 @@ async def test_vsembed_cast_playlist_falls_back_to_browser_sandbox(monkeypatch):
         },
     )
 
-    async def fake_browser_fetch(url: str, referer: str):
+    async def fake_challenge_fetch(url: str, referer: str):
         assert url == tokenized_url
         return "#EXTM3U\n#EXT-X-VERSION:3\n"
 
-    monkeypatch.setattr(extractor, "_browser_fetch_playlist", fake_browser_fetch)
+    monkeypatch.setattr(extractor, "_challenge_fetch_playlist", fake_challenge_fetch)
 
     result = await extractor.extract(embed_url)
 
@@ -689,10 +623,10 @@ async def test_vsembed_cast_playlist_plays_with_generate_php_token(monkeypatch):
         },
     )
 
-    async def no_browser_fetch(*_args):
-        raise AssertionError("browser sandbox should not be used for a playable playlist")
+    async def no_challenge_fetch(*_args):
+        raise AssertionError("challenge sandbox should not be used for a playable playlist")
 
-    monkeypatch.setattr(extractor, "_browser_fetch_playlist", no_browser_fetch)
+    monkeypatch.setattr(extractor, "_challenge_fetch_playlist", no_challenge_fetch)
 
     result = await extractor.extract(embed_url)
 

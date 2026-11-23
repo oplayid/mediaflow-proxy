@@ -2,7 +2,7 @@
 
 This guide deploys MediaFlow Proxy on [Coolify](https://coolify.io/) using a multi-arch Docker image built by GitHub Actions and published to GitHub Container Registry (GHCR).
 
-The image already runs Gunicorn with Uvicorn workers on port `8888`, as a non-root user, with `ffmpeg` and a bundled headless Chromium installed. Chromium is only launched if you opt into the gated-player fallback below. No Dockerfile changes are needed.
+The image already runs Gunicorn with Uvicorn workers on port `8888`, as a non-root user, with `ffmpeg` installed. No Dockerfile changes are needed.
 
 ## 1. Prepare your fork
 
@@ -33,8 +33,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
 
     | `REDIS_URL` | `redis://redis:6379` | Keep enabled. Shares the transcode registry and caches across workers. |
     | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Adds SubDL alternatives only when the winning host has no Indonesian subtitle. |
-    | `ENABLE_HEADLESS_FALLBACK` | `true` | Optional. Last-resort Chromium fallback for Turnstile-gated VSEmbed/VidSrcTo pages. Off by default. |
-    | `HEADLESS_FALLBACK_TIMEOUT` | `15` | Optional. Seconds allowed per gated player page. |
+    | `TRANSPORT_CONFIG` | see below | Optional. Routes upstream requests through a clean egress proxy when a host is Turnstile-gated. |
 
 3. Set your domain and enable HTTPS in Coolify as usual; Traefik routes to port `8888`.
 4. The compose file defines a healthcheck on `GET /health` and a Redis 7 service with a persistent volume. **Keep Redis enabled.** It shares the transcode job registry, player/extractor caches, rate limits and HLS/DASH prebuffer locks across Gunicorn workers. Without `REDIS_URL`, job metadata lives only in each worker's memory and a transcode URL created by one worker can return 404 when another worker serves it. Redis failures are fail-open, but a missing Redis is not safe for multi-worker playback.
@@ -52,7 +51,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
 - **Worker count**: with Redis connected, the default 4 Gunicorn workers are safe for playback and transcoding. If CPU is limited, set `WEB_CONCURRENCY: "2"` in Coolify. Change this value only by redeploying — Gunicorn reads it once at startup.
 - **Telegram interactive login** (`/proxy/telegram/session/*`) still keeps pending sessions in process memory. Set `WEB_CONCURRENCY: "1"` for that flow, or skip interactive login by supplying `TELEGRAM_SESSION_STRING`.
 - **VSEmbed / VidSrcTo**: the upstream player can render before minting its short-lived `apiToken`. The extractor mirrors the browser's single refresh fetch when `apiTokenRefresh` is present; if the upstream still refuses to mint a token, that host fails cleanly and the next host in `HOST_ORDER` is selected.
-- **Gated playback fallback**: when a page still has no `apiToken` and carries `turnstile` / `cstCaptcha`, set `ENABLE_HEADLESS_FALLBACK=true`. The image bundles Chromium; mfp opens the player page once while creating the session, waits up to `HEADLESS_FALLBACK_TIMEOUT` (15s by default) for the token, then continues through the normal stream API. It is serialized, briefly cached, and never used as a failover after playback starts. Managed challenges may pass automatically; interactive image challenges usually will not — for those, use a clean egress IP via `TRANSPORT_CONFIG` instead. Look for `playback gated` and either `gated config resolved via headless fallback` or a clean `playback gated (human verification)` error in the logs.
+- **Gated playback (Turnstile)**: mfp does not solve browser challenges. If a VSEmbed/VidSrcTo page has no `apiToken` and carries `turnstile` / `cstCaptcha`, that host fails cleanly during session creation and the next host in `HOST_ORDER` is selected. To make gated hosts usable, route their upstream traffic through a clean egress IP. The simplest option is `TRANSPORT_CONFIG: '{"proxy_url":"http://user:pass@proxy:8080","all_proxy":true}'`; note that `all_proxy` sends media segments, extractor requests and SubDL through the proxy, so use a proxy with enough bandwidth. To limit proxy use to specific hosts, use targeted routes, for example `TRANSPORT_CONFIG: '{"transport_routes":[{"pattern":"*.example.com","proxy_url":"http://user:pass@proxy:8080"}]}'`. A clean IP reduces challenges but does not guarantee bypass when the proxy IP reputation is poor; a residential/mobile proxy may still be required. Look for `playback gated (human verification)` in the logs.
 - **Docker Image resource (not Compose)**: the `redis` service in `docker-compose.coolify.yml` is not created in that deployment type. Create a separate Coolify Redis database in the same project and set `REDIS_URL` to its internal URL (for example `redis://mfp-redis:6379`). Keep `WEB_CONCURRENCY=1` until the startup log shows `Redis connected`, then raise it to 2.
 - **`docker-compose.yml` at the repository root is not for forks**: it builds from `https://github.com/mhdzumair/mediaflow-proxy.git#main`. Use `docker-compose.coolify.yml` instead.
 - The PyPI publishing and Gemini release-notes jobs are disabled by default in this fork. To enable them, set the repository variables `PUBLISH_TO_PYPI` / `GENERATE_RELEASE_NOTES` to `true` and add the corresponding secrets (`PYPI_API_TOKEN`, `GEMINI_API_KEY`).

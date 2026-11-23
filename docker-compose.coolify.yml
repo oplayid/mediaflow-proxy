@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.9.0.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.9.0}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.9.1.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.9.1}
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -34,12 +34,12 @@ services:
       # DISABLE_DOCS: "false"
       # DISABLE_SPEEDTEST: "false"
       # PUBLIC_IP: "1.2.3.4"
+      # For Turnstile-gated VSEmbed/VidSrcTo hosts, route upstream traffic through
+      # a clean egress IP. all_proxy sends media segments, extractor requests and
+      # SubDL through the proxy, so use a proxy with enough bandwidth. For a
+      # narrower route, use transport_routes instead, for example:
       # TRANSPORT_CONFIG: '{"proxy_url":"http://user:pass@proxy:8080","all_proxy":true}'
-      # Last-resort Chromium fallback for Turnstile-gated VSEmbed/VidSrcTo pages.
-      # Off by default; only used while creating a player session (never as a
-      # failover after playback starts). The image already bundles Chromium.
-      # ENABLE_HEADLESS_FALLBACK: "true"
-      # HEADLESS_FALLBACK_TIMEOUT: "15"
+      # TRANSPORT_CONFIG: '{"transport_routes":[{"pattern":"*.example.com","proxy_url":"http://user:pass@proxy:8080"}]}'
     depends_on:
       redis:
         condition: service_healthy

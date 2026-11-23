@@ -147,12 +147,6 @@ class Settings(BaseSettings):
     player_transcode_idle_ttl: int = 300
     player_transcode_max_jobs: int = 4
     player_transcode_startup_timeout: int = 30
-    # Optional last-resort headless Chromium fallback. Only used while creating
-    # a player session, when a gated VSEmbed/VidSrcTo page still has no apiToken
-    # after the normal refresh fetch. Disabled by default because it needs the
-    # Chromium binary in the image and costs CPU/latency per resolve.
-    enable_headless_fallback: bool = False
-    headless_fallback_timeout: int = 15  # seconds per gated player page
     # SubDL is an optional external subtitle source inside the mfp player. Set
     # SUBDL_API_KEY in the deployment environment; it is never sent to browsers.
     subdl_api_key: str = ""

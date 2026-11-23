@@ -21,7 +21,6 @@ from mediaflow_proxy.extractors.embed_hosts import (
     is_public_http_url,
     parse_media_path,
 )
-from mediaflow_proxy.configs import settings
 from mediaflow_proxy.extractors.vidlink_token import generate_adv_token
 from mediaflow_proxy.gateway.ad_filter import (
     AdFilterReport,
@@ -29,13 +28,13 @@ from mediaflow_proxy.gateway.ad_filter import (
     filter_extractor_result,
     sanitize_html,
 )
-from mediaflow_proxy.utils.headless_browser import resolve_gated_config
 from mediaflow_proxy.utils.packed import eval_solver
 
 logger = logging.getLogger(__name__)
 
-# A player carrying one of these keys but no apiToken needs a browser challenge
-# to mint the token. curl_cffi alone cannot produce it.
+# A player carrying one of these keys but no apiToken is behind human
+# verification. mfp does not solve challenges: route this traffic through a
+# clean egress IP with TRANSPORT_CONFIG.
 _GATE_KEYS = ("turnstile", "turnstileSiteKey", "turnstileVerify", "cstCaptcha")
 
 # Only locate the assignment; the JSON object is read with balanced braces so
@@ -440,8 +439,8 @@ class GenericEmbedExtractor(BaseExtractor):
         self.mediaflow_endpoint = config.endpoint
         self._ad_report = AdFilterReport()
 
-    async def _browser_fetch_playlist(self, url: str, referer: str) -> str | None:
-        """Fetch a challenge-protected playlist in an isolated browser context.
+    async def _challenge_fetch_playlist(self, url: str, referer: str) -> str | None:
+        """Fetch a challenge-protected playlist in an isolated curl_cffi session.
 
         This is a tightly scoped sandbox: a fresh curl_cffi session with a real
         Chrome TLS fingerprint, no shared cookies, and media-only validation.
@@ -451,7 +450,7 @@ class GenericEmbedExtractor(BaseExtractor):
         try:
             from curl_cffi.requests import AsyncSession
         except ImportError:
-            logger.debug("[%s] curl_cffi unavailable; browser probe skipped", self.config.canonical)
+            logger.debug("[%s] curl_cffi unavailable; challenge probe skipped", self.config.canonical)
             return None
 
         proxy = self._get_proxy(url)
@@ -472,13 +471,13 @@ class GenericEmbedExtractor(BaseExtractor):
                 if response.status_code == 200 and "#EXTM3U" in text:
                     return text
                 logger.debug(
-                    "[%s] browser probe returned no playlist (status=%s) for %s",
+                    "[%s] challenge probe returned no playlist (status=%s) for %s",
                     self.config.canonical,
                     response.status_code,
                     url,
                 )
         except Exception as exc:
-            logger.debug("[%s] browser probe failed for %s: %s", self.config.canonical, url, exc)
+            logger.debug("[%s] challenge probe failed for %s: %s", self.config.canonical, url, exc)
         return None
 
     async def _tokenize_cast_playlist(
@@ -831,50 +830,6 @@ class GenericEmbedExtractor(BaseExtractor):
         api_url, api_token = _credentials(player_cfg)
         gate_markers = [key for key in _GATE_KEYS if player_cfg.get(key)]
 
-        if (
-            (not api_url or not api_token)
-            and gate_markers
-            and settings.enable_headless_fallback
-        ):
-            # The page has a gate (Turnstile / cstCaptcha) and no token: the
-            # browser would mint it after solving a challenge. This is the only
-            # place a headless browser is allowed into the flow, and it is
-            # opt-in. It is never used as a post-playback failover.
-            logger.info(
-                "[%s] playback gated (%s); trying optional headless fallback",
-                self.config.canonical,
-                ",".join(gate_markers),
-            )
-            try:
-                extra = await resolve_gated_config(
-                    player_url,
-                    referer=nested_url,
-                    timeout=settings.headless_fallback_timeout,
-                    cache_key=(
-                        f"{self.config.canonical}:{media_type}:{media_id}:"
-                        f"{season}:{episode}:{player_url}"
-                    ),
-                )
-                if extra:
-                    player_cfg.update(extra)
-                    api_url, api_token = _credentials(player_cfg)
-                    if api_url and api_token:
-                        stream_base = (
-                            player_cfg.get("streamBase")
-                            or player_cfg.get("stream_base")
-                            or ""
-                        )
-                        logger.info(
-                            "[%s] gated config resolved via headless fallback",
-                            self.config.canonical,
-                        )
-            except Exception as exc:
-                logger.debug(
-                    "[%s] headless fallback unavailable: %s",
-                    self.config.canonical,
-                    exc,
-                )
-
         if not api_url or not api_token:
             logger.info(
                 "[%s] stream API config missing; keys=%s; gate=%s",
@@ -883,13 +838,9 @@ class GenericEmbedExtractor(BaseExtractor):
                 gate_markers or None,
             )
             if gate_markers:
-                hint = (
-                    "headless fallback could not obtain a token; use a clean egress IP"
-                    if settings.enable_headless_fallback
-                    else "set ENABLE_HEADLESS_FALLBACK=true or use a clean egress IP"
-                )
                 raise ExtractorError(
-                    f"{self.config.canonical}: playback gated (human verification); {hint}"
+                    f"{self.config.canonical}: playback gated (human verification); "
+                    "use a clean egress IP via TRANSPORT_CONFIG"
                 )
             raise ExtractorError(f"{self.config.canonical}: stream API config missing")
 
@@ -933,7 +884,7 @@ class GenericEmbedExtractor(BaseExtractor):
         stream_urls = data.get("stream_urls") or []
         cast_urls = data.get("cast_urls") or []
         destination: Optional[str] = None
-        browser_used = False
+        challenge_used = False
 
         if isinstance(stream_urls, list):
             destination = next(
@@ -971,9 +922,9 @@ class GenericEmbedExtractor(BaseExtractor):
                 except Exception:
                     pass
 
-                if await self._browser_fetch_playlist(candidate, player_url):
+                if await self._challenge_fetch_playlist(candidate, player_url):
                     destination = candidate
-                    browser_used = True
+                    challenge_used = True
                     break
 
         if not destination:
@@ -987,7 +938,7 @@ class GenericEmbedExtractor(BaseExtractor):
         logger.info("[%s] resolved %s -> %s", self.config.canonical, url, destination)
         subtitles = _collect_api_subtitles(stream_payload) + _collect_api_subtitles(data)
         result = self._result(destination, player_url, subtitles=subtitles)
-        if browser_used:
+        if challenge_used:
             result["sandbox_used"] = True
         return result
 
