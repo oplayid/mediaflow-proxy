@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.5.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.5}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.6.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.6}
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -13,15 +13,16 @@ services:
       API_PASSWORD: ${API_PASSWORD:?API_PASSWORD must be set in Coolify}
       # Optional: enables /trailer/... YouTube trailer endpoints (TMDB v3 key).
       TMDB_API_KEY: ${TMDB_API_KEY:-}
+      # Optional: enables SubDL subtitle alternatives inside the mfp player.
+      # Set this in Coolify's environment variables section; never commit the key.
+      SUBDL_API_KEY: ${SUBDL_API_KEY:-}
       # Coolify sits behind Traefik; without this the client IP is read as 127.0.0.1
       # and IP-bound encrypted URLs will fail.
       FORWARDED_ALLOW_IPS: "*"
       # Pin the bind address so a platform-injected PORT cannot change it.
       GUNICORN_BIND: "0.0.0.0:8888"
       REDIS_URL: redis://redis:6379
-      # First-success order. VidCore is primary; VidLink is last because DASH +
-      # HEVC transcoding is the most fragile path. Coolify may override this.
-      PLAYER_HOSTS: ${PLAYER_HOSTS:-VidCore,VSEmbed,VidSrcTo,VidLink}
+      # Host order lives only in HOST_ORDER (VidCore, VSEmbed, VidSrcTo, VidLink).
       # Optional overrides — uncomment and set in Coolify as needed:
       # WEB_CONCURRENCY: "1"          # use 1 if using Telegram interactive login
       # ENABLE_TRANSCODE: "false"

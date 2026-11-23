@@ -55,7 +55,6 @@ def session_to_dict(
     subtitles: list[dict],
     audit: dict,
     generated_at: float,
-    start_time: float = 0.0,
 ) -> dict:
     """Build the JSON object injected into the player page.
 
@@ -72,6 +71,5 @@ def session_to_dict(
         "candidates": [candidate.to_dict() for candidate in candidates],
         "subtitles": subtitles,
         "audit": audit,
-        "start_time": max(0.0, float(start_time or 0.0)),
         "generated_at": generated_at,
     }

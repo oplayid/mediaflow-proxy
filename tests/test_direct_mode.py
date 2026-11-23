@@ -1,16 +1,14 @@
-"""Offline tests for the output-only JSON gateway."""
+"""Offline tests for the identity-only JSON gateway."""
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
-import time
 
 import pytest
 from starlette.requests import Request
 
-from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS
+from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS, HOST_ORDER
 
 
 def _request(path: str = "/gateway/resolve/tv/94997/1/1", query: str = "") -> Request:
@@ -28,45 +26,6 @@ def _request(path: str = "/gateway/resolve/tv/94997/1/1", query: str = "") -> Re
     )
 
 
-def _result() -> dict:
-    return {
-        "destination_url": "https://cdn.example/hls/master.m3u8?e=9999999999",
-        "request_headers": {"Referer": "https://provider.example/"},
-        "sources": [
-            {"id": "auto", "label": "Auto", "url": "https://cdn.example/hls/master.m3u8"}
-        ],
-        "subtitles": [
-            {
-                "id": "sub-id-0",
-                "label": "Indonesian",
-                "language": "id",
-                "url": "https://cdn.example/subs/id.vtt",
-            }
-        ],
-        "capabilities": {"subtitles_from_api": True},
-        "expiration": 120,
-    }
-
-
-@pytest.fixture(autouse=True)
-def _clean_caches(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    embed_routes._resolved_cache.clear()
-    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore"])
-    # Signing needs a Starlette application scope for url_for(); this suite is
-    # about gateway/cache behaviour, so keep the signed URL deterministic.
-    monkeypatch.setattr(
-        embed_routes,
-        "_sign_asset_url",
-        lambda *_args, **_kwargs: "https://mfp.example/proxy/hls/token.m3u8",
-    )
-    yield
-    embed_routes._negative_cache.clear()
-    embed_routes._resolved_cache.clear()
-
-
 async def _resolve(request: Request, media_type="tv", media_id="94997", season="1", episode="1"):
     from mediaflow_proxy.routes import embed as embed_routes
 
@@ -77,164 +36,65 @@ async def _resolve(request: Request, media_type="tv", media_id="94997", season="
 
 
 @pytest.mark.asyncio
-async def test_gateway_extracts_once_then_reuses_cache(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    calls: list[str] = []
-
-    async def fake_extract(request, config, proxy_headers, media_type, media_id, season, episode):
-        calls.append(config.canonical)
-        return _result()
-
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
-    request = _request()
-
-    first, first_body = await _resolve(request)
-    second, second_body = await _resolve(request)
-
-    assert calls == ["VidCore"]
-    assert first.status_code == 200 == second.status_code
-    assert first_body == second_body
-    assert first_body["stream_url"] == "https://mfp.example/proxy/hls/token.m3u8"
-    assert first_body["media"] == {"type": "tv", "id": "94997", "season": "1", "episode": "1"}
-    assert first_body["subtitles"][0]["language"] == "id"
-    assert "cdn.example" not in second.body.decode()
-    assert "vidcore.org" not in second.body.decode()
-
-
-@pytest.mark.asyncio
-async def test_retry_forces_a_fresh_resolution(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    calls: list[str] = []
-
-    async def fake_extract(request, config, proxy_headers, media_type, media_id, season, episode):
-        calls.append(config.canonical)
-        return _result()
-
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
-
-    await _resolve(_request())
-    await _resolve(_request(query="retry=1"))
-
-    assert calls == ["VidCore", "VidCore"]
-
-
-@pytest.mark.asyncio
-async def test_season_and_episode_have_separate_cache_keys(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    calls: list[str] = []
-
-    async def fake_extract(request, config, proxy_headers, media_type, media_id, season, episode):
-        calls.append(f"{season}/{episode}")
-        return _result()
-
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
-
-    await _resolve(_request(), episode="1")
-    await _resolve(_request(), episode="2")
-    await _resolve(_request(), episode="1")
-
-    assert calls == ["1/1", "1/2"]
-
-
-@pytest.mark.asyncio
-async def test_gateway_never_exposes_api_password(monkeypatch):
+async def test_gateway_returns_only_player_url_and_media():
     from mediaflow_proxy.configs import settings
-    from mediaflow_proxy.routes import embed as embed_routes
 
-    monkeypatch.setattr(settings, "api_password", "super-secret")
-    monkeypatch.setattr(
-        embed_routes,
-        "_sign_asset_url",
-        lambda *_args, **_kwargs: "https://mfp.example/proxy/hls/encrypted-token",
-    )
+    before = settings.api_password
+    settings.api_password = "super-secret"
+    try:
+        response, body = await _resolve(_request())
+    finally:
+        settings.api_password = before
 
-    async def fake_extract(*_args, **_kwargs):
-        return _result()
-
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
-    _, body = await _resolve(_request())
-
+    assert response.status_code == 200
+    assert set(body) == {"player_url", "media"}
+    assert body["media"] == {"type": "tv", "id": "94997", "season": "1", "episode": "1"}
+    assert body["player_url"].startswith("https://mfp.example/_token_")
+    assert "/player/tv/94997/1/1" in body["player_url"]
     assert "api_password" not in body
-    assert "super-secret" not in str(body)
-    assert body["audit"]["hls_filter_enabled"] is True
-    assert body["expires_in"] > 0
-
-
-def test_error_reason_maps_upstream_404_to_content_unavailable():
-    from mediaflow_proxy.routes.embed import _error_reason
-
-    assert (
-        _error_reason(Exception("HTTP error 404 while requesting https://vidspark.to/api/x"))
-        == "content_unavailable"
-    )
-    assert _error_reason(Exception("VidCore: content_unavailable: Episode not found")) == "content_unavailable"
-    assert _error_reason(Exception("HTTP error 403 while requesting https://vsapi.example")) == "token_invalid"
+    assert "super-secret" not in response.body.decode()
+    assert "cdn.example" not in response.body.decode()
 
 
 @pytest.mark.asyncio
-async def test_sandbox_usage_is_reported_in_audit(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
+async def test_gateway_never_contacts_a_host(monkeypatch):
+    import mediaflow_proxy.player.simulator as simulator
 
-    async def fake_extract(*_args, **_kwargs):
-        result = _result()
-        result["sandbox_used"] = True
-        return result
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("gateway must not resolve hosts")
 
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
+    monkeypatch.setattr(simulator, "_resolve_host", forbidden)
     _, body = await _resolve(_request())
-
-    assert body["audit"]["sandbox_used"] is True
+    assert set(body) == {"player_url", "media"}
 
 
 @pytest.mark.asyncio
-async def test_server_query_cannot_select_a_provider(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
+async def test_gateway_rejects_host_query_parameter():
+    from fastapi import HTTPException
 
-    chosen: list[str] = []
-
-    async def fake_extract(request, config, *_args, **_kwargs):
-        if config.canonical != "VidCore":
-            await asyncio.sleep(0.05)
-        chosen.append(config.canonical)
-        return _result()
-
-    monkeypatch.setattr(embed_routes, "_extract", fake_extract)
-    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore", "VSEmbed"])
-
-    await _resolve(_request(query="server=vsembed&mode=relay"))
-
-    assert chosen == ["VidCore"]
+    with pytest.raises(HTTPException) as exc:
+        await _resolve(_request(query="host=vidlink"))
+    assert exc.value.status_code == 400
+    assert "host selection" in str(exc.value.detail)
 
 
-def test_gateway_metadata_uses_long_token_expiration(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
+@pytest.mark.asyncio
+async def test_retry_flag_is_signed_into_player_token(monkeypatch):
+    from mediaflow_proxy.configs import settings
+    from mediaflow_proxy.utils.crypto_utils import EncryptionHandler
 
-    seen: list[int | None] = []
-
-    def fake_sign(request, result, proxy_headers, destination_url, **kwargs):
-        seen.append(kwargs.get("expiration"))
-        return "https://mfp.example/proxy/hls/manifest.m3u8"
-
-    monkeypatch.setattr(embed_routes, "_sign_asset_url", fake_sign)
-    embed_routes._signed_metadata(_request(), _result(), None, expiration=7200)
-
-    assert seen == [7200, 7200]
-
-
-def test_upstream_expiry_is_respected_and_capped():
-    from mediaflow_proxy.routes.embed import RESOLVE_CACHE_TTL, _upstream_ttl
-
-    soon = int(time.time()) + 1000
-    ttl = _upstream_ttl({"destination_url": f"https://cdn.example/master.m3u8?e={soon}"})
-    assert 0 < ttl <= 1000
-    assert _upstream_ttl({"destination_url": "https://cdn.example/master.m3u8"}) == RESOLVE_CACHE_TTL
+    monkeypatch.setattr(settings, "api_password", "unit-secret")
+    _, body = await _resolve(_request(query="retry=1"))
+    token = body["player_url"].split("/_token_", 1)[1].split("/player/", 1)[0]
+    payload = EncryptionHandler("unit-secret").decrypt_data(token, None)
+    assert payload["refresh"] is True
+    assert payload["type"] == "tv"
+    assert payload["id"] == "94997"
 
 
-def test_gateway_routes_are_registered_and_legacy_endpoints_are_gone():
+def test_gateway_routes_are_registered_and_cache_endpoint_is_gone():
     from mediaflow_proxy.main import app
+    from mediaflow_proxy.routes import embed as embed_routes
 
     paths = [getattr(route, "path", "") for route in app.routes]
     for path in (
@@ -242,19 +102,14 @@ def test_gateway_routes_are_registered_and_legacy_endpoints_are_gone():
         "/gateway/resolve/tv/{media_id}",
         "/gateway/resolve/tv/{media_id}/{season}",
         "/gateway/resolve/tv/{media_id}/{season}/{episode}",
-        "/gateway/cache",
     ):
         assert path in paths
-    for path in (
-        "/embed/relay",
-        "/embed/relay/hosts",
-        "/embed/servers",
-        "/embed/direct/{slug}/tv/{media_id}/{season}/{episode}",
-        "/embed/{slug}/tv/{media_id}/{season}/{episode}",
-    ):
-        assert path not in paths
+    assert "/gateway/cache" not in paths
+    for removed in ("_probe_gateway", "_resolve_gateway", "_resolved_cache", "_negative_cache"):
+        assert not hasattr(embed_routes, removed)
     assert importlib.util.find_spec("mediaflow_proxy.routes.relay") is None
     assert EMBED_HOSTS["VidCore"].slug == "vidcore"
+    assert HOST_ORDER[0] == "VidCore"
 
 
 def test_tv_params_are_normalised_for_streamflix_ids():

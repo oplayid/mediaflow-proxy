@@ -1,7 +1,8 @@
 """Iframe player endpoints served by MediaFlow itself.
 
 StreamFlix only embeds the opaque ``player_url`` returned by the gateway. All
-provider URLs, CloudFront cookies and proxy tokens stay on this origin.
+provider URLs, CloudFront cookies and proxy tokens stay on this origin, and all
+video/quality/subtitle settings belong to this player.
 """
 
 from __future__ import annotations
@@ -10,11 +11,12 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.player import simulate_session
 from mediaflow_proxy.player.transcoder import serve_transcode_file
+from mediaflow_proxy.subtitles.subdl import load_vtt
 
 player_router = APIRouter()
 transcode_router = APIRouter()
@@ -57,11 +59,22 @@ def _security_headers() -> dict[str, str]:
     }
 
 
+@player_router.get("/subtitle/{filename}", name="player_subtitle")
+async def player_subtitle(request: Request, filename: str):
+    """Serve a signed, server-side converted SubDL WebVTT track."""
+    key = request.query_params.get("sub")
+    content = await load_vtt(str(key or ""))
+    if content is None:
+        raise HTTPException(status_code=404, detail="Subtitle not found")
+    return Response(
+        content=content,
+        media_type="text/vtt; charset=utf-8",
+        headers=_security_headers(),
+    )
+
+
 @player_router.get("/{media_type}/{media_id}/{season}/{episode}", name="player_page")
 @player_router.get("/{media_type}/{media_id}", name="player_page_short")
-@player_router.get("/{media_type}/{media_id}/{season}/{episode}/retry", name="player_page_retry")
-@player_router.get("/{media_type}/{media_id}/{season}/retry", name="player_page_season_retry")
-@player_router.get("/{media_type}/{media_id}/retry", name="player_page_short_retry")
 async def player_page(
     request: Request,
     media_type: str,
@@ -69,7 +82,7 @@ async def player_page(
     season: str | None = None,
     episode: str | None = None,
 ):
-    """Render the smart player after a bounded multi-host simulation."""
+    """Render the player after one bounded first-success host check."""
     media_type = (media_type or "").lower()
     if media_type not in _VALID_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported media type")
@@ -81,19 +94,14 @@ async def player_page(
     if token_id and str(token_id) != str(media_id):
         raise HTTPException(status_code=400, detail="Player token media id mismatch")
 
-    is_retry = request.url.path.rstrip("/").endswith("/retry") or request.query_params.get("retry") is True
-    try:
-        start_time = float(request.query_params.get("t") or 0)
-    except (TypeError, ValueError):
-        start_time = 0.0
+    refresh_value = request.query_params.get("refresh")
+    refresh = refresh_value is True or str(refresh_value or "").lower() in ("1", "true")
     session = await simulate_session(
         request,
         media_type,
         media_id,
         season or request.query_params.get("s"),
         episode or request.query_params.get("e"),
-        retry=is_retry,
-        exclude=request.query_params.get("exclude"),
-        start_time=start_time,
+        refresh=refresh,
     )
     return HTMLResponse(_render_player(session), headers=_security_headers())

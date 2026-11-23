@@ -134,8 +134,7 @@ class Settings(BaseSettings):
 
     # Smart player settings. The player is served by MediaFlow itself and
     # embedded by StreamFlix; StreamFlix never sees provider/proxy URLs.
-    player_hosts: str = ""  # Comma-separated canonical hosts. Empty = all known embed hosts.
-    player_simulation_budget: float = 10.0  # Max seconds spent scoring hosts before playback.
+    player_simulation_budget: float = 10.0  # Max seconds spent checking hosts before playback.
     player_cache_ttl: int = 600  # Seconds a simulated session is reused across workers.
     player_frame_ancestors: str = "https://movie.oplay.id"  # CSP frame-ancestors for the iframe.
     # HEVC browsers/TV boxes often cannot decode hvc1/hev1. Transcode to H.264.
@@ -148,6 +147,9 @@ class Settings(BaseSettings):
     player_transcode_idle_ttl: int = 300
     player_transcode_max_jobs: int = 4
     player_transcode_startup_timeout: int = 30
+    # SubDL is an optional external subtitle source inside the mfp player. Set
+    # SUBDL_API_KEY in the deployment environment; it is never sent to browsers.
+    subdl_api_key: str = ""
 
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.

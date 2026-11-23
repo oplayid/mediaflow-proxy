@@ -231,14 +231,15 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
     ]
 }
 
-# The gateway resolves these hosts in failover order. Historical hosts stay in
-# the registry for backwards-compatible lookups, but they are never probed by
-# the StreamFlix gateway.
-AUTO_HOST_ORDER: Tuple[str, ...] = (
+# Single source of truth for the player's first-success host order. The gateway
+# never probes hosts; the player walks this list once when the iframe mounts,
+# skips failures and stops at the first host with a playable media URL.
+# Historical hosts stay in the registry for backwards-compatible lookups.
+HOST_ORDER: Tuple[str, ...] = (
     "VidCore",
     "VSEmbed",
-    "VidLink",
     "VidSrcTo",
+    "VidLink",
 )
 
 # Every lower-case spelling accepted as ``host`` / embed slug.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from urllib.parse import parse_qs, urlparse
 
@@ -11,7 +10,7 @@ from starlette.requests import Request
 
 from mediaflow_proxy.extractors.base import HttpResponse
 from mediaflow_proxy.extractors.embed_hosts import (
-    AUTO_HOST_ORDER,
+    HOST_ORDER,
     EMBED_HOSTS,
     VIDSPARK_API_BASE,
     anime_variant_candidates,
@@ -53,10 +52,13 @@ def test_vidspark_api_base_includes_v1():
     assert VIDSPARK_API_BASE == "https://vidspark.to/api/vidora/v1"
 
 
-def test_auto_host_order_uses_all_supported_hosts():
-    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed", "VidLink", "VidSrcTo")
-    assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
-    assert set(AUTO_HOST_ORDER) <= set(EMBED_HOSTS)
+def test_host_order_is_the_single_first_success_order():
+    from mediaflow_proxy.player.simulator import host_configs
+
+    assert HOST_ORDER == ("VidCore", "VSEmbed", "VidSrcTo", "VidLink")
+    assert len(HOST_ORDER) == len(set(HOST_ORDER))
+    assert set(HOST_ORDER) <= set(EMBED_HOSTS)
+    assert [config.canonical for config in host_configs()] == list(HOST_ORDER)
 
 
 def test_gateway_does_not_serve_a_player_or_provider_registry():
@@ -572,7 +574,7 @@ def test_vidlink_is_a_resolvable_auto_host():
     assert config.slug == "vidlink"
     assert config.flow == "vidlink_api"
     assert config.endpoint == "proxy_stream_endpoint"
-    assert "VidLink" in AUTO_HOST_ORDER
+    assert "VidLink" in HOST_ORDER
 
 
 def test_vidlink_embed_url_templates():
@@ -930,126 +932,3 @@ async def test_generic_flow_skips_ad_script_and_uses_clean_stream():
 
     assert result["destination_url"] == destination
     assert result["ad_filter"]["sanitized_scripts"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Gateway auto selection / failover
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_gateway_auto_uses_first_healthy_host(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    embed_routes._resolved_cache.clear()
-    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore", "VSEmbed"])
-    probed: list[str] = []
-
-    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
-        probed.append(config.canonical)
-        if config.canonical == "VidCore":
-            await asyncio.sleep(0.01)
-            return config, {"stream_url": "stream", "audit": {}}, None
-        await asyncio.sleep(0.5)
-        return config, None, f"{config.canonical}: slow"
-
-    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
-    payload = await embed_routes._resolve_gateway(
-        _embed_request(), "tv", "tv-1399", "1", "1"
-    )
-
-    assert payload["stream_url"] == "stream"
-    assert probed[0] == "VidCore"
-
-
-@pytest.mark.asyncio
-async def test_gateway_failure_raises_without_rendering_a_player(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore"])
-
-    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
-        return config, None, f"{config.canonical}: episode unavailable"
-
-    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
-
-    with pytest.raises(embed_routes.EmbedUnavailable, match="episode unavailable"):
-        await embed_routes._resolve_gateway(
-            _embed_request(), "tv", "94997", "1", "1"
-        )
-
-
-@pytest.mark.asyncio
-async def test_gateway_retry_clears_negative_cache(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    monkeypatch.setattr(embed_routes, "AUTO_HOST_ORDER", ["VidCore"])
-    attempts = 0
-
-    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            return config, None, f"{config.canonical}: down"
-        return config, {"stream_url": "ok", "audit": {}}, None
-
-    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
-    with pytest.raises(embed_routes.EmbedUnavailable):
-        await embed_routes._resolve_gateway(_embed_request(), "tv", "94997", "1", "1")
-
-    payload = await embed_routes._resolve_gateway(
-        _embed_request(query="retry=1"), "tv", "94997", "1", "1"
-    )
-    assert payload["stream_url"] == "ok"
-    assert attempts == 2
-
-
-@pytest.mark.asyncio
-async def test_gateway_auto_falls_back_to_vidlink(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    embed_routes._resolved_cache.clear()
-    monkeypatch.setattr(
-        embed_routes, "AUTO_HOST_ORDER", ["VidCore", "VSEmbed", "VidLink"]
-    )
-    probed: list[str] = []
-
-    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
-        probed.append(config.canonical)
-        if config.canonical == "VidLink":
-            return config, {"host": config.canonical, "stream_url": "vidlink-stream", "audit": {}}, None
-        return config, None, f"{config.canonical}: unavailable"
-
-    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
-    payload = await embed_routes._resolve_gateway(
-        _embed_request(), "tv", "1399", "1", "1"
-    )
-
-    assert probed == ["VidCore", "VSEmbed", "VidLink"]
-    assert payload["host"] == "VidLink"
-    assert payload["stream_url"] == "vidlink-stream"
-
-
-@pytest.mark.asyncio
-async def test_gateway_explicit_host_probes_only_that_host(monkeypatch):
-    from mediaflow_proxy.routes import embed as embed_routes
-
-    embed_routes._negative_cache.clear()
-    embed_routes._resolved_cache.clear()
-    probed: list[str] = []
-
-    async def fake_probe(request, config, proxy_headers, media_type, media_id, season, episode):
-        probed.append(config.canonical)
-        return config, {"host": config.canonical, "stream_url": "vidlink-stream", "audit": {}}, None
-
-    monkeypatch.setattr(embed_routes, "_probe_gateway", fake_probe)
-    payload = await embed_routes._resolve_gateway(
-        _embed_request(), "movie", "786892", None, None, host="vidlink"
-    )
-
-    assert probed == ["VidLink"]
-    assert payload["host"] == "VidLink"

@@ -454,6 +454,14 @@ async def set_cached_extractor(key: str, data: dict, ttl: int = EXTRACTOR_CACHE_
     logger.debug(f"[Redis] Extractor cache set ({ttl}s TTL): {key[:60]}...")
 
 
+async def delete_cached_extractor(key: str):
+    """Drop one cached result (``?retry=1``). No-op if Redis unavailable."""
+    redis = await get_redis()
+    if redis is None:
+        return
+    await redis.delete(_extractor_key(key))
+
+
 # =============================================================================
 # Telegram Document -> Message Cache
 # =============================================================================

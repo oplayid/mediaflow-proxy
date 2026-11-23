@@ -89,17 +89,12 @@ def test_sign_player_url_is_opaque_and_decryptable(monkeypatch):
     assert payload["e"] == "1"
 
 
-def test_host_configs_honours_env_override(monkeypatch):
-    monkeypatch.setattr(settings, "player_hosts", "VidLink, VSEmbed")
-    names = [config.canonical for config in host_configs()]
-    assert names == ["VidLink", "VSEmbed"]
+def test_host_configs_uses_only_the_shared_host_order():
+    from mediaflow_proxy.extractors.embed_hosts import HOST_ORDER
 
-
-def test_host_configs_default_prefers_known_good_hosts(monkeypatch):
-    monkeypatch.setattr(settings, "player_hosts", "")
     names = [config.canonical for config in host_configs()]
-    assert names[:4] == ["VidCore", "VSEmbed", "VidSrcTo", "VidLink"]
-    assert "VidKing" in names
+    assert names == list(HOST_ORDER)
+    assert "VidKing" not in names  # historical registry entries are never probed
 
 
 def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
@@ -145,63 +140,82 @@ def _patch_simulation(monkeypatch, ok_hosts: set[str]) -> list[tuple[str, str]]:
     async def no_set(*args, **kwargs):
         return None
 
+    async def no_delete(*args, **kwargs):
+        return None
+
+    async def no_subtitles(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(simulator, "create_streamer", fake_streamer)
     monkeypatch.setattr(simulator, "_resolve_host", fake_resolve)
     monkeypatch.setattr(simulator, "probe_candidate", fake_probe)
     monkeypatch.setattr(simulator, "_signed_candidate", fake_signed)
     monkeypatch.setattr(simulator, "get_cached_extractor", no_cache)
     monkeypatch.setattr(simulator, "set_cached_extractor", no_set)
+    monkeypatch.setattr(simulator, "delete_cached_extractor", no_delete)
+    monkeypatch.setattr(simulator.subdl, "collect", no_subtitles)
     monkeypatch.setattr(simulator, "_prewarm", lambda job: None)
     return calls
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_stops_at_first_playable_host(monkeypatch):
-    monkeypatch.setattr(settings, "player_hosts", "VidCore,VSEmbed,VidLink")
+async def test_simulate_session_checks_each_host_at_most_once_and_stops_at_first(monkeypatch):
     calls = _patch_simulation(monkeypatch, {"VidCore"})
 
     session = await simulator.simulate_session(
-        _request("/player/movie/1263337"), "movie", "1263337", None, None, start_time=42
+        _request("/player/movie/1263337"), "movie", "1263337", None, None
     )
 
     assert [item for item in calls if item[0] in ("resolve", "probe")] == [
         ("resolve", "VidCore"),
         ("probe", "VidCore"),
     ]
+    assert calls.count(("resolve", "VidCore")) == 1
     assert len(session["candidates"]) == 1
     assert session["audit"]["chosen_video_host"] == "VidCore"
-    assert session["audit"]["retry_available"] is True
-    assert session["start_time"] == 42.0
+    assert "retry_available" not in session["audit"]
+    assert "excluded_hosts" not in session["audit"]
+    assert "start_time" not in session
 
 
 @pytest.mark.asyncio
-async def test_simulate_session_skips_excluded_host(monkeypatch):
-    monkeypatch.setattr(settings, "player_hosts", "VidCore,VSEmbed,VidLink")
-    calls = _patch_simulation(monkeypatch, {"VSEmbed"})
+async def test_simulate_session_refresh_bypasses_cached_session(monkeypatch):
+    calls = _patch_simulation(monkeypatch, {"VidCore"})
+    deleted: list[str] = []
 
-    session = await simulator.simulate_session(
-        _request("/player/movie/1263337/retry"),
-        "movie",
-        "1263337",
-        None,
-        None,
-        retry=True,
-        exclude="VidCore",
+    async def fake_delete(key):
+        deleted.append(key)
+
+    monkeypatch.setattr(simulator, "delete_cached_extractor", fake_delete)
+    await simulator.simulate_session(
+        _request("/player/movie/1263337"), "movie", "1263337", None, None, refresh=True
     )
 
-    assert [host for kind, host in calls if kind == "resolve"] == ["VSEmbed"]
-    assert session["audit"]["chosen_video_host"] == "VSEmbed"
-    assert session["audit"]["excluded_hosts"] == ["VidCore"]
+    assert len(deleted) == 1
+    assert "movie:1263337" in deleted[0]
+    assert [host for kind, host in calls if kind == "resolve"] == ["VidCore"]
 
 
-def test_player_js_retries_inside_iframe():
-    player_js = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static" / "player.js"
-    text = player_js.read_text(encoding="utf-8")
-    assert 'query.set("exclude"' in text
-    assert 'query.set("t"' in text
-    assert "/retry?" in text
-    assert "mfp:host" not in text
-    assert "start_time" in text
+def test_player_ui_has_no_host_selector_or_retry_controls():
+    static_dir = Path(__file__).resolve().parents[1] / "mediaflow_proxy" / "static"
+    html = (static_dir / "player.html").read_text(encoding="utf-8")
+    js = (static_dir / "player.js").read_text(encoding="utf-8")
+
+    assert 'id="host-select"' not in html
+    assert 'id="retry-button"' not in html
+    assert 'id="error-retry"' not in html
+    assert "simulasi host" not in html
+    assert "Cari ulang host" not in html
+    assert "/retry" not in js
+    assert "retryExcluding" not in js
+    assert "mfp:host" not in js
+    # Video settings stay in the mfp player.
+    assert 'id="quality-select"' in html
+    assert 'id="subtitle-select"' in html
+    assert "preferredSubtitle" in js
+    assert 'item.origin === "subdl"' in js
+    assert "/^subdl\\b/i.test(label)" in js  # avoid "SubDL • SubDL • ..." labels
+
 
 
 def test_player_session_is_csp_safe():
@@ -306,6 +320,90 @@ def test_merge_subtitles_prefers_indonesian_and_deduplicates():
     assert len([item for item in merged if item["language"] == "en"]) == 1
 
 
+def test_srt_to_vtt_converts_timestamps_and_keeps_webvtt():
+    from mediaflow_proxy.subtitles.subdl import srt_to_vtt
+
+    converted = srt_to_vtt(
+        "\ufeff1\r\n00:00:00,500 --> 00:00:02,000\r\nHalo\r\n\r\n"
+    )
+    assert converted.startswith("WEBVTT\n\n")
+    assert "00:00:00.500 --> 00:00:02.000" in converted
+    assert ",500" not in converted
+
+    already_vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nTeks\n"
+    assert srt_to_vtt(already_vtt).strip() == already_vtt.strip()
+
+
+@pytest.mark.asyncio
+async def test_subdl_collect_returns_signed_same_origin_tracks(monkeypatch):
+    from mediaflow_proxy.subtitles import subdl
+
+    monkeypatch.setattr(settings, "subdl_api_key", "secret-subdl-key")
+    monkeypatch.setattr(
+        subdl,
+        "search",
+        lambda *args, **kwargs: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "id": "track1",
+                    "label": "SubDL • ID • Release",
+                    "language": "id",
+                    "download_path": "/subtitle/123/4.srt",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        subdl, "_download", lambda item: asyncio.sleep(0, result="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHalo\n")
+    )
+    monkeypatch.setattr(
+        subdl, "store_vtt", lambda content: asyncio.sleep(0, result="a" * 32)
+    )
+
+    tracks = await subdl.collect(
+        "movie", "550", None, None, signer=lambda key: f"https://mfp.oplay.id/_token_x/player/subtitle/{key}.vtt"
+    )
+
+    assert len(tracks) == 1
+    assert tracks[0] == {
+        "id": "subdl-track1",
+        "label": "SubDL • ID • Release",
+        "language": "id",
+        "format": "vtt",
+        "origin": "subdl",
+        "url": f"https://mfp.oplay.id/_token_x/player/subtitle/{'a' * 32}.vtt",
+    }
+    assert "secret-subdl-key" not in str(tracks)
+
+
+@pytest.mark.asyncio
+async def test_player_subtitle_endpoint_serves_signed_vtt(monkeypatch):
+    from mediaflow_proxy.routes import player as player_routes
+
+    key = "b" * 32
+    monkeypatch.setattr(
+        player_routes, "load_vtt", lambda value: asyncio.sleep(0, result="WEBVTT\n\nHalo\n" if value == key else None)
+    )
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": f"/player/subtitle/{key}.vtt",
+        "raw_path": f"/player/subtitle/{key}.vtt".encode(),
+        "query_string": f"sub={key}".encode(),
+        "headers": [(b"host", b"mfp.oplay.id")],
+    }
+    response = await player_routes.player_subtitle(Request(scope), f"{key}.vtt")
+
+    assert response.status_code == 200
+    assert "text/vtt" in response.media_type
+    assert response.body == b"WEBVTT\n\nHalo\n"
+    assert "frame-ancestors https://movie.oplay.id" in response.headers["content-security-policy"]
+    assert "api_password" not in response.body.decode()
+
+
 def test_encryption_middleware_restores_tokenized_scope(monkeypatch):
     handler = EncryptionHandler("unit-secret")
     monkeypatch.setattr(crypto_utils, "encryption_handler", handler)
@@ -341,11 +439,13 @@ def test_encryption_middleware_restores_tokenized_scope(monkeypatch):
     assert scope["query_string"] == b""
 
 
-def test_encryption_middleware_keeps_retry_query_params(monkeypatch):
+def test_encryption_middleware_keeps_signed_refresh_flag_only(monkeypatch):
     handler = EncryptionHandler("unit-secret")
     monkeypatch.setattr(crypto_utils, "encryption_handler", handler)
-    token = handler.encrypt_data({"api_password": "unit-secret"}, 60)
-    path = f"/_token_{token}/player/movie/550/retry"
+    token = handler.encrypt_data(
+        {"api_password": "unit-secret", "refresh": True, "type": "movie", "id": "550"}, 60
+    )
+    path = f"/_token_{token}/player/movie/550"
 
     scope = {
         "type": "http",
@@ -354,7 +454,7 @@ def test_encryption_middleware_keeps_retry_query_params(monkeypatch):
         "scheme": "https",
         "path": path,
         "raw_path": path.encode(),
-        "query_string": b"exclude=VidCore&t=42",
+        "query_string": b"",
         "headers": [(b"host", b"mfp.oplay.id")],
         "client": ("10.0.0.1", 12345),
     }
@@ -369,8 +469,14 @@ def test_encryption_middleware_keeps_retry_query_params(monkeypatch):
     response = asyncio.run(middleware.dispatch(request, call_next))
 
     assert response.status_code == 200
-    assert seen["query"]["exclude"] == "VidCore"
-    assert seen["query"]["t"] == "42"
+    assert str(seen["query"]["refresh"]).lower() == "true"
+    assert seen["query"]["type"] == "movie"
+    assert "exclude" not in seen["query"]
+    assert "t" not in seen["query"]
+
+    from mediaflow_proxy.main import app
+
+    assert not any("/retry" in getattr(route, "path", "") for route in app.routes)
 
 
 def test_needs_transcode_detects_hevc_codec_and_url(monkeypatch):

@@ -143,3 +143,4 @@ stremio-test-addon/
 wireproxy/
 test_samples/
 logs.txt
+.DS_Store

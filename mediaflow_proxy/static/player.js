@@ -24,19 +24,14 @@
   var overlayBar = document.getElementById("overlay-bar");
   var errorBox = document.getElementById("error-box");
   var errorStatus = document.getElementById("error-status");
-  var hostBadge = document.getElementById("host-badge");
-  var simBadge = document.getElementById("sim-badge");
+  var sourceBadge = document.getElementById("source-badge");
   var title = document.getElementById("title");
-  var hostSelect = document.getElementById("host-select");
   var qualitySelect = document.getElementById("quality-select");
   var subtitleSelect = document.getElementById("subtitle-select");
-  var retryButton = document.getElementById("retry-button");
-  var errorRetry = document.getElementById("error-retry");
 
   var hls = null;
   var dashPlayer = null;
   var activeIndex = -1;
-  var failed = {};
   var readySent = false;
   var lastTimeUpdate = 0;
   var trackElements = {};
@@ -67,7 +62,7 @@
 
   function showError(text) {
     overlay.classList.add("hidden");
-    errorStatus.textContent = text || "Tidak ada host yang bisa diputar.";
+    errorStatus.textContent = text || "Video tidak dapat diputar.";
     errorBox.classList.remove("hidden");
     post("error", { message: errorStatus.textContent });
   }
@@ -76,13 +71,31 @@
     return candidates[activeIndex] || null;
   }
 
+  function isNative(item) {
+    return item.origin === "host" || item.origin === "provider";
+  }
+
+  function byLanguage(items, prefix) {
+    return items.find(function (item) {
+      return (item.language || "").toLowerCase().startsWith(prefix);
+    });
+  }
+
+  function subtitleLabel(item) {
+    var label = item.label || item.language || "Subtitle";
+    if (item.origin === "subdl") {
+      return /^subdl\b/i.test(label) ? label : "SubDL • " + label;
+    }
+    return item.origin === "provider" && !/^api\b/i.test(label) ? "API • " + label : label;
+  }
+
   function buildTracks() {
     Array.prototype.slice.call(video.querySelectorAll("track")).forEach(function (element) { element.remove(); });
     trackElements = {};
     subtitles.forEach(function (item) {
       var element = document.createElement("track");
       element.kind = "subtitles";
-      element.label = (item.origin === "provider" ? "API • " : "") + (item.host ? item.host + " • " : "") + item.label;
+      element.label = subtitleLabel(item);
       element.srclang = item.language || "";
       element.src = item.url;
       video.appendChild(element);
@@ -91,11 +104,11 @@
   }
 
   function preferredSubtitle() {
-    var id = subtitles.find(function (item) { return (item.language || "").toLowerCase().startsWith("id"); });
-    if (id) return id.id;
-    var en = subtitles.find(function (item) { return (item.language || "").toLowerCase().startsWith("en"); });
-    if (en) return en.id;
-    return subtitles.length ? subtitles[0].id : "";
+    // Default to the native subtitle package carried by the winning host.
+    var native = subtitles.filter(isNative);
+    var chosen = byLanguage(native, "id") || byLanguage(native, "en") || native[0];
+    if (!chosen) chosen = byLanguage(subtitles, "id") || subtitles[0];
+    return chosen ? chosen.id : "";
   }
 
   function fillSubtitles() {
@@ -107,7 +120,7 @@
     subtitles.forEach(function (item) {
       var option = document.createElement("option");
       option.value = item.id;
-      option.textContent = (item.origin === "provider" ? "API • " : "") + (item.host ? item.host + " • " : "") + item.label;
+      option.textContent = subtitleLabel(item);
       subtitleSelect.appendChild(option);
     });
     subtitleSelect.value = preferredSubtitle();
@@ -119,17 +132,6 @@
     Object.keys(trackElements).forEach(function (id) {
       try { trackElements[id].track.mode = id === selected ? "showing" : "disabled"; } catch (error) {}
     });
-  }
-
-  function fillHosts() {
-    hostSelect.innerHTML = "";
-    candidates.forEach(function (candidate, index) {
-      var option = document.createElement("option");
-      option.value = String(index);
-      option.textContent = candidate.host + " • " + (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type) + " • " + candidate.score;
-      hostSelect.appendChild(option);
-    });
-    if (candidates.length) hostSelect.value = "0";
   }
 
   function fillQualities() {
@@ -161,8 +163,6 @@
   function waitForTranscode(url, token) {
     return new Promise(function (resolve, reject) {
       var started = Date.now();
-      // Do not keep the viewer on a spinner for a minute when FFmpeg stalls;
-      // playUrl() falls back to the native source once this lapses.
       var deadline = 25000;
       function check() {
         if (token !== generation) return;
@@ -189,30 +189,13 @@
     });
   }
 
+  // Decision A: there is no post-playback failover. The host was already
+  // checked once and the winner is the only candidate in the session.
   function handleError(source, fatal) {
     if (!fatal) return;
-    var candidate = currentCandidate();
-    if (!candidate) return;
-    failed[activeIndex] = true;
-    var next = candidates.findIndex(function (_item, index) { return !failed[index]; });
-    if (next >= 0) {
-      var detail = source === "transcode" ? " transcode gagal" : "";
-      setOverlay("Host " + candidate.host + detail + ". Mencoba " + candidates[next].host + "…", 70);
-      overlay.classList.remove("hidden");
-      playCandidate(next, video.currentTime);
-      return;
-    }
-    // Standby host selection stays inside this iframe. Reloading /retry with
-    // the failed host excluded makes the server continue down PLAYER_HOSTS;
-    // StreamFlix only ever sees the ID and the opaque player URL.
-    if ((session.audit || {}).retry_available) {
-      setOverlay("Host " + candidate.host + " gagal. Mencoba host berikutnya…", 70);
-      retryExcluding(candidate.host);
-      return;
-    }
     showError(source === "transcode"
-      ? "Transcode HEVC gagal. Silakan coba ulang."
-      : "Semua host gagal diputar. Silakan cari ulang host.");
+      ? "Transcode HEVC gagal. Video tidak dapat diputar."
+      : "Sumber video gagal diputar. Silakan coba lagi nanti.");
   }
 
   function sendReady() {
@@ -222,25 +205,18 @@
     var candidate = currentCandidate();
     post("ready", {
       duration: Number.isFinite(video.duration) ? video.duration : 0,
-      host: candidate ? candidate.host : null,
       transcode: !!(candidate && candidate.needs_transcode),
       audit: session.audit || {}
     });
   }
 
-  function attachCommon(startTime) {
+  function attachCommon() {
     applySubtitle();
-    if (Number.isFinite(startTime) && startTime > 0) {
-      video.addEventListener("loadedmetadata", function once() {
-        try { video.currentTime = startTime; } catch (error) {}
-        video.removeEventListener("loadedmetadata", once);
-      });
-    }
   }
 
-  function startPlayback(candidate, url, startTime, playbackType) {
-    setOverlay("Memutar " + candidate.host + "…", 90);
-    attachCommon(startTime);
+  function startPlayback(candidate, url, playbackType) {
+    setOverlay("Memutar video…", 90);
+    attachCommon();
 
     if (playbackType === "hls") {
       if (window.Hls && window.Hls.isSupported()) {
@@ -266,74 +242,47 @@
     }
 
     video.play().catch(function () {});
-    post("sourcechange", { host: candidate.host, type: playbackType, transcode: !!candidate.needs_transcode });
+    post("sourcechange", { type: playbackType, transcode: !!candidate.needs_transcode });
   }
 
-  function playUrl(candidate, url, startTime) {
+  function playUrl(candidate, url) {
     cleanup();
     var token = generation;
     if (candidate.needs_transcode) {
-      startPlaybackAfterTranscode(candidate, startTime, token);
+      startPlaybackAfterTranscode(candidate, token);
       return;
     }
-    startPlayback(candidate, url, startTime, candidate.playback_type || candidate.manifest_type);
+    startPlayback(candidate, url, candidate.playback_type || candidate.manifest_type);
   }
 
-  function startPlaybackAfterTranscode(candidate, startTime, token) {
+  function startPlaybackAfterTranscode(candidate, token) {
     setOverlay("Menyiapkan transcode HEVC → H.264…", 5);
     waitForTranscode(candidate.transcode_url, token).then(function () {
       if (token !== generation) return;
-      startPlayback(candidate, candidate.transcode_url, startTime, "hls");
+      startPlayback(candidate, candidate.transcode_url, "hls");
     }).catch(function () {
       if (token !== generation) return;
-      // Last chance before discarding this host: play the native (already
-      // proxied) source. Errors from here go through the normal host fallback.
-      startPlayback(candidate, candidate.url, startTime, candidate.playback_type || candidate.manifest_type);
+      // Last chance before showing the error: play the native proxied source.
+      startPlayback(candidate, candidate.url, candidate.playback_type || candidate.manifest_type);
     });
   }
 
-  function playCandidate(index, startTime) {
+  function playCandidate(index) {
     var candidate = candidates[index];
-    if (!candidate) { showError("Host tidak tersedia."); return; }
+    if (!candidate) { showError("Sumber video tidak tersedia."); return; }
     activeIndex = index;
-    hostSelect.value = String(index);
     fillQualities();
-    hostBadge.textContent = candidate.host + " • " + (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type);
-    hostBadge.classList.add("good");
-    hostBadge.classList.toggle("transcode", !!candidate.needs_transcode);
-    playUrl(candidate, candidate.url, startTime || 0);
+    sourceBadge.textContent = (candidate.needs_transcode ? "HEVC → H.264" : candidate.manifest_type) + " • siap";
+    sourceBadge.classList.add("good");
+    sourceBadge.classList.toggle("transcode", !!candidate.needs_transcode);
+    playUrl(candidate, candidate.url);
   }
-
-  function retry() {
-    var path = window.location.pathname.replace(/\/?retry\/?$/, "");
-    window.location.href = path.replace(/\/$/, "") + "/retry";
-  }
-
-  // Keep the same encrypted token (it lives in the path prefix) and only add
-  // the explicit exclude/position query params. The middleware decrypts the
-  // token again on the /retry route and forwards these to simulate_session().
-  function retryExcluding(host) {
-    var audit = session.audit || {};
-    var excluded = Array.isArray(audit.excluded_hosts) ? audit.excluded_hosts.slice() : [];
-    if (host && excluded.indexOf(host) === -1) excluded.push(host);
-    var path = window.location.pathname.replace(/\/?retry\/?$/, "").replace(/\/$/, "");
-    var query = new URLSearchParams(window.location.search);
-    query.set("exclude", excluded.join(","));
-    if (video.currentTime > 0) query.set("t", String(Math.floor(video.currentTime)));
-    window.location.href = path + "/retry?" + query.toString();
-  }
-
-  retryButton.addEventListener("click", retry);
-  errorRetry.addEventListener("click", retry);
-
-  hostSelect.addEventListener("change", function () {
-    playCandidate(Number(hostSelect.value), video.currentTime);
-  });
 
   qualitySelect.addEventListener("change", function () {
-    if (!qualitySelect.value) { playCandidate(activeIndex, video.currentTime); return; }
     var candidate = currentCandidate();
-    if (candidate) playUrl(candidate, qualitySelect.value, video.currentTime);
+    if (!candidate) return;
+    if (!qualitySelect.value) { playUrl(candidate, candidate.url); return; }
+    playUrl(candidate, qualitySelect.value);
   });
 
   subtitleSelect.addEventListener("change", applySubtitle);
@@ -366,24 +315,20 @@
     } else if (data.type === "mfp:play") {
       video.play().catch(function () {});
     }
-    // No external host-switch command: Streamflix supplies only the media ID
-    // and renders the opaque player URL. Failover is owned here via /retry.
   });
 
   var media = session.media || {};
   title.textContent = media.type === "tv"
     ? "TV " + media.id + " • S" + (media.season || 1) + " E" + (media.episode || 1)
     : (media.id ? media.type + " • " + media.id : "MediaFlow Player");
-  simBadge.textContent = "simulasi " + ((session.audit || {}).simulation_ms || 0) + "ms";
 
   if (!candidates.length) {
-    showError("Tidak ada host embed yang lolos simulasi. Tambahkan atau perbaiki host di MediaFlow.");
+    showError("Sumber video tidak tersedia dari host yang diperiksa.");
     return;
   }
 
   buildTracks();
   fillSubtitles();
-  fillHosts();
-  setOverlay("Simulasi selesai. Menyiapkan " + candidates[0].host + "…", 100);
-  playCandidate(0, Number(session.start_time) || 0);
+  setOverlay("Sumber ditemukan. Menyiapkan video…", 100);
+  playCandidate(0);
 })();

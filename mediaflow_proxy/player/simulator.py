@@ -1,9 +1,9 @@
-"""Simulate playback across every known embed host and merge the best result.
+"""One first-success host check when the mfp iframe mounts.
 
-The simulation intentionally stays lightweight: resolve each host, fetch the
-manifest plus one segment with a tiny range, inspect codecs/subtitles, then rank
-the candidates. It never downloads a full video and never exposes upstream URLs
-to the browser.
+The player walks the shared host order at most once per host, skips hosts that
+fail to resolve or pass a lightweight manifest/range probe, stops at the first
+playable media URL and signs only that winner for the browser. There is no
+post-playback failover: a failed winner shows a clean error in the player.
 """
 
 from __future__ import annotations
@@ -18,26 +18,25 @@ from urllib.parse import urljoin, urlparse
 from aiohttp import ClientTimeout
 
 from mediaflow_proxy.configs import settings
-from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS, build_embed_url, get_config
+from mediaflow_proxy.extractors.embed_hosts import EMBED_HOSTS, HOST_ORDER, build_embed_url
 from mediaflow_proxy.extractors.factory import ExtractorFactory
 from mediaflow_proxy.gateway.ad_filter import AdFilterReport, filter_extractor_result
 from mediaflow_proxy.player.models import Candidate, ProbeResult, session_to_dict
 from mediaflow_proxy.player.transcoder import create_transcode_job, prepare_transcode
-from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url
+from mediaflow_proxy.routes.embed import _headers_for_destination, _sign_asset_url, _sign_subtitle_url
+from mediaflow_proxy.subtitles import subdl
 from mediaflow_proxy.utils.http_utils import create_streamer, get_proxy_headers
-from mediaflow_proxy.utils.redis_utils import get_cached_extractor, set_cached_extractor
+from mediaflow_proxy.utils.redis_utils import (
+    delete_cached_extractor,
+    get_cached_extractor,
+    set_cached_extractor,
+)
 
 logger = logging.getLogger(__name__)
 
-# First-success order: VidCore is the known-good HLS host, then the other HLS
-# chains. VidLink is last because it needs DASH conversion + HEVC transcoding.
-PREFERRED_HOSTS = ("VidCore", "VSEmbed", "VidSrcTo", "VidLink")
-# vidsrc.to chains through vidsrc.sh before reaching the VSEmbed player, so
-# resolution alone can take ~6s. Keep room for PROBE_TIMEOUT within the 10s
-# simulation budget (7.5 + 2.5).
+# Resolution/probe budget for the single host walk.
 RESOLVE_TIMEOUT = 7.5
 PROBE_TIMEOUT = 2.5
-PROBE_CONCURRENCY = 4
 CACHE_PREFIX = "mfp:player-session:"
 SESSION_TTL = 600
 
@@ -66,7 +65,7 @@ def _audio_can_be_copied(probe: ProbeResult) -> bool:
 
 
 def _prewarm(job: str) -> None:
-    """Start the winner's transcode without delaying the 10s simulation."""
+    """Start the winner's transcode without delaying the host walk."""
     task = asyncio.create_task(prepare_transcode(job))
 
     def _done(finished: asyncio.Task) -> None:
@@ -82,20 +81,12 @@ def _prewarm(job: str) -> None:
 
 
 def host_configs() -> list[Any]:
-    """Return configured hosts, preferred ones first.
+    """Return the shared first-success host order.
 
-    ``PLAYER_HOSTS`` can override the list with a comma-separated set of
-    canonical names. Adding a new host is therefore a one-line registry change
-    in ``embed_hosts.py`` plus an optional env override — no player changes.
+    ``HOST_ORDER`` in ``embed_hosts.py`` is the single source of truth. Adding a
+    host is a one-line registry change there; the player needs no code change.
     """
-    raw = (settings.player_hosts or "").strip()
-    if raw:
-        names = [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()]
-        configs = [get_config(name) for name in names]
-    else:
-        ordered = list(PREFERRED_HOSTS) + [name for name in EMBED_HOSTS if name not in PREFERRED_HOSTS]
-        configs = [EMBED_HOSTS.get(name) for name in ordered]
-    return [config for config in configs if config]
+    return [EMBED_HOSTS[name] for name in HOST_ORDER if name in EMBED_HOSTS]
 
 
 async def _resolve_host(config, request, media_type: str, media_id: str, season: str, episode: str) -> dict:
@@ -133,7 +124,7 @@ async def _probe_manifest(streamer, url: str, headers: dict, timeout: float) -> 
 
 
 async def probe_candidate(result: dict, streamer, timeout: float = PROBE_TIMEOUT) -> ProbeResult:
-    """Fetch the manifest, one segment and a few subtitle headers."""
+    """Fetch the manifest, one small segment and a few subtitle headers."""
     started = time.monotonic()
     destination = result.get("destination_url")
     if not isinstance(destination, str) or not destination:
@@ -332,7 +323,7 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
             )
         except Exception as exc:
             # A failed job registration must not discard an otherwise playable
-            # candidate: the player can still try native playback/fallback.
+            # candidate: the player can still play the native source.
             logger.warning(
                 "[player] %s transcode job failed: %s: %s",
                 host,
@@ -357,13 +348,10 @@ async def _signed_candidate(request, result: dict, proxy_headers, expiration: in
 
 
 def _merge_subtitles(candidates: list[Candidate], limit: int = 16) -> list[dict]:
-    """Merge native tracks from every host, preferring Indonesian/English."""
+    """Normalise native tracks, preferring Indonesian/English."""
     merged: dict[tuple[str, str], dict] = {}
     for candidate in candidates:
         for item in candidate.subtitles:
-            # Same language/label from two hosts is one user-visible track. Keep
-            # the first (highest-scored) candidate's signed URL but preserve its
-            # host/origin metadata for the audit trail.
             key = (
                 str(item.get("language") or "").strip().lower(),
                 str(item.get("label") or "").strip().lower(),
@@ -378,17 +366,6 @@ def _merge_subtitles(candidates: list[Candidate], limit: int = 16) -> list[dict]
     return ordered[:limit]
 
 
-def _normalise_exclude(exclude: str | list[str] | None) -> set[str]:
-    """Read the ``exclude`` query param (comma separated or repeated)."""
-    if not exclude:
-        return set()
-    values: list[str] = []
-    items = [exclude] if isinstance(exclude, str) else exclude
-    for item in items:
-        values.extend(re.split(r"[,\s]+", str(item)))
-    return {item.strip() for item in values if item.strip()}
-
-
 async def simulate_session(
     request,
     media_type: str,
@@ -396,34 +373,28 @@ async def simulate_session(
     season: str | None,
     episode: str | None,
     *,
-    retry: bool = False,
-    exclude: str | list[str] | None = None,
-    start_time: float = 0.0,
+    refresh: bool = False,
 ) -> dict:
-    """Resolve hosts in order, stop at the first playable one, stay under budget.
+    """Check hosts once, stop at the first playable one and return its session.
 
-    Standby hosts are not probed up front. If the chosen host fails in the
-    browser, the iframe reloads itself with ``/retry?exclude=<host>`` and this
-    function simply continues down the list. StreamFlix never sees host names.
+    ``refresh`` is set by ``?retry=1`` on the gateway; it clears the positive
+    session cache so the host check runs again. There is no exclude/retry path:
+    once playback starts, a failure is shown as an error in the player.
     """
     season = season or "1"
     episode = episode or "1"
-    excluded = _normalise_exclude(exclude)
-    suffix = ",".join(sorted(excluded))
     cache_key = f"{CACHE_PREFIX}{media_type}:{media_id}:{season}:{episode}"
-    if suffix:
-        cache_key += f":excluded={suffix}"
-    if not retry:
+    if refresh:
+        await delete_cached_extractor(cache_key)
+    else:
         cached = await get_cached_extractor(cache_key)
         if cached and isinstance(cached, dict) and cached.get("candidates"):
             logger.info("[player] session cache hit %s/%s s%s e%s", media_type, media_id, season, episode)
-            cached = dict(cached)
-            cached["start_time"] = max(0.0, float(start_time or 0.0))
-            return cached
+            return dict(cached)
 
     started = time.monotonic()
     budget = max(1.0, float(settings.player_simulation_budget))
-    configs = [config for config in host_configs() if config.canonical not in excluded]
+    configs = host_configs()
     proxy_headers = get_proxy_headers(request)
     tried: list[dict] = []
     winner: Candidate | None = None
@@ -475,7 +446,23 @@ async def simulate_session(
         _prewarm(winner.transcode_job)
 
     subtitles = _merge_subtitles(candidates)
-    remaining_hosts = [config for config in configs if config.canonical != (winner.host if winner else None)]
+    if winner:
+        try:
+            external = await asyncio.wait_for(
+                subdl.collect(
+                    media_type,
+                    media_id,
+                    season,
+                    episode,
+                    signer=lambda key: _sign_subtitle_url(request, key, expiration=SESSION_TTL),
+                ),
+                timeout=subdl.COLLECT_TIMEOUT,
+            )
+            # Native tracks from the winning video host stay first/default.
+            subtitles.extend(external)
+        except Exception as exc:
+            logger.info("[player] subtitle collection skipped: %s: %s", type(exc).__name__, exc)
+
     audit = {
         "hosts_tried": len(tried) + (1 if winner else 0),
         "hosts_playable": len(candidates),
@@ -483,9 +470,8 @@ async def simulate_session(
         "chosen_video_host": winner.host if winner else None,
         "chosen_subtitle_hosts": sorted({item.get("host") for item in subtitles if item.get("host")}),
         "transcode_hosts": [winner.host] if winner and winner.needs_transcode else [],
-        "excluded_hosts": sorted(excluded),
         "tried_hosts": tried,
-        "retry_available": bool(remaining_hosts),
+        "subtitle_origins": sorted({str(item.get("origin") or "") for item in subtitles if item.get("origin")}),
         "simulation_ms": int((time.monotonic() - started) * 1000),
     }
     session = session_to_dict(
@@ -497,12 +483,11 @@ async def simulate_session(
         subtitles=subtitles,
         audit=audit,
         generated_at=time.time(),
-        start_time=start_time,
     )
     if candidates:
         await set_cached_extractor(cache_key, session, ttl=settings.player_cache_ttl)
     logger.info(
-        "[player] simulated %s/%s: winner=%s after %s/%s hosts, %sms",
+        "[player] checked %s/%s: winner=%s after %s/%s hosts, %sms",
         media_type,
         media_id,
         audit["chosen_video_host"],
