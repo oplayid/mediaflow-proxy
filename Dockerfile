@@ -50,7 +50,8 @@ ENV PORT="8888" \
     GUNICORN_MAX_REQUESTS_JITTER="200" \
     GUNICORN_ACCESS_LOGFILE="-" \
     GUNICORN_ERROR_LOGFILE="-" \
-    GUNICORN_LOG_LEVEL="info"
+    GUNICORN_LOG_LEVEL="info" \
+    PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
 
 # Install only runtime dependencies (no dev packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -69,6 +70,16 @@ WORKDIR /mediaflow_proxy
 
 # Copy virtual environment from builder stage
 COPY --from=builder /build/.venv /mediaflow_proxy/.venv
+
+# Chromium is only used by the opt-in headless fallback for JS-gated players.
+# Install it (plus its system libraries) while still root, then make the cache
+# readable by the non-root user below. Without ENABLE_HEADLESS_FALLBACK=true
+# nothing launches a browser, so this only costs image size, not runtime CPU.
+RUN /mediaflow_proxy/.venv/bin/playwright install-deps chromium \
+    && /mediaflow_proxy/.venv/bin/playwright install chromium \
+    && chmod -R a+rX /ms-playwright \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy project files
 COPY --chown=mediaflow_proxy:mediaflow_proxy . /mediaflow_proxy

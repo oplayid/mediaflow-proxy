@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from starlette.requests import Request
 
-from mediaflow_proxy.extractors.base import HttpResponse
+from mediaflow_proxy.extractors.base import ExtractorError, HttpResponse
 from mediaflow_proxy.extractors.embed_hosts import (
     HOST_ORDER,
     EMBED_HOSTS,
@@ -469,6 +469,124 @@ async def test_vsembed_refreshes_missing_api_token():
 
     assert player_calls["count"] == 2
     assert result["destination_url"] == destination
+
+
+def _gated_vsembed_extractor():
+    """Player page with a Turnstile gate and no token until a browser solves it."""
+    config = EMBED_HOSTS["VSEmbed"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://stream.oplay.id/embed/tv/293610/1/4"
+    gate_url = "https://stream.oplay.id/vs_src.php?type=tv&id=293610&season=1&episode=4"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html?episode=4"
+    stream_base = "https://vsapi.example/api.php?type=tv&tmdb=293610"
+    api_url = f"{stream_base}&stream_urls=&season=1&episode=4&api_token=tok"
+    destination = "https://cdn.example/master.m3u8"
+    gated_config = {
+        "streamBase": stream_base,
+        "apiToken": "",
+        "apiTokenRefresh": True,
+        "turnstile": True,
+        "turnstileSiteKey": "site-key",
+    }
+    responses = {
+        gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+        nested_url: _response(
+            nested_url,
+            text=f'<script>window.CFG={{"playerUrl":"{player_url}"}};</script>',
+        ),
+        api_url: _response(
+            api_url,
+            text=json.dumps({"data": {"stream_urls": [destination], "cast_urls": []}}),
+        ),
+    }
+
+    async def fake_request(url: str, **kwargs):
+        if url == player_url:
+            return _response(
+                player_url,
+                text=f"<script>window.CONFIG={json.dumps(gated_config)};</script>",
+            )
+        if url not in responses:
+            raise AssertionError(f"Unexpected request: {url}")
+        return responses[url]
+
+    extractor._make_request = fake_request  # type: ignore[method-assign]
+    return extractor, embed_url, player_url, nested_url, destination
+
+
+@pytest.mark.asyncio
+async def test_vsembed_gated_uses_headless_fallback_when_enabled(monkeypatch):
+    from mediaflow_proxy.configs import settings
+
+    extractor, embed_url, player_url, nested_url, destination = _gated_vsembed_extractor()
+    monkeypatch.setattr(settings, "enable_headless_fallback", True)
+    calls = []
+
+    async def fake_resolve(url, *, referer, timeout, cache_key):
+        calls.append((url, referer, cache_key))
+        return {
+            "streamBase": "https://vsapi.example/api.php?type=tv&tmdb=293610",
+            "apiToken": "tok",
+        }
+
+    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == destination
+    assert len(calls) == 1
+    assert calls[0][0] == player_url
+    assert calls[0][1] == nested_url
+    assert "293610:1:4" in calls[0][2]
+
+
+@pytest.mark.asyncio
+async def test_vsembed_gated_fails_cleanly_when_fallback_disabled(monkeypatch):
+    from mediaflow_proxy.configs import settings
+
+    extractor, embed_url, *_ = _gated_vsembed_extractor()
+    monkeypatch.setattr(settings, "enable_headless_fallback", False)
+    calls = []
+
+    async def fake_resolve(*args, **kwargs):
+        calls.append(args)
+
+    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
+
+    with pytest.raises(ExtractorError, match="playback gated"):
+        await extractor.extract(embed_url)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_vsembed_gated_fails_cleanly_when_fallback_has_no_token(monkeypatch):
+    from mediaflow_proxy.configs import settings
+
+    extractor, embed_url, *_ = _gated_vsembed_extractor()
+    monkeypatch.setattr(settings, "enable_headless_fallback", True)
+
+    async def fake_resolve(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(generic_embed, "resolve_gated_config", fake_resolve)
+
+    with pytest.raises(ExtractorError, match="playback gated"):
+        await extractor.extract(embed_url)
+
+
+@pytest.mark.asyncio
+async def test_headless_helper_is_noop_when_disabled(monkeypatch):
+    from mediaflow_proxy.configs import settings
+    from mediaflow_proxy.utils import headless_browser
+
+    monkeypatch.setattr(settings, "enable_headless_fallback", False)
+    assert (
+        await headless_browser.resolve_gated_config(
+            "https://vsplayer.example/player.html", referer="https://vsplayer.example/"
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

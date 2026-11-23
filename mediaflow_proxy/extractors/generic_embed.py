@@ -21,6 +21,7 @@ from mediaflow_proxy.extractors.embed_hosts import (
     is_public_http_url,
     parse_media_path,
 )
+from mediaflow_proxy.configs import settings
 from mediaflow_proxy.extractors.vidlink_token import generate_adv_token
 from mediaflow_proxy.gateway.ad_filter import (
     AdFilterReport,
@@ -28,9 +29,14 @@ from mediaflow_proxy.gateway.ad_filter import (
     filter_extractor_result,
     sanitize_html,
 )
+from mediaflow_proxy.utils.headless_browser import resolve_gated_config
 from mediaflow_proxy.utils.packed import eval_solver
 
 logger = logging.getLogger(__name__)
+
+# A player carrying one of these keys but no apiToken needs a browser challenge
+# to mint the token. curl_cffi alone cannot produce it.
+_GATE_KEYS = ("turnstile", "turnstileSiteKey", "turnstileVerify", "cstCaptcha")
 
 # Only locate the assignment; the JSON object is read with balanced braces so
 # nested objects and a missing trailing semicolon do not break extraction.
@@ -640,6 +646,22 @@ class GenericEmbedExtractor(BaseExtractor):
             headers={"Referer": nested_url, "Accept": "text/html"},
         )
         player_cfg = _extract_json_object(_CONFIG_RE, player.text, self.config.canonical)
+
+        def _credentials(cfg: Dict[str, Any]) -> tuple[str, str]:
+            """Movie pages expose `api`, TV pages `streamBase`; accept aliases."""
+            api = (
+                cfg.get("api")
+                or cfg.get("streamBase")
+                or cfg.get("stream_base")
+                or cfg.get("apiUrl")
+                or cfg.get("api_url")
+                or ""
+            )
+            token = (
+                cfg.get("apiToken") or cfg.get("api_token") or cfg.get("token") or ""
+            )
+            return str(api), str(token)
+
         # Upstream can render the player before minting its short-lived API
         # token. The browser handles this by re-fetching the same player URL
         # once when `apiTokenRefresh` is set. Mirror that instead of treating a
@@ -679,25 +701,89 @@ class GenericEmbedExtractor(BaseExtractor):
                 ):
                     if refreshed_cfg.get(key):
                         player_cfg[key] = refreshed_cfg[key]
-                logger.info("[%s] stream API token refreshed", self.config.canonical)
+                if any(
+                    refreshed_cfg.get(key)
+                    for key in ("apiToken", "api_token", "token")
+                ):
+                    logger.info("[%s] stream API token refreshed", self.config.canonical)
+                else:
+                    # The refresh request succeeded but upstream still refused to
+                    # mint a token. Do not log this as a success.
+                    logger.debug(
+                        "[%s] stream API refresh returned no token",
+                        self.config.canonical,
+                    )
             except ExtractorError as exc:
                 logger.debug(
                     "[%s] stream API token refresh failed: %s",
                     self.config.canonical,
                     exc,
                 )
-        # Movie pages expose `api`; TV pages expose `streamBase`. Upstream has
-        # also been seen with camel/snake aliases for both API and token, so
-        # accept all of them and log the received keys when they change again.
+
         stream_base = player_cfg.get("streamBase") or player_cfg.get("stream_base") or ""
-        api_url = player_cfg.get("api") or stream_base or player_cfg.get("apiUrl") or player_cfg.get("api_url")
-        api_token = player_cfg.get("apiToken") or player_cfg.get("api_token") or player_cfg.get("token")
+        api_url, api_token = _credentials(player_cfg)
+        gate_markers = [key for key in _GATE_KEYS if player_cfg.get(key)]
+
+        if (
+            (not api_url or not api_token)
+            and gate_markers
+            and settings.enable_headless_fallback
+        ):
+            # The page has a gate (Turnstile / cstCaptcha) and no token: the
+            # browser would mint it after solving a challenge. This is the only
+            # place a headless browser is allowed into the flow, and it is
+            # opt-in. It is never used as a post-playback failover.
+            logger.info(
+                "[%s] playback gated (%s); trying optional headless fallback",
+                self.config.canonical,
+                ",".join(gate_markers),
+            )
+            try:
+                extra = await resolve_gated_config(
+                    player_url,
+                    referer=nested_url,
+                    timeout=settings.headless_fallback_timeout,
+                    cache_key=(
+                        f"{self.config.canonical}:{media_type}:{media_id}:"
+                        f"{season}:{episode}:{player_url}"
+                    ),
+                )
+                if extra:
+                    player_cfg.update(extra)
+                    api_url, api_token = _credentials(player_cfg)
+                    if api_url and api_token:
+                        stream_base = (
+                            player_cfg.get("streamBase")
+                            or player_cfg.get("stream_base")
+                            or ""
+                        )
+                        logger.info(
+                            "[%s] gated config resolved via headless fallback",
+                            self.config.canonical,
+                        )
+            except Exception as exc:
+                logger.debug(
+                    "[%s] headless fallback unavailable: %s",
+                    self.config.canonical,
+                    exc,
+                )
+
         if not api_url or not api_token:
             logger.info(
-                "[%s] stream API config missing; keys=%s",
+                "[%s] stream API config missing; keys=%s; gate=%s",
                 self.config.canonical,
                 sorted(player_cfg),
+                gate_markers or None,
             )
+            if gate_markers:
+                hint = (
+                    "headless fallback could not obtain a token; use a clean egress IP"
+                    if settings.enable_headless_fallback
+                    else "set ENABLE_HEADLESS_FALLBACK=true or use a clean egress IP"
+                )
+                raise ExtractorError(
+                    f"{self.config.canonical}: playback gated (human verification); {hint}"
+                )
             raise ExtractorError(f"{self.config.canonical}: stream API config missing")
 
         # The player's apiFor(s, e) appends `season`/`episode` plus the bare
