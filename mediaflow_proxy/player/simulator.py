@@ -31,8 +31,11 @@ logger = logging.getLogger(__name__)
 
 # Hosts that historically produce a playable HLS stream. They are tried first
 # so the 10 second budget is spent on the most likely winners.
-PREFERRED_HOSTS = ("VSEmbed", "VidCore", "VidLink")
-RESOLVE_TIMEOUT = 5.5
+PREFERRED_HOSTS = ("VSEmbed", "VidCore", "VidLink", "VidSrcTo")
+# vidsrc.to chains through vidsrc.sh before reaching the VSEmbed player, so
+# resolution alone can take ~6s. Keep room for PROBE_TIMEOUT within the 10s
+# simulation budget (7.5 + 2.5).
+RESOLVE_TIMEOUT = 7.5
 PROBE_TIMEOUT = 2.5
 PROBE_CONCURRENCY = 4
 CACHE_PREFIX = "mfp:player-session:"

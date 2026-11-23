@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunpa
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
 from mediaflow_proxy.extractors.embed_hosts import (
     FLOW_VIDLINK,
+    FLOW_VIDSRC_TO,
     FLOW_VIDSPARK,
     FLOW_VSEMBED,
     EmbedHostConfig,
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 _CFG_RE = re.compile(r"window\.CFG\s*=\s*(\{.*?\})\s*;", re.DOTALL)
 _CONFIG_RE = re.compile(r"window\.CONFIG\s*=\s*(\{.*?\})\s*;", re.DOTALL)
 _IFRAME_RE = re.compile(r"<iframe\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I | re.S)
+_DATA_API_RE = re.compile(r"\bdata-api\s*=\s*[\"']([^\"']+)[\"']", re.I | re.S)
 
 _M3U8_PATTERNS = [
     r"[\"'](https?:[^\"']+\.m3u8[^\"']*)[\"']",
@@ -283,6 +286,7 @@ class GenericEmbedExtractor(BaseExtractor):
       * ``vidspark_api`` — VidCore iframe -> VidSpark JSON API
       * ``vsembed_chain`` — VSEmbed gate -> player -> stream API
       * ``vidlink_api`` — VidLink embed -> signed playback API (anime sub/dub)
+      * ``vidsrc_to_api`` — vidsrc.to wrapper -> vidsrc.sh gate -> VSEmbed chain
       * ``generic_html`` — follow iframes and look for a direct playlist URL
     """
 
@@ -388,6 +392,8 @@ class GenericEmbedExtractor(BaseExtractor):
             result = await self._extract_vsembed(url)
         elif self.config.flow == FLOW_VIDLINK:
             result = await self._extract_vidlink(url)
+        elif self.config.flow == FLOW_VIDSRC_TO:
+            result = await self._extract_vidsrc_to(url)
         else:
             result = await self._extract_generic(url)
         return filter_extractor_result(result, self._ad_report)
@@ -450,6 +456,39 @@ class GenericEmbedExtractor(BaseExtractor):
             "audio": normalised_audio,
             "capabilities": default_capabilities,
         }
+
+    # ------------------------------------------------------------------
+    # vidsrc.to -> vidsrc.sh gate -> VSEmbed player chain
+    # ------------------------------------------------------------------
+    async def _extract_vidsrc_to(self, url: str) -> Dict[str, Any]:
+        """Follow vidsrc.to's iframe wrapper into its short-lived source gate.
+
+        vidsrc.to no longer serves streams itself: the embed page contains an
+        iframe on vidsrc.sh whose ``data-api`` endpoint returns a signed VSEmbed
+        player URL. Reusing the VSEmbed chain keeps subtitles/failover identical.
+        """
+        wrapper = await self._make_request(
+            url=url,
+            headers={"Referer": url, "Accept": "text/html"},
+        )
+        iframe_match = _IFRAME_RE.search(wrapper.text)
+        inner_url = filter_candidate_url(
+            iframe_match.group(1) if iframe_match else None,
+            wrapper.url or url,
+            self._ad_report,
+        )
+        if not inner_url:
+            raise ExtractorError(f"{self.config.canonical}: embed iframe missing")
+
+        inner = await self._make_request(
+            url=inner_url,
+            headers={"Referer": wrapper.url or url, "Accept": "text/html"},
+        )
+        api_match = _DATA_API_RE.search(inner.text)
+        if not api_match:
+            raise ExtractorError(f"{self.config.canonical}: source API endpoint missing")
+        gate_url = urljoin(inner.url or inner_url, html.unescape(api_match.group(1)))
+        return await self._extract_vsembed(inner_url, gate_url=gate_url)
 
     # ------------------------------------------------------------------
     # VidCore -> VidSpark
@@ -522,7 +561,9 @@ class GenericEmbedExtractor(BaseExtractor):
     # ------------------------------------------------------------------
     # VSEmbed gate chain
     # ------------------------------------------------------------------
-    async def _extract_vsembed(self, url: str) -> Dict[str, Any]:
+    async def _extract_vsembed(
+        self, url: str, *, gate_url: str | None = None
+    ) -> Dict[str, Any]:
         parsed = urlparse(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
         media_type, media_id, season, episode, _variant = parse_media_path(url)
@@ -530,9 +571,10 @@ class GenericEmbedExtractor(BaseExtractor):
         # TV gates must be episode-bound. Without season/episode the token's
         # `fid` is only `tv:<id>` and the stream API keeps serving S01E01 for
         # every requested episode.
-        gate_url = f"{origin}/vs_src.php?type={media_type}&id={media_id}"
-        if media_type == "tv":
-            gate_url += f"&season={season or '1'}&episode={episode or '1'}"
+        if gate_url is None:
+            gate_url = f"{origin}/vs_src.php?type={media_type}&id={media_id}"
+            if media_type == "tv":
+                gate_url += f"&season={season or '1'}&episode={episode or '1'}"
         gate = await self._make_request(
             url=gate_url,
             headers={"Referer": url, "Accept": "application/json"},

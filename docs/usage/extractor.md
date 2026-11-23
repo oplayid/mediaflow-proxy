@@ -55,7 +55,7 @@ These hosts are also accepted as `host` values. They are handled by the config-d
 | `SmashyStream` | `smashystream` | `embed.smashystream.com` |
 | `PStream` | `pstream` | `iframe.pstream.org` |
 | `VidSrcCC` | `vidsrccc` | `vidsrc.cc` |
-| `VidSrcTo` | `vidsrcto` | `vidsrc.to` |
+| `VidSrcTo` | `vidsrcto` | `vidsrc.to`, `www.vidsrc.to`, `vidsrc.sh`, `www.vidsrc.sh` |
 | `VidSrcRip` | `vidsrcrip` | `vidsrc.rip` |
 | `VidSrcSu` | `vidsrcsu` | `vidsrc.su` |
 | `VidSrcVip` | `vidsrcvip` | `vidsrc.vip` |
@@ -128,7 +128,7 @@ This redirects to the proxied HLS manifest URL, and because the request URL cont
 | `/_token_<token>/player/transcode/<job>/master.m3u8` | Tokenized HLS output of a server-side HEVC → H.264 job |
 | `/gateway/cache` | Debug-only cache statistics (no signed URLs) |
 
-TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway still resolves **VidCore, VSEmbed, then VidLink** (10 seconds per host, 40 seconds total). The player uses a different, broader order: **VSEmbed, VidCore, VidLink**, followed by every host registered in `EMBED_HOSTS`. Set `PLAYER_HOSTS=VidLink,VSEmbed,...` to override that order. Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
+TV IDs accept an optional `tv-` prefix; invalid or zero season/episode values fall back to `1`. The compatibility gateway resolves **VidCore, VSEmbed, VidLink, then VidSrcTo** (10 seconds per host, 40 seconds total). The player uses a different, broader order: **VSEmbed, VidCore, VidLink, VidSrcTo**, followed by every host registered in `EMBED_HOSTS`. Set `PLAYER_HOSTS=VSEmbed,VidCore,VidLink,VidSrcTo` to override that order — production currently pins the three-host list, so add `VidSrcTo` there to activate it. `VidSrcTo` follows the `vidsrc.to` wrapper to `vidsrc.sh`, reads its short-lived `/vs_src.php` gate, then reuses the VSEmbed player chain. It accepts numeric TMDB ids and IMDb `tt...` ids (`/embed/tv/tt.../1/2` becomes `/1-2` upstream). Adding a new external embed host is therefore a registry entry plus an optional env change — the player needs no code change.
 
 Example:
 

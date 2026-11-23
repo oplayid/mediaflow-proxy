@@ -53,8 +53,8 @@ def test_vidspark_api_base_includes_v1():
     assert VIDSPARK_API_BASE == "https://vidspark.to/api/vidora/v1"
 
 
-def test_auto_host_order_uses_all_three_supported_hosts():
-    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed", "VidLink")
+def test_auto_host_order_uses_all_supported_hosts():
+    assert AUTO_HOST_ORDER == ("VidCore", "VSEmbed", "VidLink", "VidSrcTo")
     assert len(AUTO_HOST_ORDER) == len(set(AUTO_HOST_ORDER))
     assert set(AUTO_HOST_ORDER) <= set(EMBED_HOSTS)
 
@@ -263,6 +263,54 @@ async def test_vsembed_chain():
     assert result["destination_url"] == destination
     assert result["request_headers"]["Referer"] == player_url
     assert result["expiration"] == 120
+
+
+@pytest.mark.asyncio
+async def test_vidsrc_to_follows_wrapper_and_source_gate():
+    config = EMBED_HOSTS["VidSrcTo"]
+    extractor = GenericEmbedExtractor({}, config)
+    embed_url = "https://vidsrc.to/embed/movie/385687"
+    inner_url = "https://vidsrc.sh/embed/movie/385687"
+    gate_url = "https://vidsrc.sh/vs_src.php?type=movie&id=385687"
+    nested_url = "https://vsplayer.example/watch"
+    player_url = "https://vsplayer.example/player.html"
+    api_url = "https://vsapi.example/api.php?id=385687&api_token=tok"
+    destination = "https://cdn.example/master.m3u8"
+
+    _mock_requests(
+        extractor,
+        {
+            embed_url: _response(
+                embed_url,
+                text=f'<iframe src="{inner_url}" allowfullscreen></iframe>',
+            ),
+            inner_url: _response(
+                inner_url,
+                text='<iframe data-api="/vs_src.php?type=movie&amp;id=385687"></iframe>',
+            ),
+            gate_url: _response(gate_url, text=f'{{"src":"{nested_url}"}}'),
+            nested_url: _response(
+                nested_url,
+                text=f'<script>window.CFG={{"playerUrl":"{player_url}"}};</script>',
+            ),
+            player_url: _response(
+                player_url,
+                text=(
+                    '<script>window.CONFIG={"api":"https://vsapi.example/api.php?id=385687",'
+                    '"apiToken":"tok","cast_urls":[]};</script>'
+                ),
+            ),
+            api_url: _response(
+                api_url,
+                text=f'{{"data":{{"stream_urls":["{destination}"],"cast_urls":[]}}}}',
+            ),
+        },
+    )
+
+    result = await extractor.extract(embed_url)
+
+    assert result["destination_url"] == destination
+    assert result["request_headers"]["Referer"] == player_url
 
 
 @pytest.mark.asyncio
@@ -523,6 +571,14 @@ def test_vidlink_embed_url_templates():
         (
             "https://vidlink.pro/anime/40748/1/dub",
             ("anime", "40748", None, "1", "dub"),
+        ),
+        (
+            "https://vidsrc.sh/embed/movie/385687",
+            ("movie", "385687", None, None, None),
+        ),
+        (
+            "https://vidsrc.sh/embed/tv/tt0944947/1-2",
+            ("tv", "tt0944947", "1", "2", None),
         ),
     ],
 )

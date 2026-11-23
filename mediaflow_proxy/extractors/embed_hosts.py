@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 FLOW_VIDSPARK = "vidspark_api"
 FLOW_VSEMBED = "vsembed_chain"
 FLOW_VIDLINK = "vidlink_api"
+FLOW_VIDSRC_TO = "vidsrc_to_api"
 FLOW_GENERIC = "generic_html"
 
 VIDSPARK_API_BASE = "https://vidspark.to/api/vidora/v1"
@@ -180,9 +181,10 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
         _cfg(
             "VidSrcTo",
             "vidsrcto",
-            ("vidsrc.to",),
+            ("vidsrc.to", "www.vidsrc.to", "vidsrc.sh", "www.vidsrc.sh"),
             "https://vidsrc.to/embed/movie/{id}",
             "https://vidsrc.to/embed/tv/{id}/{season}/{episode}",
+            flow=FLOW_VIDSRC_TO,
         ),
         _cfg(
             "VidSrcRip",
@@ -229,13 +231,14 @@ EMBED_HOSTS: Dict[str, EmbedHostConfig] = {
     ]
 }
 
-# The gateway resolves exactly three hosts, in failover order. Historical
-# hosts stay in the registry for backwards-compatible lookups, but they are
-# never probed by the StreamFlix gateway.
+# The gateway resolves these hosts in failover order. Historical hosts stay in
+# the registry for backwards-compatible lookups, but they are never probed by
+# the StreamFlix gateway.
 AUTO_HOST_ORDER: Tuple[str, ...] = (
     "VidCore",
     "VSEmbed",
     "VidLink",
+    "VidSrcTo",
 )
 
 # Every lower-case spelling accepted as ``host`` / embed slug.
@@ -299,7 +302,9 @@ def anime_variant_candidates(variant: Optional[str]) -> Tuple[str, ...]:
     return (requested, fallback)
 
 
-_MEDIA_PATH_RE = re.compile(r"/(movie|tv)/(\d+)(?:/(\d+)/(\d+))?")
+# Accept numeric TMDB ids and IMDb-style ``tt`` ids. vidsrc.sh writes TV
+# season/episode as ``1-2`` while other hosts use ``1/2``.
+_MEDIA_PATH_RE = re.compile(r"/(movie|tv)/(\d+|tt\d+)(?:/(\d+)[/-](\d+))?", re.I)
 _ANIME_PATH_RE = re.compile(r"/anime/(\d+)/(\d+)(?:/(sub|dub))?", re.I)
 
 

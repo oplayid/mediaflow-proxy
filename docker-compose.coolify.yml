@@ -3,8 +3,8 @@
 services:
   mfp:
     # Image is built and pushed to GHCR by .github/workflows/main.yml.
-    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.1.
-    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.1}
+    # Coolify should set MFP_IMAGE=ghcr.io/oplayid/mediaflow-proxy:v2.8.2.
+    image: ${MFP_IMAGE:-ghcr.io/oplayid/mediaflow-proxy:v2.8.2}
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -19,6 +19,9 @@ services:
       # Pin the bind address so a platform-injected PORT cannot change it.
       GUNICORN_BIND: "0.0.0.0:8888"
       REDIS_URL: redis://redis:6379
+      # Active player/gateway hosts. Coolify may override this value; keep the
+      # four-host list so VidSrcTo is used as the final fallback.
+      PLAYER_HOSTS: ${PLAYER_HOSTS:-VSEmbed,VidCore,VidLink,VidSrcTo}
       # Optional overrides — uncomment and set in Coolify as needed:
       # WEB_CONCURRENCY: "1"          # use 1 if using Telegram interactive login
       # ENABLE_TRANSCODE: "false"
