@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import pytest
 from fastapi import HTTPException, Request
@@ -141,6 +144,10 @@ def _patch_common(monkeypatch, earnvids_get=None):
 
 async def _noop_async(value=None):
     return value
+
+
+async def _noop_download(*_args, **_kwargs):
+    return None
 
 
 @pytest.mark.asyncio
@@ -608,6 +615,7 @@ async def test_convert_prefers_copy_without_transcoding(monkeypatch, tmp_path):
     monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
     monkeypatch.setattr(upload_util, "job_dir", lambda job_id: directory)
     monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+    monkeypatch.setattr(upload_util, "download_hls_source", _noop_download)
 
     result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
 
@@ -631,6 +639,7 @@ async def test_convert_falls_back_to_transcode_when_copy_output_invalid(monkeypa
     monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
     monkeypatch.setattr(upload_util, "job_dir", lambda job_id: directory)
     monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+    monkeypatch.setattr(upload_util, "download_hls_source", _noop_download)
 
     result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
 
@@ -648,6 +657,133 @@ async def test_convert_timeout_does_not_start_transcode(monkeypatch, tmp_path):
     monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
     monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / "job")
     monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+    monkeypatch.setattr(upload_util, "download_hls_source", _noop_download)
 
     with pytest.raises(RuntimeError, match="ffmpeg timeout"):
         await upload_util.convert_source_to_file("job123", SIGNED_URL)
+
+
+def test_parallel_download_defaults_are_configured():
+    fields = type(settings).model_fields
+    assert fields["earnvids_download_concurrency"].default == 8
+    assert fields["earnvids_stall_timeout"].default == 600
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        payload: bytes = b"",
+        headers: dict[str, str] | None = None,
+        tracker: Any = None,
+        url: str = "",
+    ) -> None:
+        self.status = 200
+        self._text = text
+        self._payload = payload
+        self.headers = headers or {}
+        self.content = self
+        self._tracker = tracker
+        self._url = url
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def text(self, errors: str = "ignore") -> str:
+        return self._text
+
+    def iter_chunked(self, size: int):
+        async def chunks():
+            if self._tracker is None:
+                if self._payload:
+                    yield self._payload
+                return
+            tracker = self._tracker
+            async with tracker.condition:
+                tracker.active += 1
+                tracker.peak = max(tracker.peak, tracker.active)
+                tracker.condition.notify_all()
+            try:
+                # Hold every segment until the configured number of requests
+                # is in flight. A sequential downloader times out here.
+                async with tracker.condition:
+                    await asyncio.wait_for(
+                        tracker.condition.wait_for(
+                            lambda: tracker.active >= tracker.concurrency
+                        ),
+                        timeout=1.0,
+                    )
+                index = int(self._url.rsplit("seg-", 1)[1].split(".")[0])
+                # Finish in reverse order to prove the assembled file keeps
+                # playlist order rather than completion order.
+                await asyncio.sleep((tracker.total - index) * 0.01)
+                for offset in range(0, len(self._payload), size):
+                    yield self._payload[offset : offset + size]
+            finally:
+                async with tracker.condition:
+                    tracker.active -= 1
+
+        return chunks()
+
+
+class _FakeSegmentSession:
+    def __init__(
+        self, texts: dict[str, str], bodies: dict[str, bytes], concurrency: int
+    ) -> None:
+        self.texts = texts
+        self.bodies = bodies
+        self.concurrency = concurrency
+        self.total = len(bodies)
+        self.condition = asyncio.Condition()
+        self.active = 0
+        self.peak = 0
+        self.requests: list[str] = []
+
+    def get(self, url: str, *, proxy=None, timeout=None) -> _FakeResponse:
+        self.requests.append(url)
+        if url in self.texts:
+            return _FakeResponse(text=self.texts[url])
+        payload = self.bodies[url]
+        return _FakeResponse(
+            payload=payload,
+            headers={"Content-Length": str(len(payload))},
+            tracker=self,
+            url=url,
+        )
+
+
+@pytest.mark.asyncio
+async def test_hls_download_is_parallel_and_ordered(monkeypatch, tmp_path):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(6)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + "".join(
+        f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(6)
+    )
+    bodies = {
+        url: f"seg{index}:".encode() + bytes([65 + index]) * 64
+        for index, url in enumerate(segment_urls)
+    }
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant}, bodies, concurrency=3
+    )
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(settings, "earnvids_download_concurrency", 3)
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / "job")
+
+    result = await upload_util.download_hls_source("job123", SIGNED_URL)
+
+    assert result == tmp_path / "job" / "input.ts"
+    assert result.read_bytes() == b"".join(bodies[url] for url in segment_urls)
+    assert tracker.peak == 3
+    assert sum(url.endswith(".ts") for url in tracker.requests) == 6
+    assert not list((tmp_path / "job").glob("segment-*.ts"))

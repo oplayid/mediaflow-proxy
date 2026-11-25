@@ -15,12 +15,19 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, Coroutine
+from urllib.parse import urljoin
+
+from aiohttp import ClientTimeout
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.utils import redis_utils
+from mediaflow_proxy.utils.http_utils import create_aiohttp_session
 from mediaflow_proxy.utils.log_redaction import redact_sensitive
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+HLS_MAP_RE = re.compile(r'^#EXT-X-MAP:URI="([^"]+)"', re.MULTILINE)
+HLS_KEY_RE = re.compile(r"^#EXT-X-KEY:", re.MULTILINE)
+HLS_VARIANT_TAG = "#EXT-X-STREAM-INF"
 UPLOAD_DIR = Path("/tmp/mfp-earnvids-upload")
 _LOCAL_JOBS: dict[str, dict[str, Any]] = {}
 _LOCAL_JOB_LIMIT = 256
@@ -146,10 +153,136 @@ def _valid_output(output: Path) -> bool:
         return False
 
 
+async def _fetch_manifest(
+    session: Any, proxy_url: str | None, url: str, timeout: ClientTimeout
+) -> str | None:
+    """Fetch a small playlist without ever logging its signed URL."""
+    try:
+        async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
+            if response.status != 200:
+                logger.info("[earnvids] manifest HTTP %s", response.status)
+                return None
+            return await response.text(errors="ignore")
+    except Exception as exc:
+        logger.info("[earnvids] manifest fetch failed: %s", type(exc).__name__)
+        return None
+
+
+def _playlist_segments(body: str, base_url: str) -> list[str]:
+    entries = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    init = HLS_MAP_RE.search(body)
+    if init:
+        entries.insert(0, init.group(1))
+    return [urljoin(base_url, entry) for entry in entries if entry]
+
+
+async def download_hls_source(job_id: str, source_url: str) -> Path | None:
+    """Download an HLS source in parallel and return its assembled TS file.
+
+    Direct video files, encrypted playlists and single-entry playlists return
+    ``None`` so the existing ffmpeg path stays in charge. Segment URLs stay
+    in-process; only counts and byte totals are logged.
+    """
+    timeout = ClientTimeout(
+        connect=10,
+        sock_read=max(60, int(settings.earnvids_stall_timeout)),
+        total=None,
+    )
+    async with create_aiohttp_session(source_url, timeout=timeout) as (session, proxy_url):
+        body = await _fetch_manifest(session, proxy_url, source_url, timeout)
+        if not body or not body.lstrip().startswith("#EXTM3U"):
+            return None
+
+        manifest_url = source_url
+        if HLS_VARIANT_TAG in body:
+            variants = _playlist_segments(body, source_url)
+            if not variants:
+                return None
+            manifest_url = variants[0]
+            body = await _fetch_manifest(session, proxy_url, manifest_url, timeout)
+            if not body:
+                return None
+
+        if HLS_KEY_RE.search(body):
+            # AES-128 needs ffmpeg's key/IV handling; concatenating encrypted
+            # segments would produce an undecryptable file.
+            logger.info("[earnvids] job=%s encrypted HLS uses ffmpeg path", job_id)
+            return None
+
+        segments = _playlist_segments(body, manifest_url)
+        if len(segments) <= 1:
+            return None
+
+        directory = job_dir(job_id)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        concurrency = max(1, min(32, int(settings.earnvids_download_concurrency)))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def grab(index: int, url: str) -> int:
+            async with semaphore:
+                target = directory / f"segment-{index:06d}.ts"
+                for attempt in range(3):
+                    try:
+                        async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"segment HTTP {response.status}")
+                            expected = int(response.headers.get("Content-Length") or 0)
+                            written = 0
+                            with target.open("wb") as handle:
+                                async for chunk in response.content.iter_chunked(1 << 20):
+                                    handle.write(chunk)
+                                    written += len(chunk)
+                        if written == 0 or (expected and written != expected):
+                            raise RuntimeError("short segment")
+                        return written
+                    except Exception:
+                        target.unlink(missing_ok=True)
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(1 + attempt)
+                return 0
+
+        try:
+            results = await asyncio.gather(
+                *(grab(index, url) for index, url in enumerate(segments))
+            )
+        except Exception:
+            for index in range(len(segments)):
+                (directory / f"segment-{index:06d}.ts").unlink(missing_ok=True)
+            raise
+
+        combined = directory / "input.ts"
+        total = 0
+        with combined.open("wb") as output:
+            for index in range(len(segments)):
+                target = directory / f"segment-{index:06d}.ts"
+                with target.open("rb") as handle:
+                    shutil.copyfileobj(handle, output)
+                total += results[index]
+                target.unlink(missing_ok=True)
+
+        logger.info(
+            "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d",
+            job_id,
+            len(segments),
+            total,
+            concurrency,
+        )
+        return combined
+
+
 async def convert_source_to_file(job_id: str, source_url: str) -> Path:
     """Remux the signed stream into one MP4, then transcode only if needed."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg unavailable")
+
+    prepared = await download_hls_source(job_id, source_url)
+    if prepared is not None:
+        source_url = str(prepared)
 
     directory = job_dir(job_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)

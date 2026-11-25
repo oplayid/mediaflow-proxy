@@ -179,6 +179,12 @@ class Settings(BaseSettings):
     earnvids_upload_copy_timeout: int = 900
     earnvids_upload_ffmpeg_timeout: int = 3600
     earnvids_job_ttl: int = 24 * 60 * 60
+    # HLS is downloaded segment-by-segment in parallel before remuxing. Each
+    # connection is still rate limited by most hosts, so concurrency is the
+    # only way to use more of the VPS bandwidth. The stall timeout replaces a
+    # hard total limit: a long film keeps running while bytes keep arriving.
+    earnvids_download_concurrency: int = 8
+    earnvids_stall_timeout: int = 600
 
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.

@@ -39,6 +39,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
     | `EARNVIDS_UPLOAD_HEIGHT` / `_CRF` / `_PRESET` | `720` / `23` / `veryfast` | Optional. MP4 remux quality used before uploading to EarnVids. |
     | `EARNVIDS_UPLOAD_MAX_SECONDS` / `_MAX_BYTES` | `14400` / `2147483648` | Optional. Hard bounds for one background upload; 4 hours by default so full films are not truncated. |
     | `EARNVIDS_UPLOAD_COPY_TIMEOUT` / `_FFMPEG_TIMEOUT` / `EARNVIDS_JOB_TTL` | `900` / `3600` / `86400` | Optional. Remux budget, transcode fallback budget, and Redis job state lifetime in seconds. |
+    | `EARNVIDS_DOWNLOAD_CONCURRENCY` / `EARNVIDS_STALL_TIMEOUT` | `8` / `600` | Optional. Parallel HLS segment downloads; stall timeout in seconds is per read, not a total job limit. |
     | `EARNVIDS_FLD_ID` / `EARNVIDS_CAT_ID` / `EARNVIDS_TAGS` | empty | Optional. Forwarded to EarnVids as folder/category/tags. |
 
     Never use `VITE_*` names for these secrets: they would be bundled into the browser. The EarnVids bridge is server-to-server only — Streamflix signs the request with `MFP_EARNVIDS_SECRET`, mfp resolves the source, remuxes it to one MP4 and uploads the file, so the original `?sign=...` link, signed URL and `api_password` never leave this origin. Only upload content you own or are licensed to distribute.
