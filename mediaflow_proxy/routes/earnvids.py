@@ -1,14 +1,15 @@
-"""Server-to-server bridge that hands mfp-signed media URLs to EarnVids.
+"""Server-to-server bridge that uploads one converted MP4 to EarnVids.
 
 StreamFlix never sees a provider URL or a signed query. It sends only media
 identity and an HMAC made with ``MFP_EARNVIDS_SECRET``. mfp resolves the
-requested source, signs a same-origin proxy URL with a 6-hour token, and asks
-EarnVids to fetch that URL. The EarnVids API key and all upstream headers stay
-on this origin.
+requested source, signs a same-origin proxy URL, remuxes it into a bounded
+temporary MP4 and uploads that file to EarnVids' ``upload/server`` endpoint.
+The EarnVids API key and all upstream headers stay on this origin.
 
-Status is derived from three EarnVids endpoints: ``file/info`` decides whether
-a file is playable, ``file/encodings`` supplies progress and the verified player
-link, and ``file/url_uploads`` exposes queue errors and remaining URL quota.
+Uploads run as background jobs so a feature-length film is not bound by the
+120-second gunicorn request timeout. Job state is shared through Redis and
+never contains the signed source URL. Final playback state is derived from
+``file/info``, ``file/encodings`` and ``file/url_uploads``.
 """
 
 from __future__ import annotations
@@ -19,16 +20,26 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, FormData
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.player.adapters import configured_servers, get_adapter
 from mediaflow_proxy.routes.embed import _sign_asset_url
+from mediaflow_proxy.utils.earnvids_upload import (
+    cleanup_job,
+    convert_source_to_file,
+    load_job,
+    new_job_id,
+    spawn_job,
+    store_job,
+    valid_job_id,
+)
 from mediaflow_proxy.utils.http_utils import create_streamer, get_proxy_headers
 
 logger = logging.getLogger(__name__)
@@ -101,6 +112,13 @@ def _file_code_from(data: dict[str, Any]) -> str:
     if not file_code or not _FILE_CODE_RE.match(file_code):
         raise HTTPException(status_code=400, detail="file_code tidak valid")
     return file_code
+
+
+def _job_id_from(data: dict[str, Any]) -> str:
+    job_id = str(data.get("job_id") or "").strip()
+    if not valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="job_id tidak valid")
+    return job_id
 
 
 def _integer(value: Any, default: int = 0) -> int:
@@ -332,66 +350,240 @@ async def _player_link(file_code: str, title: str) -> str:
     return ""
 
 
-async def _collect_status(file_code: str, title: str = "") -> dict[str, Any]:
-    info_payload = await _earnvids_get(
-        "/file/info", {"file_code": file_code}, allow_missing=True
-    )
-    info_items = _dict_list(info_payload.get("result"))
-    info = next(
-        (item for item in info_items if str(item.get("file_code") or "").strip() == file_code),
-        info_items[0] if info_items else {},
-    )
-    canplay = _integer(info.get("canplay")) == 1 and _integer(info.get("status")) == 200
+async def _patch_job(job_id: str, **changes: Any) -> dict[str, Any]:
+    state = await load_job(job_id)
+    state.update(changes)
+    state["updated_at"] = time.time()
+    await store_job(job_id, state)
+    return state
 
-    encodings = await _earnvids_get(
-        "/file/encodings", {"file_code": file_code}, allow_missing=True
-    )
-    enc_items = _dict_list(encodings.get("result"))
+
+def _safe_filename(title: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-")[:60]
+    return cleaned or "video"
+
+
+async def _earnvids_post_file(
+    upload_url: str,
+    path: Path,
+    title: str,
+    metadata: dict[str, str],
+    options: dict[str, Any],
+) -> str:
+    """POST one MP4 to the server URL returned by EarnVids' upload/server API."""
+    key = _secret("earnvids_api_key")
+    if not key:
+        raise RuntimeError("EARNVIDS_API_KEY belum dikonfigurasi")
+
+    parsed = urlparse(upload_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("Upload server EarnVids tidak valid")
+
+    form = FormData()
+    form.add_field("key", key)
+    form.add_field("file_public", "1" if options.get("file_public", True) else "0")
+    if title:
+        form.add_field("file_title", title)
+    if metadata.get("overview"):
+        form.add_field("file_descr", metadata["overview"])
+    if settings.earnvids_fld_id:
+        form.add_field("fld_id", settings.earnvids_fld_id)
+    if settings.earnvids_cat_id:
+        form.add_field("cat_id", settings.earnvids_cat_id)
+    if settings.earnvids_tags:
+        form.add_field("tags", settings.earnvids_tags)
+
+    streamer = await create_streamer(upload_url)
+    try:
+        with path.open("rb") as handle:
+            form.add_field(
+                "file",
+                handle,
+                filename=f"{_safe_filename(title)}.mp4",
+                content_type="video/mp4",
+            )
+            async with streamer.session.post(
+                upload_url,
+                data=form,
+                timeout=ClientTimeout(total=max(60, int(settings.earnvids_upload_ffmpeg_timeout))),
+            ) as response:
+                status = response.status
+                text = await response.text(errors="ignore")
+    except Exception as exc:
+        # Never echo the body: it can contain the API key echo or provider URLs.
+        logger.warning("[earnvids] multipart upload failed: %s", type(exc).__name__)
+        raise RuntimeError("Gagal mengunggah file ke EarnVids") from exc
+    finally:
+        await streamer.session.close()
+
+    if status != 200:
+        logger.warning("[earnvids] upload server returned HTTP %s", status)
+        raise RuntimeError("EarnVids menolak unggahan file")
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise RuntimeError("Respons unggahan EarnVids bukan JSON") from exc
+    if not isinstance(payload, dict) or int(payload.get("status") or 0) != 200:
+        raise RuntimeError("EarnVids menolak unggahan file")
+
+    files = [item for item in _dict_list(payload.get("files"))]
+    filecode = str(files[0].get("filecode") or "").strip() if files else ""
+    if not filecode or not _FILE_CODE_RE.match(filecode):
+        raise RuntimeError("EarnVids tidak mengembalikan filecode yang valid")
+    return filecode
+
+
+async def _run_upload_job(
+    job_id: str,
+    source_url: str,
+    initial: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    title = str(initial.get("title") or "").strip()
+    metadata = {
+        "title": title,
+        "year": str(initial.get("year") or ""),
+        "overview": str(initial.get("overview") or ""),
+    }
+    try:
+        await _patch_job(job_id, state="downloading", progress=5, error="")
+        path = await convert_source_to_file(job_id, source_url)
+        await _patch_job(job_id, state="uploading", progress=45)
+
+        server = await _earnvids_get("/upload/server", {})
+        upload_url = str(server.get("result") or "").strip()
+        filecode = await _earnvids_post_file(upload_url, path, title, metadata, options)
+        await _patch_job(job_id, state="encoding", filecode=filecode, progress=70)
+
+        if title:
+            try:
+                await _earnvids_get("/file/edit", {"file_code": filecode, "file_title": title})
+            except HTTPException:
+                # Cosmetic metadata must never fail a completed upload.
+                logger.warning("[earnvids] failed to set title for %s", filecode)
+
+        final = await _collect_status(filecode, title, job_id)
+        await _patch_job(
+            job_id,
+            state=final["state"],
+            status=final["status"],
+            progress=final["progress"],
+            canplay=final["canplay"],
+            player_url=final["player_url"],
+            title=final["title"] or title,
+            duration=final["duration"],
+            error=final["error"] or "",
+        )
+    except Exception as exc:
+        logger.warning("[earnvids] job=%s failed: %s", job_id, type(exc).__name__)
+        await _patch_job(
+            job_id,
+            state="failed",
+            error="Gagal mengunggah video ke EarnVids",
+        )
+    finally:
+        cleanup_job(job_id)
+
+
+async def _collect_status(
+    file_code: str = "", title: str = "", job_id: str = ""
+) -> dict[str, Any]:
+    job_id = job_id if valid_job_id(job_id) else ""
+    job = await load_job(job_id) if job_id else {}
+
+    if not file_code:
+        candidate = str(job.get("filecode") or "").strip()
+        file_code = candidate if candidate and _FILE_CODE_RE.match(candidate) else ""
+
+    info: dict[str, Any] = {}
+    enc_items: list[dict[str, Any]] = []
+    queue_entry: dict[str, Any] = {}
+    queue_status = ""
+    enc_status = ""
+    canplay = False
+    requests_available = _integer(job.get("requests_available"), -1)
+
+    if file_code:
+        info_payload = await _earnvids_get(
+            "/file/info", {"file_code": file_code}, allow_missing=True
+        )
+        info_items = _dict_list(info_payload.get("result"))
+        info = next(
+            (item for item in info_items if str(item.get("file_code") or "").strip() == file_code),
+            info_items[0] if info_items else {},
+        )
+        canplay = _integer(info.get("canplay")) == 1 and _integer(info.get("status")) == 200
+
+        encodings = await _earnvids_get(
+            "/file/encodings", {"file_code": file_code}, allow_missing=True
+        )
+        enc_items = _dict_list(encodings.get("result"))
+        enc_status = next(
+            (str(item.get("status") or "").upper() for item in enc_items if item.get("status")),
+            "",
+        )
+
+        queue = await _earnvids_get(
+            "/file/url_uploads", {"file_code": file_code}, allow_missing=True
+        )
+        queue_entry = _queue_item(queue.get("result"), file_code)
+        queue_status = str(queue_entry.get("status") or "").upper()
+        requests_available = _integer(queue.get("requests_available"), -1)
+
     progress = max((_integer(item.get("progress")) for item in enc_items), default=0)
-    enc_status = next(
-        (str(item.get("status") or "").upper() for item in enc_items if item.get("status")),
-        "",
-    )
+    if not progress:
+        progress = _integer(job.get("progress"))
+    if not requests_available or requests_available < 0:
+        requests_available = _integer(job.get("requests_available"), -1)
 
-    queue = await _earnvids_get(
-        "/file/url_uploads", {"file_code": file_code}, allow_missing=True
-    )
-    queue_entry = _queue_item(queue.get("result"), file_code)
-    queue_status = str(queue_entry.get("status") or "").upper()
-    requests_available = _integer(queue.get("requests_available"), -1)
-
+    job_state = str(job.get("state") or "").strip().lower()
     combined = f"{queue_status} {enc_status}".upper()
     if canplay:
         state = "uploaded"
         progress = max(progress, 100)
     elif any(word in combined for word in ("ERROR", "FAILED", "DELETED")):
         state = "failed"
-    elif "ENCODING" in combined or "CONVERTING" in combined:
+    elif job_state == "failed":
+        state = "failed"
+    elif "ENCODING" in combined or "CONVERTING" in combined or job_state == "encoding":
         state = "encoding"
-    elif any(word in combined for word in ("PENDING", "UPLOADING", "DOWNLOADING")):
+    elif any(word in combined for word in ("PENDING", "UPLOADING", "DOWNLOADING")) or job_state in (
+        "uploading",
+        "downloading",
+        "queued",
+    ):
         state = "uploading"
     else:
         state = "queued"
 
-    player_url = await _player_link(file_code, title) if canplay else ""
+    player_url = await _player_link(file_code, title) if canplay else str(job.get("player_url") or "")
+    status = queue_status or enc_status or job_state.upper() or ("READY" if canplay else "PENDING")
+    if state == "failed":
+        if queue_status or enc_status:
+            error = f"EarnVids: {queue_status or enc_status}"
+        else:
+            error = str(job.get("error") or "EarnVids: ERROR")
+    else:
+        error = None
 
     return {
         "filecode": file_code,
+        "job_id": job_id,
         "state": state,
-        "status": queue_status or enc_status or ("READY" if canplay else "PENDING"),
+        "status": status,
         "progress": min(100, max(0, progress)),
         "canplay": canplay,
         "player_url": player_url,
-        "title": str(info.get("file_title") or "").strip(),
-        "duration": _integer(info.get("file_length")),
-        "error": f"EarnVids: {queue_status or enc_status}" if state == "failed" else None,
+        "title": str(info.get("file_title") or job.get("title") or title or "").strip(),
+        "duration": _integer(info.get("file_length"), _integer(job.get("duration"))),
+        "error": error,
         "requests_available": requests_available,
     }
 
 
 @earnvids_router.post("/internal/earnvids/upload")
 async def earnvids_upload(request: Request):
-    """Resolve media and ask EarnVids to fetch the signed mfp proxy URL."""
+    """Start a background MP4 upload and return an opaque job id immediately."""
     data = await _json_body(request)
     media_type, media_id, season, episode = _media_from(data)
     quality = str(data.get("quality") or "").strip()
@@ -400,43 +592,34 @@ async def earnvids_upload(request: Request):
     metadata = await _tmdb_metadata(media_type, media_id)
     title = str(metadata.get("title") or title).strip()
 
-    quota = await _earnvids_get("/file/url_uploads", {})
-    if _integer(quota.get("requests_available"), -1) == 0:
-        raise HTTPException(status_code=429, detail="Kuota upload URL EarnVids habis")
-
     signed, host, chosen_quality = await _sign_source(
         request, media_type, media_id, season, episode, quality, source
     )
-
-    params: dict[str, Any] = {
-        "url": signed,
-        "file_public": "1" if data.get("file_public", True) else "0",
+    job_id = new_job_id()
+    initial = {
+        "job_id": job_id,
+        "state": "queued",
+        "status": "PENDING",
+        "filecode": "",
+        "progress": 0,
+        "canplay": False,
+        "player_url": "",
+        "title": title,
+        "year": metadata.get("year", ""),
+        "overview": metadata.get("overview", ""),
+        "duration": 0,
+        "error": "",
+        # Server-only: used by the background job, never returned to a browser.
+        "source": host,
+        "quality": chosen_quality,
     }
-    if settings.earnvids_fld_id:
-        params["fld_id"] = settings.earnvids_fld_id
-    if settings.earnvids_cat_id:
-        params["cat_id"] = settings.earnvids_cat_id
-    if settings.earnvids_tags:
-        params["tags"] = settings.earnvids_tags
-
-    payload = await _earnvids_get("/upload/url", params)
-    filecode = str((payload.get("result") or {}).get("filecode") or "").strip()
-    if not filecode or not _FILE_CODE_RE.match(filecode):
-        raise HTTPException(status_code=502, detail="EarnVids tidak mengembalikan filecode yang valid")
-
-    if title:
-        try:
-            await _earnvids_get("/file/edit", {"file_code": filecode, "file_title": title})
-        except HTTPException:
-            # Metadata is cosmetic; the upload itself must not fail because of it.
-            logger.warning("[earnvids] failed to set title for %s", filecode)
+    await store_job(job_id, initial)
+    spawn_job(_run_upload_job(job_id, signed, initial, data))
 
     return JSONResponse(
         {
-            "filecode": filecode,
-            "source": host,
-            "quality": chosen_quality,
-            "player_url": await _player_link(filecode, title),
+            "job_id": job_id,
+            "status": "queued",
             "title": title,
             "year": metadata.get("year", ""),
             "overview": metadata.get("overview", ""),
@@ -447,17 +630,43 @@ async def earnvids_upload(request: Request):
                 "episode": episode,
             },
         },
+        status_code=202,
         headers={"Cache-Control": "no-store"},
     )
 
 
 @earnvids_router.post("/internal/earnvids/status")
 async def earnvids_status(request: Request):
-    """Report upload/encoding state and the API-verified player URL."""
+    """Report job/upload state and the API-verified player URL."""
     data = await _json_body(request)
-    file_code = _file_code_from(data)
+    raw_code = str(data.get("file_code") or "").strip()
+    file_code = _file_code_from(data) if raw_code else ""
+    job_id = _job_id_from(data) if data.get("job_id") else ""
+    if not file_code and not job_id:
+        raise HTTPException(status_code=400, detail="file_code atau job_id diperlukan")
     title = str(data.get("title") or "").strip()
-    return JSONResponse(await _collect_status(file_code, title), headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        await _collect_status(file_code, title, job_id),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@earnvids_router.post("/internal/earnvids/action")
+async def earnvids_action(request: Request):
+    """Delete one failed URL-upload queue entry without touching other files."""
+    data = await _json_body(request)
+    action = str(data.get("action") or "delete").strip().lower()
+    if action != "delete":
+        raise HTTPException(status_code=400, detail="action harus delete")
+    file_code = _file_code_from(data)
+    payload = await _earnvids_get("/file/url_actions", {"delete_code": file_code})
+    return JSONResponse(
+        {
+            "deleted": file_code,
+            "requests_available": _integer(payload.get("requests_available"), -1),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @earnvids_router.post("/internal/earnvids/info")

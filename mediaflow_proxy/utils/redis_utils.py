@@ -372,6 +372,36 @@ def _lock_key(key: str) -> str:
     return f"{LOCK_PREFIX}{key_hash}"
 
 
+EARNVIDS_JOB_PREFIX = "mfp:earnvids:job:"
+
+
+def _earnvids_job_key(job_id: str) -> str:
+    """Hash the opaque job id before using it as a Redis key."""
+    return EARNVIDS_JOB_PREFIX + hashlib.sha256(job_id.encode()).hexdigest()
+
+
+async def get_earnvids_job(job_id: str) -> Optional[dict]:
+    """Read EarnVids upload job state. Returns None when Redis is unavailable."""
+    r = await get_redis()
+    if r is None:
+        return None
+    data = await r.get(_earnvids_job_key(job_id))
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except ValueError:
+        return None
+
+
+async def set_earnvids_job(job_id: str, state: dict, ttl: int = 24 * 60 * 60):
+    """Persist EarnVids upload job state. No-op when Redis is unavailable."""
+    r = await get_redis()
+    if r is None:
+        return
+    await r.set(_earnvids_job_key(job_id), json.dumps(state), ex=ttl)
+
+
 async def acquire_lock(key: str, ttl: int = DEFAULT_LOCK_TTL, timeout: float = 30.0) -> bool:
     """
     Acquire a distributed lock.

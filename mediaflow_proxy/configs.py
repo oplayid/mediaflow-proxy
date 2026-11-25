@@ -158,8 +158,8 @@ class Settings(BaseSettings):
     subdl_api_key: str = ""
 
     # Optional EarnVids bridge. StreamFlix signs a small request with
-    # MFP_EARNVIDS_SECRET; mfp resolves the source, signs a same-origin proxy URL
-    # with a 6-hour token and asks EarnVids to fetch that URL. Neither the
+    # MFP_EARNVIDS_SECRET; mfp resolves the source, signs a same-origin proxy URL,
+    # remuxes it to one MP4 and uploads that file to EarnVids. Neither the
     # provider URL nor these secrets are ever sent to the browser.
     earnvids_api_key: SecretStr | None = None
     mfp_earnvids_secret: SecretStr | None = None
@@ -168,6 +168,15 @@ class Settings(BaseSettings):
     earnvids_cat_id: str = ""
     earnvids_tags: str = ""
     earnvids_request_timeout: float = 20.0
+    # File-upload pipeline. The old URL-upload endpoint expects a direct video
+    # file, while the embeds resolve to HLS manifests, so mfp converts first.
+    earnvids_upload_height: int = 720
+    earnvids_upload_crf: int = 23
+    earnvids_upload_preset: str = "veryfast"
+    earnvids_upload_max_seconds: int = 7200
+    earnvids_upload_max_bytes: int = 2 * 1024 * 1024 * 1024
+    earnvids_upload_ffmpeg_timeout: int = 1800
+    earnvids_job_ttl: int = 24 * 60 * 60
 
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.

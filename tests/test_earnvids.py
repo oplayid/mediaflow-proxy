@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,11 +15,14 @@ from pydantic import SecretStr
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.routes import earnvids as earnvids_routes
+from mediaflow_proxy.utils import earnvids_upload as upload_util
+from mediaflow_proxy.utils.log_redaction import redact_sensitive
 
 SECRET = "shared-hmac-secret"
 RAW_URL = "https://cdn.example/convert-h264/abc.mp4?sign=very-secret-token"
 FILE_CODE = "abc123xyz"
 PLAYER_LINK = f"https://earnvids.com/{FILE_CODE}.html"
+SIGNED_URL = "https://mfp.oplay.id/_token_opaque/proxy/hls/manifest.m3u8"
 
 
 def _request(
@@ -28,6 +32,7 @@ def _request(
     signature: str | None = None,
     secret: str = SECRET,
     app=None,
+    path: str = "/internal/earnvids/upload",
 ) -> Request:
     payload = json.dumps(body).encode()
     stamp = timestamp if timestamp is not None else str(int(time.time()))
@@ -40,8 +45,8 @@ def _request(
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/internal/earnvids/upload",
-        "raw_path": b"/internal/earnvids/upload",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "headers": [
             (b"host", b"mfp.oplay.id"),
@@ -94,14 +99,13 @@ def _fake_earnvids(
     queue: list[dict] | None = None,
     info: list[dict] | None = None,
     encodings: list[dict] | None = None,
-    filecode: str = FILE_CODE,
 ):
     async def fake_get(path: str, params: dict[str, Any], **kwargs):
         calls.append((path, dict(params)))
         if path == "/file/url_uploads":
             return {"status": 200, "requests_available": requests_available, "result": queue or []}
-        if path == "/upload/url":
-            return {"status": 200, "result": {"filecode": filecode}}
+        if path == "/upload/server":
+            return {"status": 200, "result": "https://s1.earnvids.example/upload/01"}
         if path == "/file/encodings":
             return {"status": 200, "result": encodings if encodings is not None else []}
         if path == "/file/info":
@@ -110,12 +114,14 @@ def _fake_earnvids(
             return {"status": 200, "result": {"files": []}}
         if path == "/file/edit":
             return {"status": 200, "result": "true"}
+        if path == "/file/url_actions":
+            return {"status": 200, "requests_available": requests_available}
         raise AssertionError(f"unexpected EarnVids path: {path}")
 
     return fake_get
 
 
-def _patch_common(monkeypatch, earnvids_get):
+def _patch_common(monkeypatch, earnvids_get=None):
     monkeypatch.setattr(settings, "mfp_earnvids_secret", SecretStr(SECRET))
     monkeypatch.setattr(settings, "earnvids_api_key", SecretStr("earnvids-api-key-secret"))
     monkeypatch.setattr(settings, "tmdb_api_key", None)
@@ -125,7 +131,16 @@ def _patch_common(monkeypatch, earnvids_get):
         "configured_servers",
         lambda: [_FakeAdapter("VidCore"), _FakeAdapter("VidLink")],
     )
-    monkeypatch.setattr(earnvids_routes, "_earnvids_get", earnvids_get)
+    if earnvids_get is not None:
+        monkeypatch.setattr(earnvids_routes, "_earnvids_get", earnvids_get)
+    # Background jobs are tested separately; never start ffmpeg from a route test.
+    monkeypatch.setattr(earnvids_routes, "spawn_job", lambda coroutine: coroutine.close())
+    monkeypatch.setattr(earnvids_routes, "store_job", lambda job_id, state: _noop_async())
+    monkeypatch.setattr(earnvids_routes, "load_job", lambda job_id: _noop_async({}))
+
+
+async def _noop_async(value=None):
+    return value
 
 
 @pytest.mark.asyncio
@@ -155,15 +170,12 @@ async def test_upload_rejects_bad_hmac(monkeypatch, kwargs, status):
 
 
 @pytest.mark.asyncio
-async def test_upload_signs_real_proxy_url_without_leaking_secrets(monkeypatch):
+async def test_upload_returns_opaque_job_and_does_not_call_earnvids(monkeypatch):
     from mediaflow_proxy.main import app
 
     calls: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(settings, "api_password", "unit-api-password")
-    _patch_common(
-        monkeypatch,
-        _fake_earnvids(calls, encodings=[{"link": PLAYER_LINK, "status": "ENCODING", "progress": 15}]),
-    )
+    _patch_common(monkeypatch, _fake_earnvids(calls))
 
     response = await earnvids_routes.earnvids_upload(
         _request(
@@ -172,62 +184,38 @@ async def test_upload_signs_real_proxy_url_without_leaking_secrets(monkeypatch):
         )
     )
     body = response.body.decode()
+    payload = json.loads(body)
 
-    upload = next(params for path, params in calls if path == "/upload/url")
-    signed = upload["url"]
-    assert signed.startswith("https://mfp.oplay.id/_token_")
-    assert "api_password" not in signed
-    assert RAW_URL not in signed
-    assert "sign=very-secret-token" not in signed
-    assert "earnvids-api-key-secret" not in signed
-
-    assert json.loads(body) == {
-        "filecode": FILE_CODE,
-        "source": "VidLink",
-        "quality": "1080",
-        "player_url": PLAYER_LINK,
-        "title": "",
-        "year": "",
-        "overview": "",
-        "media": {"type": "movie", "id": "786892", "season": "1", "episode": "1"},
+    assert response.status_code == 202
+    assert payload["status"] == "queued"
+    assert upload_util.valid_job_id(payload["job_id"])
+    assert payload["media"] == {
+        "type": "movie",
+        "id": "786892",
+        "season": "1",
+        "episode": "1",
     }
-    assert RAW_URL not in body
-    assert "earnvids-api-key-secret" not in body
-    assert "unit-api-password" not in body
-    assert response.headers["cache-control"] == "no-store"
+    assert "filecode" not in payload
+    assert "source" not in payload
+    assert "player_url" not in payload
+    assert calls == []
+    for secret in (RAW_URL, "sign=very-secret-token", "earnvids-api-key-secret", "unit-api-password"):
+        assert secret not in body
 
 
 @pytest.mark.asyncio
-async def test_upload_checks_url_quota_before_resolving(monkeypatch):
+async def test_upload_signs_source_with_six_hour_token(monkeypatch):
+    captured: dict[str, Any] = {}
     calls: list[tuple[str, dict[str, Any]]] = []
-    _patch_common(monkeypatch, _fake_earnvids(calls, requests_available=0))
-    monkeypatch.setattr(
-        earnvids_routes,
-        "_sign_asset_url",
-        lambda *args, **kwargs: pytest.fail("resolve must not run when quota is exhausted"),
-    )
-
-    with pytest.raises(HTTPException) as exc:
-        await earnvids_routes.earnvids_upload(_request({"type": "movie", "id": "786892"}))
-
-    assert exc.value.status_code == 429
-    assert [path for path, _ in calls] == ["/file/url_uploads"]
-
-
-@pytest.mark.asyncio
-async def test_upload_uses_six_hour_token_and_direct_endpoint(monkeypatch):
-    captured: dict = {}
-    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
 
     def fake_sign(request, result, proxy_headers, destination_url, **kwargs):
         captured.update(kwargs)
         captured["destination"] = destination_url
-        return "https://mfp.oplay.id/_token_opaque/proxy/stream"
+        return SIGNED_URL
 
     monkeypatch.setattr(settings, "earnvids_source_token_ttl", 6 * 60 * 60)
-    _patch_common(monkeypatch, _fake_earnvids(calls))
     monkeypatch.setattr(earnvids_routes, "_sign_asset_url", fake_sign)
-
     await earnvids_routes.earnvids_upload(
         _request({"type": "tv", "id": "246473", "season": "2", "episode": "3"})
     )
@@ -239,18 +227,52 @@ async def test_upload_uses_six_hour_token_and_direct_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_upload_rejects_invalid_filecode(monkeypatch):
+async def test_upload_uses_tmdb_metadata_without_client_title(monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+
+    async def fake_tmdb(media_type, media_id):
+        return {"title": "Judul Dari TMDB", "year": "2024", "overview": "Sinopsis resmi"}
+
+    monkeypatch.setattr(earnvids_routes, "_tmdb_metadata", fake_tmdb)
     from mediaflow_proxy.main import app
 
-    calls: list[tuple[str, dict[str, Any]]] = []
-    _patch_common(
-        monkeypatch, _fake_earnvids(calls, filecode="not valid?!?")
+    response = await earnvids_routes.earnvids_upload(
+        _request({"type": "movie", "id": "786892", "title": "Judul Dari Client"}, app=app)
     )
-    with pytest.raises(HTTPException) as exc:
-        await earnvids_routes.earnvids_upload(
-            _request({"type": "movie", "id": "786892"}, app=app)
-        )
-    assert exc.value.status_code == 502
+    payload = json.loads(response.body.decode())
+
+    assert payload["title"] == "Judul Dari TMDB"
+    assert payload["year"] == "2024"
+    assert payload["overview"] == "Sinopsis resmi"
+    assert "Judul Dari Client" not in response.body.decode()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_upload_uses_first_successful_server(monkeypatch):
+    from mediaflow_proxy.main import app
+
+    stored: list[dict[str, Any]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+    monkeypatch.setattr(
+        earnvids_routes,
+        "configured_servers",
+        lambda: [_FailingAdapter("VidCore"), _FakeAdapter("VidSrc")],
+    )
+
+    async def fake_store(job_id, state):
+        stored.append(dict(state))
+
+    monkeypatch.setattr(earnvids_routes, "store_job", fake_store)
+    await earnvids_routes.earnvids_upload(
+        _request({"type": "movie", "id": "786892"}, app=app)
+    )
+
+    assert stored[0]["source"] == "VidSrc"
+    assert stored[0]["state"] == "queued"
+    assert SIGNED_URL not in json.dumps(stored)
 
 
 @pytest.mark.asyncio
@@ -281,6 +303,7 @@ async def test_status_uses_file_info_as_source_of_truth(monkeypatch):
 
     assert payload == {
         "filecode": FILE_CODE,
+        "job_id": "",
         "state": "uploaded",
         "status": "CONVERTED",
         "progress": 100,
@@ -337,6 +360,76 @@ async def test_status_reports_failed_upload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_status_follows_job_state_before_filecode_exists(monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+
+    async def fake_load(job_id):
+        return {
+            "job_id": job_id,
+            "state": "uploading",
+            "status": "UPLOADING",
+            "filecode": "",
+            "progress": 45,
+            "title": "Sedang diunggah",
+            "error": "",
+        }
+
+    monkeypatch.setattr(earnvids_routes, "load_job", fake_load)
+    response = await earnvids_routes.earnvids_status(
+        _request({"job_id": "job123"}, path="/internal/earnvids/status")
+    )
+    payload = json.loads(response.body.decode())
+
+    assert payload["filecode"] == ""
+    assert payload["job_id"] == "job123"
+    assert payload["state"] == "uploading"
+    assert payload["progress"] == 45
+    assert payload["title"] == "Sedang diunggah"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_status_requires_file_code_or_job_id(monkeypatch):
+    _patch_common(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await earnvids_routes.earnvids_status(
+            _request({}, path="/internal/earnvids/status")
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_status_rejects_bad_file_code(monkeypatch):
+    async def fake_get(path, params, **kwargs):
+        pytest.fail("EarnVids must not be called for an invalid file code")
+
+    _patch_common(monkeypatch, fake_get)
+    with pytest.raises(HTTPException) as exc:
+        await earnvids_routes.earnvids_status(
+            _request({"file_code": "../etc/passwd"}, path="/internal/earnvids/status")
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_action_deletes_only_requested_code(monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+    response = await earnvids_routes.earnvids_action(
+        _request(
+            {"action": "delete", "file_code": FILE_CODE},
+            path="/internal/earnvids/action",
+        )
+    )
+
+    payload = json.loads(response.body.decode())
+    assert payload["deleted"] == FILE_CODE
+    assert calls == [("/file/url_actions", {"delete_code": FILE_CODE})]
+    assert all("restart_errors" not in params for _, params in calls)
+
+
+@pytest.mark.asyncio
 async def test_info_exposes_only_safe_metadata(monkeypatch):
     calls: list[tuple[str, dict[str, Any]]] = []
     _patch_common(
@@ -356,9 +449,10 @@ async def test_info_exposes_only_safe_metadata(monkeypatch):
         ),
     )
 
-    response = await earnvids_routes.earnvids_info(_request({"file_code": FILE_CODE}))
-    body = response.body.decode()
-    payload = json.loads(body)
+    response = await earnvids_routes.earnvids_info(
+        _request({"file_code": FILE_CODE}, path="/internal/earnvids/info")
+    )
+    payload = json.loads(response.body.decode())
 
     assert payload == {
         "filecode": FILE_CODE,
@@ -368,68 +462,120 @@ async def test_info_exposes_only_safe_metadata(monkeypatch):
         "title": "Judul Aman",
         "duration": 120,
     }
-    assert "api_password" not in body
-    assert RAW_URL not in body
+    assert RAW_URL not in response.body.decode()
 
 
 @pytest.mark.asyncio
-async def test_status_rejects_bad_file_code(monkeypatch):
-    async def fake_get(path, params, **kwargs):
-        pytest.fail("EarnVids must not be called for an invalid file code")
-
-    _patch_common(monkeypatch, fake_get)
-    with pytest.raises(HTTPException) as exc:
-        await earnvids_routes.earnvids_status(_request({"file_code": "../etc/passwd"}))
-    assert exc.value.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_auto_upload_uses_first_successful_server(monkeypatch):
-    from mediaflow_proxy.main import app
-
+async def test_upload_job_converts_and_stores_filecode(monkeypatch, tmp_path):
+    output = tmp_path / "upload.mp4"
+    output.write_bytes(b"0" * 2048)
     calls: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(settings, "api_password", "unit-api-password")
-    _patch_common(monkeypatch, _fake_earnvids(calls))
-    monkeypatch.setattr(
-        earnvids_routes,
-        "configured_servers",
-        lambda: [_FailingAdapter("VidCore"), _FakeAdapter("VidSrc")],
+
+    async def fake_convert(job_id, source_url):
+        assert source_url == SIGNED_URL
+        return output
+
+    async def fake_post(upload_url, path, title, metadata, options):
+        assert upload_url == "https://s1.earnvids.example/upload/01"
+        return FILE_CODE
+
+    monkeypatch.setattr(settings, "mfp_earnvids_secret", SecretStr(SECRET))
+    monkeypatch.setattr(settings, "earnvids_api_key", SecretStr("earnvids-api-key-secret"))
+    monkeypatch.setattr(settings, "tmdb_api_key", None)
+    monkeypatch.setattr(earnvids_routes, "_earnvids_get", _fake_earnvids(calls))
+    monkeypatch.setattr(earnvids_routes, "convert_source_to_file", fake_convert)
+    monkeypatch.setattr(earnvids_routes, "_earnvids_post_file", fake_post)
+    monkeypatch.setattr(earnvids_routes, "cleanup_job", lambda job_id: None)
+
+    states: dict[str, dict[str, Any]] = {}
+
+    async def fake_store(job_id, state):
+        states[job_id] = dict(state)
+
+    async def fake_load(job_id):
+        return dict(states.get(job_id) or {})
+
+    monkeypatch.setattr(earnvids_routes, "store_job", fake_store)
+    monkeypatch.setattr(earnvids_routes, "load_job", fake_load)
+
+    await earnvids_routes._run_upload_job(
+        "job123",
+        SIGNED_URL,
+        {"job_id": "job123", "title": "Judul", "year": "2024", "overview": "Sinopsis"},
+        {"file_public": True},
     )
 
-    response = await earnvids_routes.earnvids_upload(
-        _request({"type": "movie", "id": "786892"}, app=app)
-    )
-    payload = json.loads(response.body.decode())
-
-    assert payload["source"] == "VidSrc"
-    upload = next(params for path, params in calls if path == "/upload/url")
-    assert upload["url"].startswith("https://mfp.oplay.id/_token_")
+    final = states["job123"]
+    assert final["filecode"] == FILE_CODE
+    assert final["state"] in ("uploaded", "encoding")
+    assert final["progress"] >= 70
+    assert SIGNED_URL not in json.dumps(final)
 
 
 @pytest.mark.asyncio
-async def test_upload_uses_tmdb_metadata_and_never_leaks_client_title(monkeypatch):
-    from mediaflow_proxy.main import app
+async def test_multipart_upload_returns_filecode(monkeypatch, tmp_path):
+    path = tmp_path / "upload.mp4"
+    path.write_bytes(b"0" * 2048)
+    captured: dict[str, Any] = {}
 
-    calls: list[tuple[str, dict[str, Any]]] = []
-    _patch_common(monkeypatch, _fake_earnvids(calls))
+    class _FakeResponse:
+        status = 200
 
-    async def fake_tmdb(media_type, media_id):
-        return {
-            "title": "Judul Dari TMDB",
-            "year": "2024",
-            "overview": "Sinopsis resmi",
-        }
+        async def __aenter__(self):
+            return self
 
-    monkeypatch.setattr(earnvids_routes, "_tmdb_metadata", fake_tmdb)
+        async def __aexit__(self, *args):
+            return False
 
-    response = await earnvids_routes.earnvids_upload(
-        _request({"type": "movie", "id": "786892", "title": "Judul Dari Client"}, app=app)
+        async def text(self, errors="ignore"):
+            return json.dumps(
+                {"status": 200, "msg": "OK", "files": [{"filecode": FILE_CODE, "status": "OK"}]}
+            )
+
+    class _FakeSession:
+        def post(self, url, data=None, timeout=None):
+            captured["url"] = url
+            captured["form"] = data
+            return _FakeResponse()
+
+        async def close(self):
+            return None
+
+    class _FakeStreamer:
+        session = _FakeSession()
+
+    async def fake_create_streamer(url):
+        return _FakeStreamer()
+
+    monkeypatch.setattr(settings, "earnvids_api_key", SecretStr("earnvids-api-key-secret"))
+    monkeypatch.setattr(earnvids_routes, "create_streamer", fake_create_streamer)
+
+    result = await earnvids_routes._earnvids_post_file(
+        "https://s1.earnvids.example/upload/01",
+        path,
+        "Judul Aman",
+        {"overview": "Sinopsis"},
+        {"file_public": True},
     )
-    payload = json.loads(response.body.decode())
 
-    edit = next(params for path, params in calls if path == "/file/edit")
-    assert edit["file_title"] == "Judul Dari TMDB"
-    assert payload["title"] == "Judul Dari TMDB"
-    assert payload["year"] == "2024"
-    assert payload["overview"] == "Sinopsis resmi"
-    assert "Judul Dari Client" not in response.body.decode()
+    assert result == FILE_CODE
+    assert captured["url"] == "https://s1.earnvids.example/upload/01"
+
+
+def test_ffmpeg_command_is_bounded_and_redaction_hides_source():
+    command = upload_util.build_ffmpeg_command(SIGNED_URL, Path("/tmp/upload.mp4"))
+
+    assert command[command.index("-i") + 1] == SIGNED_URL
+    assert "-t" in command
+    assert "-fs" in command
+    assert "+faststart" in command
+    assert "mp4" in command
+
+    redacted = redact_sensitive(
+        f"[get_or_download] CACHE MISS: {RAW_URL} token={SECRET} api_password=hunter2"
+    )
+    assert "cdn.example" not in redacted
+    assert "very-secret-token" not in redacted
+    assert SECRET not in redacted
+    assert "hunter2" not in redacted
+    assert "<url-redacted:" in redacted

@@ -27,10 +27,12 @@ from mediaflow_proxy.routes.xtream import xtream_root_router
 from mediaflow_proxy.schemas import GenerateUrlRequest, GenerateMultiUrlRequest, MultiUrlRequestItem
 from mediaflow_proxy.utils.crypto_utils import EncryptionHandler, EncryptionMiddleware
 from mediaflow_proxy.utils import redis_utils
+from mediaflow_proxy.utils.log_redaction import install_log_redaction
 from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url
 from mediaflow_proxy.utils.base64_utils import encode_url_to_base64, decode_base64_url, is_base64_url
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 # Suppress Telethon's "RuntimeError: coroutine ignored GeneratorExit" warnings.
