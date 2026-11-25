@@ -479,7 +479,7 @@ async def test_upload_job_converts_and_stores_filecode(monkeypatch, tmp_path):
     output.write_bytes(b"0" * 2048)
     calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_convert(job_id, source_url):
+    async def fake_convert(job_id, source_url, **_kwargs):
         assert source_url == SIGNED_URL
         return output
 
@@ -711,8 +711,9 @@ class _FakeResponse:
         headers: dict[str, str] | None = None,
         tracker: Any = None,
         url: str = "",
+        status: int = 200,
     ) -> None:
-        self.status = 200
+        self.status = status
         self._text = text
         self._payload = payload
         self.headers = headers or {}
@@ -773,10 +774,12 @@ class _FakeSegmentSession:
         bodies: dict[str, bytes],
         concurrency: int,
         keys: dict[str, bytes] | None = None,
+        statuses: dict[str, list[int]] | None = None,
     ) -> None:
         self.texts = texts
         self.bodies = bodies
         self.keys = keys or {}
+        self.statuses = statuses or {}
         self.concurrency = concurrency
         self.total = len(bodies)
         self.condition = asyncio.Condition()
@@ -786,13 +789,16 @@ class _FakeSegmentSession:
 
     def get(self, url: str, *, proxy=None, timeout=None) -> _FakeResponse:
         self.requests.append(url)
+        queued = self.statuses.get(url) or []
+        status = queued.pop(0) if queued else 200
         if url in self.texts:
-            return _FakeResponse(text=self.texts[url])
+            return _FakeResponse(text=self.texts[url], status=status)
         if url in self.keys:
             payload = self.keys[url]
             return _FakeResponse(
                 payload=payload,
                 headers={"Content-Length": str(len(payload))},
+                status=status,
             )
         payload = self.bodies[url]
         return _FakeResponse(
@@ -800,6 +806,7 @@ class _FakeSegmentSession:
             headers={"Content-Length": str(len(payload))},
             tracker=self,
             url=url,
+            status=status,
         )
 
 
@@ -834,6 +841,111 @@ async def test_hls_download_is_parallel_and_ordered(monkeypatch, tmp_path):
     assert tracker.peak == 3
     assert sum(url.endswith(".ts") for url in tracker.requests) == 6
     assert not list((tmp_path / "job").glob("segment-*.ts"))
+
+
+@pytest.mark.asyncio
+async def test_hls_download_resumes_after_source_refresh(monkeypatch, tmp_path, caplog):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(4)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + "".join(
+        f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(4)
+    )
+    bodies = {
+        url: f"seg{index}:".encode() + bytes([65 + index]) * 1024
+        for index, url in enumerate(segment_urls)
+    }
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        bodies,
+        concurrency=2,
+        statuses={
+            segment_urls[2]: [502, 502, 502],
+            segment_urls[3]: [502, 502, 502],
+        },
+    )
+
+    fresh_master = urljoin(SIGNED_URL, "fresh/master.m3u8")
+    fresh_variant = urljoin(SIGNED_URL, "fresh/variant.m3u8")
+    fresh_segments = [
+        urljoin(SIGNED_URL, f"fresh/seg-{index}.ts") for index in range(4)
+    ]
+    tracker.texts[fresh_master] = (
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    )
+    tracker.texts[fresh_variant] = variant
+    for index, url in enumerate(fresh_segments):
+        tracker.bodies[url] = bodies[segment_urls[index]]
+
+    refreshes: list[int] = []
+
+    async def fake_refresh() -> str:
+        refreshes.append(1)
+        return fresh_master
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(upload_util, "_RETRY_DELAYS", (0, 0, 0))
+    monkeypatch.setattr(settings, "earnvids_download_concurrency", 2)
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / job_id)
+
+    with caplog.at_level(logging.INFO, logger="mediaflow_proxy.utils.earnvids_upload"):
+        result = await upload_util.download_hls_source(
+            "job-refresh", SIGNED_URL, refresh_source=fake_refresh
+        )
+
+    assert result == tmp_path / "job-refresh" / "input.ts"
+    assert result.read_bytes() == b"".join(bodies[url] for url in segment_urls)
+    assert refreshes == [1]
+    assert tracker.requests.count(segment_urls[0]) == 1
+    assert tracker.requests.count(segment_urls[2]) == 3
+    assert tracker.requests.count(fresh_segments[2]) == 1
+    assert "source refresh=1" in caplog.text
+    assert "pending=2" in caplog.text
+    assert SIGNED_URL not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hls_download_keeps_completed_segments_when_refresh_unavailable(
+    monkeypatch, tmp_path
+):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(4)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + "".join(
+        f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(4)
+    )
+    bodies = {
+        url: f"seg{index}:".encode() + bytes([65 + index]) * 1024
+        for index, url in enumerate(segment_urls)
+    }
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        bodies,
+        concurrency=2,
+        statuses={segment_urls[2]: [502, 502, 502]},
+    )
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(upload_util, "_RETRY_DELAYS", (0, 0, 0))
+    monkeypatch.setattr(settings, "earnvids_download_concurrency", 2)
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / job_id)
+
+    with pytest.raises(upload_util.SourceRefreshNeeded):
+        await upload_util.download_hls_source("job-stale", SIGNED_URL)
+
+    job_path = tmp_path / "job-stale"
+    assert (job_path / "segment-000000.ts").exists()
+    assert (job_path / "segment-000001.ts").exists()
+    assert (job_path / "segment-000003.ts").exists()
+    assert not (job_path / "segment-000002.ts").exists()
 
 
 def test_ffmpeg_command_allows_local_encrypted_playlist():
@@ -910,7 +1022,7 @@ async def test_encrypted_hls_download_uses_parallel_local_playlist(
     assert "stage=manifest" in logged
     assert "stage=variant" in logged
     assert "stage=key bytes=16" in logged
-    assert "stage=segment count=4 concurrency=2" in logged
+    assert "stage=segment count=4 pending=4 concurrency=2 refresh=0" in logged
     assert "key.bin" not in logged
     assert "cdn.example" not in logged
     assert SIGNED_URL not in logged

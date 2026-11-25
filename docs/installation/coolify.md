@@ -28,7 +28,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
    | Variable | Example | Notes |
    |----------|---------|-------|
    | `API_PASSWORD` | `my-secret` | Required. Without it authentication and encrypted URLs are disabled. |
-   | `MFP_IMAGE` | `ghcr.io/oplayid/mediaflow-proxy:v2.9.14` | Optional; defaults to `:latest`. Use an immutable version tag in production. |
+   | `MFP_IMAGE` | `ghcr.io/oplayid/mediaflow-proxy:v2.9.15` | Optional; defaults to `:latest`. Use an immutable version tag in production. |
    | `TMDB_API_KEY` | `your-tmdb-v3-key` | Optional. Enables `/trailer/...` YouTube trailer pages; the key is never sent to the browser. |
 
     | `REDIS_URL` | `redis://redis:6379` | Keep enabled. Shares the transcode registry and caches across workers. |

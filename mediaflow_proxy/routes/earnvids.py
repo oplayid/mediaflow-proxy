@@ -21,6 +21,7 @@ import logging
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -278,6 +279,22 @@ async def _sign_source(
     return signed, adapter.name, str((chosen or {}).get("label") or "auto")
 
 
+def _request_context(request: Request) -> dict[str, Any]:
+    """Capture only what adapter resolution needs after the request returns."""
+    return {
+        "headers": dict(request.headers),
+        "query_params": dict(request.query_params),
+    }
+
+
+def _context_request(context: dict[str, Any]) -> Any:
+    """A minimal request stand-in for ``get_proxy_headers`` and adapters."""
+    return SimpleNamespace(
+        headers=context.get("headers") or {},
+        query_params=context.get("query_params") or {},
+    )
+
+
 async def _earnvids_get(
     path: str, params: dict[str, Any], *, allow_missing: bool = False
 ) -> dict[str, Any]:
@@ -439,6 +456,7 @@ async def _run_upload_job(
     source_url: str,
     initial: dict[str, Any],
     options: dict[str, Any],
+    request_context: dict[str, Any] | None = None,
 ) -> None:
     title = str(initial.get("title") or "").strip()
     metadata = {
@@ -446,9 +464,27 @@ async def _run_upload_job(
         "year": str(initial.get("year") or ""),
         "overview": str(initial.get("overview") or ""),
     }
+
+    async def refresh_source() -> str:
+        """Re-resolve the same adapter when a signed upstream URL goes stale."""
+        if not request_context:
+            raise RuntimeError("konteks sumber tidak tersedia")
+        signed, _host, _quality = await _sign_source(
+            _context_request(request_context),
+            str(options.get("type") or "movie"),
+            str(options.get("id") or ""),
+            str(options.get("season") or "1"),
+            str(options.get("episode") or "1"),
+            str(options.get("quality") or ""),
+            str(initial.get("source") or options.get("source") or "auto"),
+        )
+        return signed
+
     try:
         await _patch_job(job_id, state="downloading", progress=5, error="")
-        path = await convert_source_to_file(job_id, source_url)
+        path = await convert_source_to_file(
+            job_id, source_url, refresh_source=refresh_source
+        )
         await _patch_job(job_id, state="uploading", progress=45)
 
         server = await _earnvids_get("/upload/server", {})
@@ -621,7 +657,9 @@ async def earnvids_upload(request: Request):
         "quality": chosen_quality,
     }
     await store_job(job_id, initial)
-    spawn_job(_run_upload_job(job_id, signed, initial, data))
+    spawn_job(
+        _run_upload_job(job_id, signed, initial, data, _request_context(request))
+    )
 
     return JSONResponse(
         {

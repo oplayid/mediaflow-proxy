@@ -15,7 +15,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine
 from urllib.parse import urljoin
 
 from aiohttp import ClientTimeout
@@ -35,6 +35,32 @@ _LOCAL_JOBS: dict[str, dict[str, Any]] = {}
 _LOCAL_JOB_LIMIT = 256
 _TASKS: set[asyncio.Task[Any]] = set()
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_RETRY_DELAYS = (5.0, 15.0, 45.0)
+
+
+class SourceRefreshNeeded(RuntimeError):
+    """Raised when segments stay stale after the source has been refreshed."""
+
+
+class _RetryableStatus(Exception):
+    """One segment returned a gateway/rate-limit status after all retries."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"segment HTTP {status}")
+        self.status = status
+
+
+def _segment_path(directory: Path, index: int) -> Path:
+    return directory / f"segment-{index:06d}.ts"
+
+
+def _segment_ready(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= 1024
+    except OSError:
+        return False
 
 
 def new_job_id() -> str:
@@ -242,198 +268,329 @@ def _playlist_segments(body: str, base_url: str) -> list[str]:
     return [urljoin(base_url, entry) for entry in entries if entry]
 
 
-async def download_hls_source(job_id: str, source_url: str) -> Path | None:
-    """Download an HLS source in parallel and return a local ffmpeg input.
+async def _load_playlist(
+    session: Any,
+    proxy_url: str | None,
+    source_url: str,
+    timeout: ClientTimeout,
+    job_id: str,
+    *,
+    log_stage: bool = True,
+) -> tuple[str, str, list[str]] | None:
+    """Fetch a playlist and return its body, base URL and segment URLs."""
+    body = await _fetch_manifest(session, proxy_url, source_url, timeout)
+    if not body or not body.lstrip().startswith("#EXTM3U"):
+        return None
+    if log_stage:
+        logger.info(
+            "[earnvids] job=%s stage=manifest lines=%d", job_id, len(body.splitlines())
+        )
 
-    Plain HLS is assembled into ``input.ts``. AES-128 HLS is downloaded as
-    ciphertext segments with a local key file and a rewritten ``local.m3u8`` so
-    ffmpeg can decrypt at disk speed without touching the signed origin URLs
-    again. Other key methods, byte ranges and init segments fall back to the
-    existing ffmpeg path. Only counts and byte totals are logged.
+    manifest_url = source_url
+    if HLS_VARIANT_TAG in body:
+        variants = _playlist_segments(body, source_url)
+        if not variants:
+            return None
+        manifest_url = variants[0]
+        body = await _fetch_manifest(session, proxy_url, manifest_url, timeout)
+        if not body:
+            return None
+        if log_stage:
+            logger.info("[earnvids] job=%s stage=variant", job_id)
+
+    segments = _playlist_segments(body, manifest_url)
+    if len(segments) <= 1:
+        return None
+    return body, manifest_url, segments
+
+
+async def _prepare_keys(
+    job_id: str,
+    session: Any,
+    proxy_url: str | None,
+    manifest_url: str,
+    body: str,
+    timeout: ClientTimeout,
+    directory: Path,
+) -> dict[str, str] | None:
+    """Write AES-128 keys locally. ``None`` means fall back to ffmpeg."""
+    key_lines = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith("#EXT-X-KEY:")
+    ]
+    if key_lines and (HLS_MAP_RE.search(body) or "#EXT-X-BYTERANGE" in body):
+        logger.info("[earnvids] job=%s keyed HLS uses ffmpeg path", job_id)
+        return None
+
+    key_files: dict[str, str] = {}
+    for line in key_lines:
+        method_match = HLS_KEY_METHOD_RE.search(line)
+        method = method_match.group(1).upper() if method_match else "AES-128"
+        if method == "NONE":
+            continue
+        if method != "AES-128":
+            logger.info("[earnvids] job=%s HLS key method uses ffmpeg path", job_id)
+            return None
+        uri_match = HLS_KEY_URI_RE.search(line)
+        if not uri_match:
+            logger.info("[earnvids] job=%s HLS key URI missing", job_id)
+            return None
+
+        uri = uri_match.group(1)
+        if uri in key_files:
+            continue
+        payload = await _fetch_key(
+            job_id, session, proxy_url, urljoin(manifest_url, uri), timeout
+        )
+        if payload is None or len(payload) != 16:
+            logger.info(
+                "[earnvids] job=%s HLS key unusable bytes=%s",
+                job_id,
+                len(payload) if payload is not None else 0,
+            )
+            return None
+
+        local_name = f"key-{len(key_files):06d}.bin"
+        key_path = directory / local_name
+        key_path.write_bytes(payload)
+        key_path.chmod(0o600)
+        key_files[uri] = local_name
+    return key_files
+
+
+async def download_hls_source(
+    job_id: str,
+    source_url: str,
+    *,
+    refresh_source: Callable[[], Awaitable[str]] | None = None,
+    max_refreshes: int = 3,
+) -> Path | None:
+    """Download HLS in parallel, keeping completed segments across refreshes.
+
+    A signed upstream URL can expire while a long film is downloading. When
+    segments repeatedly return a gateway/rate-limit status, ``refresh_source``
+    is called to resolve a fresh signed manifest and downloading resumes from
+    the first missing segment instead of starting over.
     """
     timeout = ClientTimeout(
         connect=10,
         sock_read=max(60, int(settings.earnvids_stall_timeout)),
         total=None,
     )
+    directory = job_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+
     async with create_aiohttp_session(source_url, timeout=timeout) as (session, proxy_url):
-        body = await _fetch_manifest(session, proxy_url, source_url, timeout)
-        if not body or not body.lstrip().startswith("#EXTM3U"):
+        loaded = await _load_playlist(session, proxy_url, source_url, timeout, job_id)
+        if loaded is None:
             return None
-        logger.info(
-            "[earnvids] job=%s stage=manifest lines=%d", job_id, len(body.splitlines())
+        body, manifest_url, segments = loaded
+
+        key_files = await _prepare_keys(
+            job_id, session, proxy_url, manifest_url, body, timeout, directory
         )
-
-        manifest_url = source_url
-        if HLS_VARIANT_TAG in body:
-            variants = _playlist_segments(body, source_url)
-            if not variants:
-                return None
-            manifest_url = variants[0]
-            body = await _fetch_manifest(session, proxy_url, manifest_url, timeout)
-            if not body:
-                return None
-            logger.info("[earnvids] job=%s stage=variant", job_id)
-
-        segments = _playlist_segments(body, manifest_url)
-        if len(segments) <= 1:
+        if key_files is None:
             return None
 
-        key_lines = [
-            line.strip()
-            for line in body.splitlines()
-            if line.strip().startswith("#EXT-X-KEY:")
-        ]
-        if key_lines and (HLS_MAP_RE.search(body) or "#EXT-X-BYTERANGE" in body):
-            logger.info("[earnvids] job=%s keyed HLS uses ffmpeg path", job_id)
-            return None
+        primary = max(1, min(32, int(settings.earnvids_download_concurrency)))
+        expected_count = len(segments)
+        refresh_count = 0
 
-        directory = job_dir(job_id)
-        shutil.rmtree(directory, ignore_errors=True)
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        while True:
+            pending = [
+                index
+                for index in range(len(segments))
+                if not _segment_ready(_segment_path(directory, index))
+            ]
+            if not pending:
+                break
 
-        key_files: dict[str, str] = {}
-        for line in key_lines:
-            method_match = HLS_KEY_METHOD_RE.search(line)
-            method = method_match.group(1).upper() if method_match else "AES-128"
-            if method == "NONE":
-                continue
-            if method != "AES-128":
-                logger.info("[earnvids] job=%s HLS key method uses ffmpeg path", job_id)
-                shutil.rmtree(directory, ignore_errors=True)
-                return None
-            uri_match = HLS_KEY_URI_RE.search(line)
-            if not uri_match:
-                logger.info("[earnvids] job=%s HLS key URI missing", job_id)
-                shutil.rmtree(directory, ignore_errors=True)
-                return None
-
-            uri = uri_match.group(1)
-            if uri in key_files:
-                continue
-            payload = await _fetch_key(
-                job_id, session, proxy_url, urljoin(manifest_url, uri), timeout
+            concurrency = primary if refresh_count == 0 else max(1, min(primary, 4))
+            semaphore = asyncio.Semaphore(concurrency)
+            stats = {"retryable": 0}
+            logger.info(
+                "[earnvids] job=%s stage=segment count=%d pending=%d concurrency=%d refresh=%d",
+                job_id,
+                len(segments),
+                len(pending),
+                concurrency,
+                refresh_count,
             )
-            if payload is None or len(payload) != 16:
-                logger.info(
-                    "[earnvids] job=%s HLS key unusable bytes=%s",
-                    job_id,
-                    len(payload) if payload is not None else 0,
-                )
-                shutil.rmtree(directory, ignore_errors=True)
-                return None
 
-            local_name = f"key-{len(key_files):06d}.bin"
-            key_path = directory / local_name
-            key_path.write_bytes(payload)
-            key_path.chmod(0o600)
-            key_files[uri] = local_name
+            async def grab(index: int, url: str) -> int:
+                async with semaphore:
+                    target = _segment_path(directory, index)
+                    for attempt in range(3):
+                        written = 0
+                        expected = 0
+                        try:
+                            status = 0
+                            async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
+                                status = response.status
+                                if status == 200:
+                                    expected = int(response.headers.get("Content-Length") or 0)
+                                    with target.open("wb") as handle:
+                                        async for chunk in response.content.iter_chunked(1 << 20):
+                                            handle.write(chunk)
+                                            written += len(chunk)
+                                elif status not in _RETRYABLE_STATUSES:
+                                    logger.info(
+                                        "[earnvids] job=%s segment=%d attempt=%d http=%d",
+                                        job_id,
+                                        index,
+                                        attempt + 1,
+                                        status,
+                                    )
+                                    raise RuntimeError(f"segment HTTP {status}")
 
-        concurrency = max(1, min(32, int(settings.earnvids_download_concurrency)))
-        semaphore = asyncio.Semaphore(concurrency)
-        logger.info(
-            "[earnvids] job=%s stage=segment count=%d concurrency=%d",
-            job_id,
-            len(segments),
-            concurrency,
-        )
-
-        async def grab(index: int, url: str) -> int:
-            async with semaphore:
-                target = directory / f"segment-{index:06d}.ts"
-                for attempt in range(3):
-                    try:
-                        async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
-                            if response.status != 200:
+                            if status in _RETRYABLE_STATUSES:
+                                stats["retryable"] += 1
                                 logger.info(
-                                    "[earnvids] job=%s segment=%d attempt=%d http=%d",
+                                    "[earnvids] job=%s segment=%d attempt=%d http=%d retry=true",
                                     job_id,
                                     index,
                                     attempt + 1,
-                                    response.status,
+                                    status,
                                 )
-                                raise RuntimeError(f"segment HTTP {response.status}")
-                            expected = int(response.headers.get("Content-Length") or 0)
-                            written = 0
-                            with target.open("wb") as handle:
-                                async for chunk in response.content.iter_chunked(1 << 20):
-                                    handle.write(chunk)
-                                    written += len(chunk)
-                        if written == 0 or (expected and written != expected):
+                                if attempt == 2:
+                                    raise _RetryableStatus(status)
+                                await asyncio.sleep(_RETRY_DELAYS[attempt])
+                                continue
+
+                            if written == 0 or (expected and written != expected):
+                                logger.info(
+                                    "[earnvids] job=%s segment=%d attempt=%d short expected=%d written=%d",
+                                    job_id,
+                                    index,
+                                    attempt + 1,
+                                    expected,
+                                    written,
+                                )
+                                raise RuntimeError("short segment")
+                            return written
+                        except _RetryableStatus:
+                            raise
+                        except Exception as exc:
+                            target.unlink(missing_ok=True)
                             logger.info(
-                                "[earnvids] job=%s segment=%d attempt=%d short expected=%d written=%d",
+                                "[earnvids] job=%s segment=%d attempt=%d error=%s",
                                 job_id,
                                 index,
                                 attempt + 1,
-                                expected,
-                                written,
+                                type(exc).__name__,
                             )
-                            raise RuntimeError("short segment")
-                        return written
-                    except Exception as exc:
-                        target.unlink(missing_ok=True)
-                        logger.info(
-                            "[earnvids] job=%s segment=%d attempt=%d error=%s",
-                            job_id,
-                            index,
-                            attempt + 1,
-                            type(exc).__name__,
-                        )
-                        if attempt == 2:
-                            raise
-                        await asyncio.sleep(1 + attempt)
-                return 0
+                            if attempt == 2:
+                                raise
+                            await asyncio.sleep(_RETRY_DELAYS[attempt])
+                    return 0
 
-        try:
             results = await asyncio.gather(
-                *(grab(index, url) for index, url in enumerate(segments))
+                *(grab(index, segments[index]) for index in pending),
+                return_exceptions=True,
             )
-        except Exception:
-            for index in range(len(segments)):
-                (directory / f"segment-{index:06d}.ts").unlink(missing_ok=True)
-            raise
+            errors = [value for value in results if isinstance(value, BaseException)]
+            if not errors:
+                break
 
-        total = sum(results)
+            fatal = next(
+                (error for error in errors if not isinstance(error, _RetryableStatus)),
+                None,
+            )
+            if fatal is not None:
+                raise fatal
+
+            if stats["retryable"] and all(
+                isinstance(error, _RetryableStatus) for error in errors
+            ):
+                if refresh_source and refresh_count < max_refreshes:
+                    refresh_count += 1
+                    logger.info("[earnvids] job=%s source refresh=%d", job_id, refresh_count)
+                    source_url = await refresh_source()
+                    loaded = await _load_playlist(
+                        session,
+                        proxy_url,
+                        source_url,
+                        timeout,
+                        job_id,
+                        log_stage=False,
+                    )
+                    if loaded is None:
+                        return None
+                    body, manifest_url, segments = loaded
+                    refreshed_keys = await _prepare_keys(
+                        job_id, session, proxy_url, manifest_url, body, timeout, directory
+                    )
+                    if refreshed_keys is None:
+                        return None
+                    key_files = refreshed_keys
+                    if len(segments) != expected_count:
+                        for path in directory.glob("segment-*.ts"):
+                            path.unlink(missing_ok=True)
+                        expected_count = len(segments)
+                        logger.info(
+                            "[earnvids] job=%s manifest changed; restarting download", job_id
+                        )
+                    continue
+
+                first = errors[0]
+                status = first.status if isinstance(first, _RetryableStatus) else 0
+                raise SourceRefreshNeeded(
+                    f"segment HTTP {status or 'retryable'} after {refresh_count} refreshes"
+                )
+
+            raise errors[0]
+
+        total = sum(_segment_path(directory, index).stat().st_size for index in range(len(segments)))
         if key_files:
             playlist_path = directory / "local.m3u8"
             playlist_path.write_text(
                 _rewrite_encrypted_playlist(body, key_files), encoding="utf-8"
             )
             logger.info(
-                "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d keys=%d",
+                "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d keys=%d refresh=%d",
                 job_id,
                 len(segments),
                 total,
                 concurrency,
                 len(key_files),
+                refresh_count,
             )
             return playlist_path
 
         combined = directory / "input.ts"
         with combined.open("wb") as output:
             for index in range(len(segments)):
-                target = directory / f"segment-{index:06d}.ts"
+                target = _segment_path(directory, index)
                 with target.open("rb") as handle:
                     shutil.copyfileobj(handle, output)
                 target.unlink(missing_ok=True)
 
         logger.info(
-            "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d",
+            "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d refresh=%d",
             job_id,
             len(segments),
             total,
             concurrency,
+            refresh_count,
         )
         return combined
 
 
-async def convert_source_to_file(job_id: str, source_url: str) -> Path:
+async def convert_source_to_file(
+    job_id: str,
+    source_url: str,
+    *,
+    refresh_source: Callable[[], Awaitable[str]] | None = None,
+) -> Path:
     """Remux the signed stream into one MP4, then transcode only if needed."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg unavailable")
 
     logger.info("[earnvids] job=%s stage=download", job_id)
-    prepared = await download_hls_source(job_id, source_url)
+    prepared = await download_hls_source(
+        job_id, source_url, refresh_source=refresh_source
+    )
     local_playlist = bool(prepared and prepared.suffix.lower() == ".m3u8")
     logger.info(
         "[earnvids] job=%s stage=remux local_playlist=%s",
