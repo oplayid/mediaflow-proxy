@@ -1,9 +1,10 @@
 """Convert a signed mfp stream to one MP4 and keep upload job state.
 
 EarnVids' ``upload/url`` endpoint expects a direct video file. The embed
-adapters resolve to HLS manifests, so mfp first remuxes the signed same-origin
-proxy URL into a bounded temporary MP4. The signed URL is only passed to
-ffmpeg in-process; it is never stored in Redis or written to a log.
+adapters resolve to HLS manifests, so mfp first downloads those segments in
+parallel and remuxes them into a bounded temporary MP4. AES-128 playlists keep
+their key local so ffmpeg can decrypt from disk. The signed URL is only passed
+to ffmpeg in-process; it is never stored in Redis or written to a log.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from mediaflow_proxy.utils.log_redaction import redact_sensitive
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 HLS_MAP_RE = re.compile(r'^#EXT-X-MAP:URI="([^"]+)"', re.MULTILINE)
-HLS_KEY_RE = re.compile(r"^#EXT-X-KEY:", re.MULTILINE)
+HLS_KEY_METHOD_RE = re.compile(r"METHOD=([A-Za-z0-9-]+)")
+HLS_KEY_URI_RE = re.compile(r'URI="([^"]+)"')
 HLS_VARIANT_TAG = "#EXT-X-STREAM-INF"
 UPLOAD_DIR = Path("/tmp/mfp-earnvids-upload")
 _LOCAL_JOBS: dict[str, dict[str, Any]] = {}
@@ -53,13 +55,16 @@ def job_dir(job_id: str) -> Path:
 
 
 def build_ffmpeg_command(
-    source_url: str, output_path: Path, *, copy: bool = False
+    source_url: str, output_path: Path, *, copy: bool = False, local_playlist: bool = False
 ) -> list[str]:
     """Build a bounded MP4 command; the source URL stays out of log output.
 
     ``copy=True`` remuxes without re-encoding, which is far faster for a full
     film. The default stays the bounded H.264/AAC transcode used as a fallback
     when the source codecs cannot be copied into MP4.
+
+    ``local_playlist=True`` enables ffmpeg's local HLS key handling for the
+    rewritten playlist produced by :func:`download_hls_source`.
     """
     command = [
         "ffmpeg",
@@ -68,17 +73,30 @@ def build_ffmpeg_command(
         "error",
         "-nostdin",
         "-y",
-        "-i",
-        source_url,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-t",
-        str(max(1, int(settings.earnvids_upload_max_seconds))),
-        "-fs",
-        str(max(1, int(settings.earnvids_upload_max_bytes))),
     ]
+    if local_playlist:
+        command.extend(
+            [
+                "-allowed_extensions",
+                "ALL",
+                "-protocol_whitelist",
+                "file,crypto,data,tcp,tls,http,https",
+            ]
+        )
+    command.extend(
+        [
+            "-i",
+            source_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-t",
+            str(max(1, int(settings.earnvids_upload_max_seconds))),
+            "-fs",
+            str(max(1, int(settings.earnvids_upload_max_bytes))),
+        ]
+    )
     if copy:
         command.extend(
             [
@@ -168,6 +186,42 @@ async def _fetch_manifest(
         return None
 
 
+async def _fetch_key(
+    session: Any, proxy_url: str | None, url: str, timeout: ClientTimeout
+) -> bytes | None:
+    """Fetch one AES-128 key without ever logging its signed URL."""
+    try:
+        async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
+            if response.status != 200:
+                logger.info("[earnvids] key HTTP %s", response.status)
+                return None
+            return await response.read()
+    except Exception as exc:
+        logger.info("[earnvids] key fetch failed: %s", type(exc).__name__)
+        return None
+
+
+def _rewrite_encrypted_playlist(body: str, key_files: dict[str, str]) -> str:
+    """Point a keyed playlist at local segment and key files."""
+    lines: list[str] = []
+    segment = 0
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-KEY:"):
+            match = HLS_KEY_URI_RE.search(line)
+            if match:
+                local_name = key_files.get(match.group(1))
+                if local_name:
+                    line = line.replace(
+                        f'URI="{match.group(1)}"', f'URI="{local_name}"'
+                    )
+        elif stripped and not stripped.startswith("#"):
+            line = f"segment-{segment:06d}.ts"
+            segment += 1
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 def _playlist_segments(body: str, base_url: str) -> list[str]:
     entries = [
         line.strip()
@@ -181,11 +235,13 @@ def _playlist_segments(body: str, base_url: str) -> list[str]:
 
 
 async def download_hls_source(job_id: str, source_url: str) -> Path | None:
-    """Download an HLS source in parallel and return its assembled TS file.
+    """Download an HLS source in parallel and return a local ffmpeg input.
 
-    Direct video files, encrypted playlists and single-entry playlists return
-    ``None`` so the existing ffmpeg path stays in charge. Segment URLs stay
-    in-process; only counts and byte totals are logged.
+    Plain HLS is assembled into ``input.ts``. AES-128 HLS is downloaded as
+    ciphertext segments with a local key file and a rewritten ``local.m3u8`` so
+    ffmpeg can decrypt at disk speed without touching the signed origin URLs
+    again. Other key methods, byte ranges and init segments fall back to the
+    existing ffmpeg path. Only counts and byte totals are logged.
     """
     timeout = ClientTimeout(
         connect=10,
@@ -207,18 +263,60 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
             if not body:
                 return None
 
-        if HLS_KEY_RE.search(body):
-            # AES-128 needs ffmpeg's key/IV handling; concatenating encrypted
-            # segments would produce an undecryptable file.
-            logger.info("[earnvids] job=%s encrypted HLS uses ffmpeg path", job_id)
-            return None
-
         segments = _playlist_segments(body, manifest_url)
         if len(segments) <= 1:
             return None
 
+        key_lines = [
+            line.strip()
+            for line in body.splitlines()
+            if line.strip().startswith("#EXT-X-KEY:")
+        ]
+        if key_lines and (HLS_MAP_RE.search(body) or "#EXT-X-BYTERANGE" in body):
+            logger.info("[earnvids] job=%s keyed HLS uses ffmpeg path", job_id)
+            return None
+
         directory = job_dir(job_id)
+        shutil.rmtree(directory, ignore_errors=True)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        key_files: dict[str, str] = {}
+        for line in key_lines:
+            method_match = HLS_KEY_METHOD_RE.search(line)
+            method = method_match.group(1).upper() if method_match else "AES-128"
+            if method == "NONE":
+                continue
+            if method != "AES-128":
+                logger.info("[earnvids] job=%s HLS key method uses ffmpeg path", job_id)
+                shutil.rmtree(directory, ignore_errors=True)
+                return None
+            uri_match = HLS_KEY_URI_RE.search(line)
+            if not uri_match:
+                logger.info("[earnvids] job=%s HLS key URI missing", job_id)
+                shutil.rmtree(directory, ignore_errors=True)
+                return None
+
+            uri = uri_match.group(1)
+            if uri in key_files:
+                continue
+            payload = await _fetch_key(
+                session, proxy_url, urljoin(manifest_url, uri), timeout
+            )
+            if payload is None or len(payload) != 16:
+                logger.info(
+                    "[earnvids] job=%s HLS key unusable bytes=%s",
+                    job_id,
+                    len(payload) if payload is not None else 0,
+                )
+                shutil.rmtree(directory, ignore_errors=True)
+                return None
+
+            local_name = f"key-{len(key_files):06d}.bin"
+            key_path = directory / local_name
+            key_path.write_bytes(payload)
+            key_path.chmod(0o600)
+            key_files[uri] = local_name
+
         concurrency = max(1, min(32, int(settings.earnvids_download_concurrency)))
         semaphore = asyncio.Semaphore(concurrency)
 
@@ -255,14 +353,28 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
                 (directory / f"segment-{index:06d}.ts").unlink(missing_ok=True)
             raise
 
+        total = sum(results)
+        if key_files:
+            playlist_path = directory / "local.m3u8"
+            playlist_path.write_text(
+                _rewrite_encrypted_playlist(body, key_files), encoding="utf-8"
+            )
+            logger.info(
+                "[earnvids] job=%s downloaded %d segments (%d bytes) concurrency=%d keys=%d",
+                job_id,
+                len(segments),
+                total,
+                concurrency,
+                len(key_files),
+            )
+            return playlist_path
+
         combined = directory / "input.ts"
-        total = 0
         with combined.open("wb") as output:
             for index in range(len(segments)):
                 target = directory / f"segment-{index:06d}.ts"
                 with target.open("rb") as handle:
                     shutil.copyfileobj(handle, output)
-                total += results[index]
                 target.unlink(missing_ok=True)
 
         logger.info(
@@ -281,6 +393,7 @@ async def convert_source_to_file(job_id: str, source_url: str) -> Path:
         raise RuntimeError("ffmpeg unavailable")
 
     prepared = await download_hls_source(job_id, source_url)
+    local_playlist = bool(prepared and prepared.suffix.lower() == ".m3u8")
     if prepared is not None:
         source_url = str(prepared)
 
@@ -291,7 +404,7 @@ async def convert_source_to_file(job_id: str, source_url: str) -> Path:
 
     copied = await _ffmpeg_attempt(
         job_id,
-        build_ffmpeg_command(source_url, output, copy=True),
+        build_ffmpeg_command(source_url, output, copy=True, local_playlist=local_playlist),
         settings.earnvids_upload_copy_timeout,
     )
     if copied and _valid_output(output):
@@ -304,7 +417,7 @@ async def convert_source_to_file(job_id: str, source_url: str) -> Path:
     output.unlink(missing_ok=True)
     if not await _ffmpeg_attempt(
         job_id,
-        build_ffmpeg_command(source_url, output),
+        build_ffmpeg_command(source_url, output, local_playlist=local_playlist),
         settings.earnvids_upload_ffmpeg_timeout,
     ):
         raise RuntimeError("ffmpeg failed")

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -696,6 +697,9 @@ class _FakeResponse:
     async def text(self, errors: str = "ignore") -> str:
         return self._text
 
+    async def read(self) -> bytes:
+        return self._payload
+
     def iter_chunked(self, size: int):
         async def chunks():
             if self._tracker is None:
@@ -732,10 +736,15 @@ class _FakeResponse:
 
 class _FakeSegmentSession:
     def __init__(
-        self, texts: dict[str, str], bodies: dict[str, bytes], concurrency: int
+        self,
+        texts: dict[str, str],
+        bodies: dict[str, bytes],
+        concurrency: int,
+        keys: dict[str, bytes] | None = None,
     ) -> None:
         self.texts = texts
         self.bodies = bodies
+        self.keys = keys or {}
         self.concurrency = concurrency
         self.total = len(bodies)
         self.condition = asyncio.Condition()
@@ -747,6 +756,12 @@ class _FakeSegmentSession:
         self.requests.append(url)
         if url in self.texts:
             return _FakeResponse(text=self.texts[url])
+        if url in self.keys:
+            payload = self.keys[url]
+            return _FakeResponse(
+                payload=payload,
+                headers={"Content-Length": str(len(payload))},
+            )
         payload = self.bodies[url]
         return _FakeResponse(
             payload=payload,
@@ -787,3 +802,134 @@ async def test_hls_download_is_parallel_and_ordered(monkeypatch, tmp_path):
     assert tracker.peak == 3
     assert sum(url.endswith(".ts") for url in tracker.requests) == 6
     assert not list((tmp_path / "job").glob("segment-*.ts"))
+
+
+def test_ffmpeg_command_allows_local_encrypted_playlist():
+    playlist = str(Path("/tmp/job") / "local.m3u8")
+    command = upload_util.build_ffmpeg_command(
+        playlist, Path("/tmp/upload.mp4"), copy=True, local_playlist=True
+    )
+
+    assert command[command.index("-i") + 1] == playlist
+    assert command[command.index("-allowed_extensions") + 1] == "ALL"
+    assert "crypto" in command[command.index("-protocol_whitelist") + 1]
+    assert command.index("-allowed_extensions") < command.index("-i")
+    assert command[command.index("-c") + 1] == "copy"
+
+
+@pytest.mark.asyncio
+async def test_encrypted_hls_download_uses_parallel_local_playlist(
+    monkeypatch, tmp_path, caplog
+):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    key_url = urljoin(variant_url, "key.bin")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(4)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:7\n"
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x0102030405060708090a0b0c0d0e0f10\n'
+        + "".join(f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(4))
+        + "#EXT-X-ENDLIST\n"
+    )
+    key_bytes = bytes(range(16))
+    bodies = {
+        url: f"seg{index}:".encode() + bytes([65 + index]) * 32
+        for index, url in enumerate(segment_urls)
+    }
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        bodies,
+        concurrency=2,
+        keys={key_url: key_bytes},
+    )
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(settings, "earnvids_download_concurrency", 2)
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / "job")
+
+    with caplog.at_level(logging.INFO, logger="mediaflow_proxy.utils.earnvids_upload"):
+        result = await upload_util.download_hls_source("job456", SIGNED_URL)
+
+    job_path = tmp_path / "job"
+    assert result == job_path / "local.m3u8"
+    assert not (job_path / "input.ts").exists()
+    assert (job_path / "key-000000.bin").read_bytes() == key_bytes
+    assert (job_path / "key-000000.bin").stat().st_mode & 0o777 == 0o600
+    assert all((job_path / f"segment-{index:06d}.ts").exists() for index in range(4))
+
+    playlist = result.read_text(encoding="utf-8")
+    assert 'URI="key-000000.bin"' in playlist
+    assert 'URI="key.bin"' not in playlist
+    assert "#EXT-X-MEDIA-SEQUENCE:7" in playlist
+    assert "#EXT-X-ENDLIST" in playlist
+    assert "segment-000000.ts" in playlist
+    assert "segment-000003.ts" in playlist
+
+    assert tracker.peak == 2
+    assert tracker.requests.count(key_url) == 1
+    assert sum(url.endswith(".ts") for url in tracker.requests) == 4
+
+    logged = caplog.text
+    assert "keys=1" in logged
+    assert "key.bin" not in logged
+    assert "cdn.example" not in logged
+    assert SIGNED_URL not in logged
+
+
+@pytest.mark.asyncio
+async def test_unsupported_hls_key_method_falls_back(monkeypatch, tmp_path):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    key_url = urljoin(variant_url, "key.bin")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(2)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = (
+        "#EXTM3U\n"
+        '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"\n'
+        + "".join(f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(2))
+    )
+    bodies = {url: b"x" * 16 for url in segment_urls}
+    tracker = _FakeSegmentSession({SIGNED_URL: master, variant_url: variant}, bodies, 2)
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / "job")
+
+    result = await upload_util.download_hls_source("job789", SIGNED_URL)
+
+    assert result is None
+    assert key_url not in tracker.requests
+    assert not list((tmp_path / "job").glob("segment-*.ts"))
+
+
+@pytest.mark.asyncio
+async def test_convert_passes_local_playlist_flags(monkeypatch, tmp_path):
+    directory = tmp_path / "job"
+    playlist = directory / "local.m3u8"
+    output = directory / "upload.mp4"
+    captured: list[list[str]] = []
+
+    async def fake_download(*_args, **_kwargs):
+        return playlist
+
+    async def fake_attempt(job_id, command, timeout):
+        captured.append(command)
+        output.write_bytes(b"0" * 2048)
+        return True
+
+    monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: directory)
+    monkeypatch.setattr(upload_util, "download_hls_source", fake_download)
+    monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+
+    result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
+
+    assert result == output
+    assert captured and all("-allowed_extensions" in command for command in captured)
+    assert captured[0][captured[0].index("-i") + 1] == str(playlist)
