@@ -175,7 +175,9 @@ class Settings(BaseSettings):
     earnvids_upload_preset: str = "veryfast"
     earnvids_upload_max_seconds: int = 14400
     earnvids_upload_max_bytes: int = 2 * 1024 * 1024 * 1024
-    earnvids_upload_ffmpeg_timeout: int = 1800
+    # Remux (-c copy) is the primary path; transcode is only a fallback.
+    earnvids_upload_copy_timeout: int = 900
+    earnvids_upload_ffmpeg_timeout: int = 3600
     earnvids_job_ttl: int = 24 * 60 * 60
 
     # EPG proxy settings

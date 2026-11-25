@@ -579,3 +579,75 @@ def test_ffmpeg_command_is_bounded_and_redaction_hides_source():
     assert SECRET not in redacted
     assert "hunter2" not in redacted
     assert "<url-redacted:" in redacted
+
+
+def test_ffmpeg_copy_command_remuxes_without_reencode():
+    command = upload_util.build_ffmpeg_command(SIGNED_URL, Path("/tmp/upload.mp4"), copy=True)
+
+    assert command[command.index("-i") + 1] == SIGNED_URL
+    assert command[command.index("-c") + 1] == "copy"
+    assert "aac_adtstoasc" in command
+    assert "-t" in command
+    assert "-fs" in command
+    assert "+faststart" in command
+    assert "libx264" not in command
+
+
+@pytest.mark.asyncio
+async def test_convert_prefers_copy_without_transcoding(monkeypatch, tmp_path):
+    directory = tmp_path / "job"
+    output = directory / "upload.mp4"
+    attempts: list[str] = []
+
+    async def fake_attempt(job_id, command, timeout):
+        attempts.append("copy" if "copy" in command else "transcode")
+        directory.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"0" * 2048)
+        return True
+
+    monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: directory)
+    monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+
+    result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
+
+    assert result == output
+    assert attempts == ["copy"]
+
+
+@pytest.mark.asyncio
+async def test_convert_falls_back_to_transcode_when_copy_output_invalid(monkeypatch, tmp_path):
+    directory = tmp_path / "job"
+    output = directory / "upload.mp4"
+    attempts: list[str] = []
+
+    async def fake_attempt(job_id, command, timeout):
+        mode = "copy" if "copy" in command else "transcode"
+        attempts.append(mode)
+        directory.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"0" * (100 if mode == "copy" else 2048))
+        return True
+
+    monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: directory)
+    monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+
+    result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
+
+    assert result == output
+    assert attempts == ["copy", "transcode"]
+
+
+@pytest.mark.asyncio
+async def test_convert_timeout_does_not_start_transcode(monkeypatch, tmp_path):
+    async def fake_attempt(job_id, command, timeout):
+        if "copy" in command:
+            raise RuntimeError("ffmpeg timeout")
+        pytest.fail("transcode must not start after a stalled remux")
+
+    monkeypatch.setattr(upload_util.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / "job")
+    monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
+
+    with pytest.raises(RuntimeError, match="ffmpeg timeout"):
+        await upload_util.convert_source_to_file("job123", SIGNED_URL)
