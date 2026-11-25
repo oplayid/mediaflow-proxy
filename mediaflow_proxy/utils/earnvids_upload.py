@@ -187,17 +187,25 @@ async def _fetch_manifest(
 
 
 async def _fetch_key(
-    session: Any, proxy_url: str | None, url: str, timeout: ClientTimeout
+    job_id: str,
+    session: Any,
+    proxy_url: str | None,
+    url: str,
+    timeout: ClientTimeout,
 ) -> bytes | None:
     """Fetch one AES-128 key without ever logging its signed URL."""
     try:
         async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
             if response.status != 200:
-                logger.info("[earnvids] key HTTP %s", response.status)
+                logger.info("[earnvids] job=%s stage=key http=%s", job_id, response.status)
                 return None
-            return await response.read()
+            payload = await response.read()
+            logger.info("[earnvids] job=%s stage=key bytes=%d", job_id, len(payload))
+            return payload
     except Exception as exc:
-        logger.info("[earnvids] key fetch failed: %s", type(exc).__name__)
+        logger.info(
+            "[earnvids] job=%s stage=key error=%s", job_id, type(exc).__name__
+        )
         return None
 
 
@@ -252,6 +260,9 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
         body = await _fetch_manifest(session, proxy_url, source_url, timeout)
         if not body or not body.lstrip().startswith("#EXTM3U"):
             return None
+        logger.info(
+            "[earnvids] job=%s stage=manifest lines=%d", job_id, len(body.splitlines())
+        )
 
         manifest_url = source_url
         if HLS_VARIANT_TAG in body:
@@ -262,6 +273,7 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
             body = await _fetch_manifest(session, proxy_url, manifest_url, timeout)
             if not body:
                 return None
+            logger.info("[earnvids] job=%s stage=variant", job_id)
 
         segments = _playlist_segments(body, manifest_url)
         if len(segments) <= 1:
@@ -300,7 +312,7 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
             if uri in key_files:
                 continue
             payload = await _fetch_key(
-                session, proxy_url, urljoin(manifest_url, uri), timeout
+                job_id, session, proxy_url, urljoin(manifest_url, uri), timeout
             )
             if payload is None or len(payload) != 16:
                 logger.info(
@@ -319,6 +331,12 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
 
         concurrency = max(1, min(32, int(settings.earnvids_download_concurrency)))
         semaphore = asyncio.Semaphore(concurrency)
+        logger.info(
+            "[earnvids] job=%s stage=segment count=%d concurrency=%d",
+            job_id,
+            len(segments),
+            concurrency,
+        )
 
         async def grab(index: int, url: str) -> int:
             async with semaphore:
@@ -327,6 +345,13 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
                     try:
                         async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
                             if response.status != 200:
+                                logger.info(
+                                    "[earnvids] job=%s segment=%d attempt=%d http=%d",
+                                    job_id,
+                                    index,
+                                    attempt + 1,
+                                    response.status,
+                                )
                                 raise RuntimeError(f"segment HTTP {response.status}")
                             expected = int(response.headers.get("Content-Length") or 0)
                             written = 0
@@ -335,10 +360,25 @@ async def download_hls_source(job_id: str, source_url: str) -> Path | None:
                                     handle.write(chunk)
                                     written += len(chunk)
                         if written == 0 or (expected and written != expected):
+                            logger.info(
+                                "[earnvids] job=%s segment=%d attempt=%d short expected=%d written=%d",
+                                job_id,
+                                index,
+                                attempt + 1,
+                                expected,
+                                written,
+                            )
                             raise RuntimeError("short segment")
                         return written
-                    except Exception:
+                    except Exception as exc:
                         target.unlink(missing_ok=True)
+                        logger.info(
+                            "[earnvids] job=%s segment=%d attempt=%d error=%s",
+                            job_id,
+                            index,
+                            attempt + 1,
+                            type(exc).__name__,
+                        )
                         if attempt == 2:
                             raise
                         await asyncio.sleep(1 + attempt)
@@ -392,8 +432,14 @@ async def convert_source_to_file(job_id: str, source_url: str) -> Path:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg unavailable")
 
+    logger.info("[earnvids] job=%s stage=download", job_id)
     prepared = await download_hls_source(job_id, source_url)
     local_playlist = bool(prepared and prepared.suffix.lower() == ".m3u8")
+    logger.info(
+        "[earnvids] job=%s stage=remux local_playlist=%s",
+        job_id,
+        str(local_playlist).lower(),
+    )
     if prepared is not None:
         source_url = str(prepared)
 
@@ -414,6 +460,7 @@ async def convert_source_to_file(job_id: str, source_url: str) -> Path:
     # remux raises RuntimeError("ffmpeg timeout") and never starts a second
     # long-running process against the same stalled source.
     logger.info("[earnvids] job=%s remux failed; falling back to transcode", job_id)
+    logger.info("[earnvids] job=%s stage=transcode", job_id)
     output.unlink(missing_ok=True)
     if not await _ffmpeg_attempt(
         job_id,

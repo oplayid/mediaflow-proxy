@@ -41,6 +41,7 @@ from mediaflow_proxy.utils.earnvids_upload import (
     valid_job_id,
 )
 from mediaflow_proxy.utils.http_utils import create_streamer, get_proxy_headers
+from mediaflow_proxy.utils.log_redaction import redact_sensitive
 
 logger = logging.getLogger(__name__)
 earnvids_router = APIRouter()
@@ -475,7 +476,13 @@ async def _run_upload_job(
             error=final["error"] or "",
         )
     except Exception as exc:
-        logger.warning("[earnvids] job=%s failed: %s", job_id, type(exc).__name__)
+        detail = redact_sensitive(str(exc))[:200].replace("\n", " ").strip()
+        logger.warning(
+            "[earnvids] job=%s failed: %s detail=%s",
+            job_id,
+            type(exc).__name__,
+            detail or "-",
+        )
         await _patch_job(
             job_id,
             state="failed",

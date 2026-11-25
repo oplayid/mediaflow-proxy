@@ -521,6 +521,38 @@ async def test_upload_job_converts_and_stores_filecode(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_job_failure_logs_redacted_detail(monkeypatch, caplog):
+    async def fake_convert(*_args, **_kwargs):
+        raise RuntimeError(
+            f"segment HTTP 403 url={SIGNED_URL} sign=very-secret-token api_password=hunter2"
+        )
+
+    async def fake_store(job_id, state):
+        return None
+
+    async def fake_load(job_id):
+        return {}
+
+    monkeypatch.setattr(earnvids_routes, "convert_source_to_file", fake_convert)
+    monkeypatch.setattr(earnvids_routes, "store_job", fake_store)
+    monkeypatch.setattr(earnvids_routes, "load_job", fake_load)
+    monkeypatch.setattr(earnvids_routes, "cleanup_job", lambda job_id: None)
+
+    with caplog.at_level(logging.WARNING, logger="mediaflow_proxy.routes.earnvids"):
+        await earnvids_routes._run_upload_job(
+            "job456", SIGNED_URL, {}, {"file_public": True}
+        )
+
+    logged = caplog.text
+    assert "failed: RuntimeError" in logged
+    assert "segment HTTP 403" in logged
+    assert SIGNED_URL not in logged
+    assert "very-secret-token" not in logged
+    assert "hunter2" not in logged
+    assert "<url-redacted:" in logged
+
+
+@pytest.mark.asyncio
 async def test_multipart_upload_returns_filecode(monkeypatch, tmp_path):
     path = tmp_path / "upload.mp4"
     path.write_bytes(b"0" * 2048)
@@ -875,6 +907,10 @@ async def test_encrypted_hls_download_uses_parallel_local_playlist(
 
     logged = caplog.text
     assert "keys=1" in logged
+    assert "stage=manifest" in logged
+    assert "stage=variant" in logged
+    assert "stage=key bytes=16" in logged
+    assert "stage=segment count=4 concurrency=2" in logged
     assert "key.bin" not in logged
     assert "cdn.example" not in logged
     assert SIGNED_URL not in logged
@@ -909,7 +945,7 @@ async def test_unsupported_hls_key_method_falls_back(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_convert_passes_local_playlist_flags(monkeypatch, tmp_path):
+async def test_convert_passes_local_playlist_flags(monkeypatch, tmp_path, caplog):
     directory = tmp_path / "job"
     playlist = directory / "local.m3u8"
     output = directory / "upload.mp4"
@@ -928,8 +964,11 @@ async def test_convert_passes_local_playlist_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(upload_util, "download_hls_source", fake_download)
     monkeypatch.setattr(upload_util, "_ffmpeg_attempt", fake_attempt)
 
-    result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
+    with caplog.at_level(logging.INFO, logger="mediaflow_proxy.utils.earnvids_upload"):
+        result = await upload_util.convert_source_to_file("job123", SIGNED_URL)
 
     assert result == output
     assert captured and all("-allowed_extensions" in command for command in captured)
     assert captured[0][captured[0].index("-i") + 1] == str(playlist)
+    assert "stage=download" in caplog.text
+    assert "stage=remux local_playlist=true" in caplog.text
