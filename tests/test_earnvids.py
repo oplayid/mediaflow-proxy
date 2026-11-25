@@ -61,7 +61,8 @@ def _request(
 
 
 class _FakeAdapter:
-    name = "VidLink"
+    def __init__(self, name: str = "VidLink"):
+        self.name = name
 
     async def resolve(self, request, media_type, media_id, season, episode):
         return {
@@ -76,6 +77,14 @@ class _FakeAdapter:
                 }
             ],
         }
+
+
+class _FailingAdapter:
+    def __init__(self, name: str = "VidCore"):
+        self.name = name
+
+    async def resolve(self, request, media_type, media_id, season, episode):
+        raise RuntimeError("resolver failed")
 
 
 def _fake_earnvids(
@@ -109,7 +118,13 @@ def _fake_earnvids(
 def _patch_common(monkeypatch, earnvids_get):
     monkeypatch.setattr(settings, "mfp_earnvids_secret", SecretStr(SECRET))
     monkeypatch.setattr(settings, "earnvids_api_key", SecretStr("earnvids-api-key-secret"))
+    monkeypatch.setattr(settings, "tmdb_api_key", None)
     monkeypatch.setattr(earnvids_routes, "get_adapter", lambda name: _FakeAdapter())
+    monkeypatch.setattr(
+        earnvids_routes,
+        "configured_servers",
+        lambda: [_FakeAdapter("VidCore"), _FakeAdapter("VidLink")],
+    )
     monkeypatch.setattr(earnvids_routes, "_earnvids_get", earnvids_get)
 
 
@@ -171,6 +186,9 @@ async def test_upload_signs_real_proxy_url_without_leaking_secrets(monkeypatch):
         "source": "VidLink",
         "quality": "1080",
         "player_url": PLAYER_LINK,
+        "title": "",
+        "year": "",
+        "overview": "",
         "media": {"type": "movie", "id": "786892", "season": "1", "episode": "1"},
     }
     assert RAW_URL not in body
@@ -363,3 +381,55 @@ async def test_status_rejects_bad_file_code(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await earnvids_routes.earnvids_status(_request({"file_code": "../etc/passwd"}))
     assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_auto_upload_uses_first_successful_server(monkeypatch):
+    from mediaflow_proxy.main import app
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(settings, "api_password", "unit-api-password")
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+    monkeypatch.setattr(
+        earnvids_routes,
+        "configured_servers",
+        lambda: [_FailingAdapter("VidCore"), _FakeAdapter("VidSrc")],
+    )
+
+    response = await earnvids_routes.earnvids_upload(
+        _request({"type": "movie", "id": "786892"}, app=app)
+    )
+    payload = json.loads(response.body.decode())
+
+    assert payload["source"] == "VidSrc"
+    upload = next(params for path, params in calls if path == "/upload/url")
+    assert upload["url"].startswith("https://mfp.oplay.id/_token_")
+
+
+@pytest.mark.asyncio
+async def test_upload_uses_tmdb_metadata_and_never_leaks_client_title(monkeypatch):
+    from mediaflow_proxy.main import app
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _patch_common(monkeypatch, _fake_earnvids(calls))
+
+    async def fake_tmdb(media_type, media_id):
+        return {
+            "title": "Judul Dari TMDB",
+            "year": "2024",
+            "overview": "Sinopsis resmi",
+        }
+
+    monkeypatch.setattr(earnvids_routes, "_tmdb_metadata", fake_tmdb)
+
+    response = await earnvids_routes.earnvids_upload(
+        _request({"type": "movie", "id": "786892", "title": "Judul Dari Client"}, app=app)
+    )
+    payload = json.loads(response.body.decode())
+
+    edit = next(params for path, params in calls if path == "/file/edit")
+    assert edit["file_title"] == "Judul Dari TMDB"
+    assert payload["title"] == "Judul Dari TMDB"
+    assert payload["year"] == "2024"
+    assert payload["overview"] == "Sinopsis resmi"
+    assert "Judul Dari Client" not in response.body.decode()

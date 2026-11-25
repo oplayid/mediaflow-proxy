@@ -35,8 +35,11 @@ logger = logging.getLogger(__name__)
 earnvids_router = APIRouter()
 
 EARNVIDS_API = "https://earnvidsapi.com/api"
+TMDB_BASE = "https://api.themoviedb.org/3"
 TIMESTAMP_SKEW = 300
+TMDB_CACHE_TTL = 6 * 60 * 60
 _FILE_CODE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_TMDB_CACHE: dict[tuple[str, str], tuple[float, dict[str, str]]] = {}
 
 
 def _secret(name: str) -> str:
@@ -131,6 +134,45 @@ def _verified_player_link(value: Any, file_code: str) -> str:
     return urlunparse(("https", parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
 
 
+async def _tmdb_metadata(media_type: str, media_id: str) -> dict[str, str]:
+    """Fetch browser-safe title metadata from TMDB; never raise on lookup failure."""
+    cache_key = (media_type, media_id)
+    cached = _TMDB_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < TMDB_CACHE_TTL:
+        return dict(cached[1])
+
+    api_key = _secret("tmdb_api_key")
+    if not api_key:
+        return {}
+
+    url = f"{TMDB_BASE}/{media_type}/{media_id}"
+    streamer = await create_streamer(url)
+    try:
+        async with streamer.session.get(
+            url,
+            params={"api_key": api_key},
+            timeout=ClientTimeout(total=float(settings.earnvids_request_timeout)),
+        ) as response:
+            if response.status != 200:
+                logger.warning("[earnvids] TMDB returned HTTP %s", response.status)
+                return {}
+            payload = json.loads(await response.text(errors="ignore"))
+    except Exception as exc:
+        # Never log the URL: it contains the TMDB API key.
+        logger.warning("[earnvids] TMDB lookup failed: %s", type(exc).__name__)
+        return {}
+    finally:
+        await streamer.session.close()
+
+    metadata = {
+        "title": str(payload.get("title") or payload.get("name") or "").strip(),
+        "year": str(payload.get("release_date") or payload.get("first_air_date") or "")[:4],
+        "overview": str(payload.get("overview") or "").strip(),
+    }
+    _TMDB_CACHE[cache_key] = (time.time(), metadata)
+    return dict(metadata)
+
+
 async def _sign_source(
     request: Request,
     media_type: str,
@@ -140,28 +182,56 @@ async def _sign_source(
     quality: str,
     source: str,
 ) -> tuple[str, str, str]:
-    """Resolve one source and return (signed URL, host name, quality label)."""
-    adapter = get_adapter(source) if source else None
-    if adapter is None and source:
-        adapter = next(
-            (item for item in configured_servers() if item.name.lower() == source.lower()),
-            None,
+    """Resolve source(s) and return (signed URL, host name, quality label).
+
+    With ``source='auto'`` the first configured embed server that resolves to a
+    playable URL wins. Host names stay server-side; only the signed proxy URL is
+    handed to EarnVids.
+    """
+    requested = str(source or "").strip()
+    if requested and requested.lower() != "auto":
+        adapter = get_adapter(requested)
+        if adapter is None:
+            adapter = next(
+                (item for item in configured_servers() if item.name.lower() == requested.lower()),
+                None,
+            )
+        if adapter is None:
+            raise HTTPException(status_code=400, detail="Server tidak dikenal")
+        candidates = [adapter]
+    else:
+        candidates = configured_servers()
+        if not candidates:
+            raise HTTPException(status_code=502, detail="Tidak ada server embed yang aktif")
+
+    raw: dict[str, Any] | None = None
+    selected = None
+    for candidate in candidates:
+        try:
+            resolved = await candidate.resolve(request, media_type, media_id, season, episode)
+        except HTTPException:
+            if len(candidates) == 1:
+                raise
+            # Never echo the exception text: it can contain the provider URL.
+            logger.warning("[earnvids] resolve failed: HTTP error")
+            continue
+        except Exception as exc:
+            logger.warning("[earnvids] resolve failed: %s", type(exc).__name__)
+            continue
+        destination = resolved.get("destination_url")
+        if isinstance(destination, str) and destination:
+            raw = resolved
+            selected = candidate
+            break
+        logger.warning("[earnvids] empty resolve result")
+
+    if raw is None or selected is None:
+        raise HTTPException(
+            status_code=502, detail="Semua server embed gagal me-resolve sumber video"
         )
-    if adapter is None:
-        raise HTTPException(status_code=400, detail="Server tidak dikenal")
 
-    try:
-        raw = await adapter.resolve(request, media_type, media_id, season, episode)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # Never echo the exception text: it can contain the provider URL.
-        logger.warning("[earnvids] resolve failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Gagal me-resolve sumber video") from exc
-
-    destination = raw.get("destination_url")
-    if not isinstance(destination, str) or not destination:
-        raise HTTPException(status_code=502, detail="Sumber tidak mengembalikan URL video")
+    adapter = selected
+    destination = raw["destination_url"]
 
     chosen: dict[str, Any] | None = None
     if quality:
@@ -325,8 +395,10 @@ async def earnvids_upload(request: Request):
     data = await _json_body(request)
     media_type, media_id, season, episode = _media_from(data)
     quality = str(data.get("quality") or "").strip()
-    source = str(data.get("source") or "VidLink").strip()
+    source = str(data.get("source") or "auto").strip()
     title = str(data.get("title") or "").strip()
+    metadata = await _tmdb_metadata(media_type, media_id)
+    title = str(metadata.get("title") or title).strip()
 
     quota = await _earnvids_get("/file/url_uploads", {})
     if _integer(quota.get("requests_available"), -1) == 0:
@@ -365,6 +437,9 @@ async def earnvids_upload(request: Request):
             "source": host,
             "quality": chosen_quality,
             "player_url": await _player_link(filecode, title),
+            "title": title,
+            "year": metadata.get("year", ""),
+            "overview": metadata.get("overview", ""),
             "media": {
                 "type": media_type,
                 "id": media_id,

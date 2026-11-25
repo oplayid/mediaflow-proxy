@@ -1299,7 +1299,7 @@ wheels = [
 
 [[package]]
 name = "mediaflow-proxy"
-version = "2.9.7"
+version = "2.9.8"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
