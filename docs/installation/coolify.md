@@ -33,6 +33,12 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
 
     | `REDIS_URL` | `redis://redis:6379` | Keep enabled. Shares the transcode registry and caches across workers. |
     | `SUBDL_API_KEY` | `your-subdl-key` | Optional. Enables the manual **Cari SubDL** button in the player; the key stays server-side. |
+    | `EARNVIDS_API_KEY` | `your-earnvids-key` | Optional. Required only for the EarnVids upload bridge; rotate it if it was ever pasted in a chat. |
+    | `MFP_EARNVIDS_SECRET` | `<64 hex chars>` | Optional. HMAC shared with Streamflix; generate with `openssl rand -hex 32`. Must be identical on both services. |
+    | `EARNVIDS_SOURCE_TOKEN_TTL` | `21600` | Optional. Lifetime of the signed same-origin URL EarnVids fetches; defaults to 6 hours. |
+    | `EARNVIDS_FLD_ID` / `EARNVIDS_CAT_ID` / `EARNVIDS_TAGS` | empty | Optional. Forwarded to EarnVids as folder/category/tags. |
+
+    Never use `VITE_*` names for these secrets: they would be bundled into the browser. The EarnVids bridge is server-to-server only — Streamflix signs the request with `MFP_EARNVIDS_SECRET`, mfp resolves the source and hands EarnVids a tokenized same-origin URL, so the original `?sign=...` link and `api_password` never leave this origin. Only upload content you own or are licensed to distribute.
     | `TRANSPORT_CONFIG` | see below | Optional. Routes upstream requests through a clean egress proxy when a host is Turnstile-gated. |
 
 3. Set your domain and enable HTTPS in Coolify as usual; Traefik routes to port `8888`.

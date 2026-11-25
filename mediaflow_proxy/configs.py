@@ -157,6 +157,18 @@ class Settings(BaseSettings):
     # SUBDL_API_KEY in the deployment environment; it is never sent to browsers.
     subdl_api_key: str = ""
 
+    # Optional EarnVids bridge. StreamFlix signs a small request with
+    # MFP_EARNVIDS_SECRET; mfp resolves the source, signs a same-origin proxy URL
+    # with a 6-hour token and asks EarnVids to fetch that URL. Neither the
+    # provider URL nor these secrets are ever sent to the browser.
+    earnvids_api_key: SecretStr | None = None
+    mfp_earnvids_secret: SecretStr | None = None
+    earnvids_source_token_ttl: int = 6 * 60 * 60
+    earnvids_fld_id: str = ""
+    earnvids_cat_id: str = ""
+    earnvids_tags: str = ""
+    earnvids_request_timeout: float = 20.0
+
     # EPG proxy settings
     epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.
 

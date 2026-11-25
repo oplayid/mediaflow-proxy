@@ -188,3 +188,11 @@ Ad filtering runs at three layers and writes an audit trail:
 `/embed/relay/*`, `/embed/relay/hosts`, `/embed/servers`, `/embed/<slug>/*`, `?mode=standard`, `?mode=relay`, `/gateway/cache`, `/player/.../retry`, `?exclude=`, `?t=`, and the old `OPLAY_EMBED_*` postMessage contract have been removed entirely. They are replaced by the tokenized `/player/...` iframe described above. Streamflix's `/watch/...` page resolves only the media ID, embeds one opaque `player_url`, and shows a back button; MediaFlow owns playback, host selection, quality, and subtitles.
 
 These endpoints are intentionally public: the gateway signs only the player identity, and the player resolves the stream and signs MediaFlow proxy URLs internally, so `api_password` is never exposed to the browser. The TMDB API key used by trailer/banner endpoints and the SubDL API key also stay server-side.
+
+### EarnVids upload bridge
+
+`POST /internal/earnvids/upload` and `POST /internal/earnvids/status` are server-to-server endpoints, not browser endpoints. Streamflix signs the raw JSON body with `HMAC-SHA256(secret, timestamp + "." + body)` using `MFP_EARNVIDS_SECRET` and sends `x-mfp-timestamp` / `x-mfp-signature`; requests with a skew over 300 seconds or a bad signature get `401`.
+
+The upload endpoint accepts only `type` (`movie` or `tv`), a numeric `id`, optional `season`, `episode`, `quality` and `source`. mfp resolves that source, signs exactly one same-origin proxy URL with `proxy_stream_endpoint`, `force_playlist_proxy=false` and a 6-hour token (`EARNVIDS_SOURCE_TOKEN_TTL`), then calls EarnVids `GET /api/upload/url` with that tokenized URL. EarnVids fetches the URL itself; mfp injects the original `Referer`/`User-Agent`, so no provider URL, `?sign=...` token, header or `api_password` is ever returned to Streamflix or written to the browser. The response contains only `filecode`, `source`, `quality` and `media`.
+
+`POST /internal/earnvids/status` accepts a `file_code` and returns `filecode`, `status` and `progress` from EarnVids `/api/file/url_uploads`. Streamflix stores the `filecode` in its `earnvids_assets` collection and deduplicates by media id + quality; it never stores the provider URL. Use the EarnVids player URL for playback — EarnVids forbids hotlinking direct files. Only upload content you own or are licensed to distribute.
