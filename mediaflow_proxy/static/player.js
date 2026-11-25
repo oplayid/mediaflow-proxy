@@ -630,6 +630,9 @@
       video.pause();
     } else if (data.type === "mfp:play") {
       video.play().catch(function () {});
+    } else if (data.type === "mfp:mute") {
+      // Used by the hidden telemetry iframe so duplicate playback stays silent.
+      video.muted = true;
     } else if (data.type === "mfp:restoreSubtitles") {
       // Streamflix sends the shared VTT content it stores in Mongo. Blob URLs
       // keep the signed mfp subtitle token server-side and survive a re-mount.
