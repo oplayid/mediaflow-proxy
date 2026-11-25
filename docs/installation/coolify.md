@@ -37,7 +37,7 @@ Prefer pinning the version tag (`:v2.4.1`) in production rather than `:latest`, 
     | `MFP_EARNVIDS_SECRET` | `<64 hex chars>` | Optional. HMAC shared with Streamflix; generate with `openssl rand -hex 32`. Must be identical on both services. |
     | `EARNVIDS_SOURCE_TOKEN_TTL` | `21600` | Optional. Lifetime of the signed same-origin URL ffmpeg fetches; defaults to 6 hours. |
     | `EARNVIDS_UPLOAD_HEIGHT` / `_CRF` / `_PRESET` | `720` / `23` / `veryfast` | Optional. MP4 remux quality used before uploading to EarnVids. |
-    | `EARNVIDS_UPLOAD_MAX_SECONDS` / `_MAX_BYTES` | `7200` / `2147483648` | Optional. Hard bounds for one background upload. |
+    | `EARNVIDS_UPLOAD_MAX_SECONDS` / `_MAX_BYTES` | `14400` / `2147483648` | Optional. Hard bounds for one background upload; 4 hours by default so full films are not truncated. |
     | `EARNVIDS_UPLOAD_FFMPEG_TIMEOUT` / `EARNVIDS_JOB_TTL` | `1800` / `86400` | Optional. ffmpeg timeout and Redis job state lifetime in seconds. |
     | `EARNVIDS_FLD_ID` / `EARNVIDS_CAT_ID` / `EARNVIDS_TAGS` | empty | Optional. Forwarded to EarnVids as folder/category/tags. |
 

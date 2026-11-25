@@ -173,7 +173,7 @@ class Settings(BaseSettings):
     earnvids_upload_height: int = 720
     earnvids_upload_crf: int = 23
     earnvids_upload_preset: str = "veryfast"
-    earnvids_upload_max_seconds: int = 7200
+    earnvids_upload_max_seconds: int = 14400
     earnvids_upload_max_bytes: int = 2 * 1024 * 1024 * 1024
     earnvids_upload_ffmpeg_timeout: int = 1800
     earnvids_job_ttl: int = 24 * 60 * 60
