@@ -16,7 +16,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from aiohttp import ClientTimeout
 
@@ -44,6 +44,14 @@ _BATCH_MAX = 32
 
 class SourceRefreshNeeded(RuntimeError):
     """Raised when segments stay stale after the source has been refreshed."""
+
+
+class HlsKeyFetchError(RuntimeError):
+    """An AES-128 key could not be fetched, so no local playlist can be built."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HLS key HTTP {status}")
+        self.status = status
 
 
 class _RetryableStatus(Exception):
@@ -220,21 +228,50 @@ async def _fetch_key(
     proxy_url: str | None,
     url: str,
     timeout: ClientTimeout,
-) -> bytes | None:
-    """Fetch one AES-128 key without ever logging its signed URL."""
-    try:
-        async with session.get(url, proxy=proxy_url, timeout=timeout) as response:
-            if response.status != 200:
-                logger.info("[earnvids] job=%s stage=key http=%s", job_id, response.status)
-                return None
-            payload = await response.read()
-            logger.info("[earnvids] job=%s stage=key bytes=%d", job_id, len(payload))
-            return payload
-    except Exception as exc:
-        logger.info(
-            "[earnvids] job=%s stage=key error=%s", job_id, type(exc).__name__
-        )
-        return None
+    referer: str = "",
+) -> bytes:
+    """Fetch one AES-128 key, retrying with playlist referer headers."""
+    origin = ""
+    if referer:
+        parts = urlsplit(referer)
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
+    last_status = 0
+    for attempt in range(2):
+        headers = None
+        if attempt == 1 and (referer or origin):
+            headers = {}
+            if referer:
+                headers["referer"] = referer
+            if origin:
+                headers["origin"] = origin
+        try:
+            async with session.get(
+                url, proxy=proxy_url, timeout=timeout, headers=headers
+            ) as response:
+                if response.status != 200:
+                    last_status = response.status
+                    logger.info(
+                        "[earnvids] job=%s stage=key http=%s attempt=%d",
+                        job_id,
+                        response.status,
+                        attempt + 1,
+                    )
+                else:
+                    payload = await response.read()
+                    logger.info("[earnvids] job=%s stage=key bytes=%d", job_id, len(payload))
+                    return payload
+        except Exception as exc:
+            logger.info(
+                "[earnvids] job=%s stage=key error=%s attempt=%d",
+                job_id,
+                type(exc).__name__,
+                attempt + 1,
+            )
+        if attempt == 0:
+            await asyncio.sleep(0.5)
+
+    raise HlsKeyFetchError(last_status or 0)
 
 
 def _rewrite_encrypted_playlist(body: str, key_files: dict[str, str]) -> str:
@@ -343,15 +380,18 @@ async def _prepare_keys(
         if uri in key_files:
             continue
         payload = await _fetch_key(
-            job_id, session, proxy_url, urljoin(manifest_url, uri), timeout
+            job_id,
+            session,
+            proxy_url,
+            urljoin(manifest_url, uri),
+            timeout,
+            referer=manifest_url,
         )
-        if payload is None or len(payload) != 16:
+        if len(payload) != 16:
             logger.info(
-                "[earnvids] job=%s HLS key unusable bytes=%s",
-                job_id,
-                len(payload) if payload is not None else 0,
+                "[earnvids] job=%s HLS key unusable bytes=%d", job_id, len(payload)
             )
-            return None
+            raise RuntimeError("HLS key unusable")
 
         local_name = f"key-{len(key_files):06d}.bin"
         key_path = directory / local_name
@@ -367,6 +407,7 @@ async def download_hls_source(
     *,
     refresh_source: Callable[[], Awaitable[str]] | None = None,
     max_refreshes: int = 3,
+    request_headers: dict[str, str] | None = None,
 ) -> Path | None:
     """Download HLS in parallel, keeping completed segments across refreshes.
 
@@ -383,7 +424,9 @@ async def download_hls_source(
     directory = job_dir(job_id)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    async with create_aiohttp_session(source_url, timeout=timeout) as (session, proxy_url):
+    async with create_aiohttp_session(
+        source_url, timeout=timeout, headers=request_headers or None
+    ) as (session, proxy_url):
         loaded = await _load_playlist(session, proxy_url, source_url, timeout, job_id)
         if loaded is None:
             return None
@@ -586,6 +629,7 @@ async def convert_source_to_file(
     source_url: str,
     *,
     refresh_source: Callable[[], Awaitable[str]] | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> Path:
     """Remux the signed stream into one MP4, then transcode only if needed."""
     if shutil.which("ffmpeg") is None:
@@ -593,7 +637,10 @@ async def convert_source_to_file(
 
     logger.info("[earnvids] job=%s stage=download", job_id)
     prepared = await download_hls_source(
-        job_id, source_url, refresh_source=refresh_source
+        job_id,
+        source_url,
+        refresh_source=refresh_source,
+        request_headers=request_headers,
     )
     local_playlist = bool(prepared and prepared.suffix.lower() == ".m3u8")
     logger.info(

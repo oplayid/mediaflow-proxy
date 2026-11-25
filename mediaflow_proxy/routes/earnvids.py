@@ -53,6 +53,9 @@ TIMESTAMP_SKEW = 300
 TMDB_CACHE_TTL = 6 * 60 * 60
 _FILE_CODE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _TMDB_CACHE: dict[tuple[str, str], tuple[float, dict[str, str]]] = {}
+_UPSTREAM_HEADERS = frozenset(
+    {"user-agent", "referer", "origin", "accept", "accept-language"}
+)
 
 
 def _secret(name: str) -> str:
@@ -279,11 +282,29 @@ async def _sign_source(
     return signed, adapter.name, str((chosen or {}).get("label") or "auto")
 
 
+def _safe_upstream_headers(request: Request) -> dict[str, str]:
+    """Only browser-like headers, never HMAC or other bridge credentials."""
+    headers = {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower() in _UPSTREAM_HEADERS and value
+    }
+    for name, value in request.query_params.items():
+        lowered = name.lower()
+        if lowered.startswith("h_") and lowered[2:] in _UPSTREAM_HEADERS and value:
+            headers[lowered[2:]] = value
+    if "referrer" in headers and "referer" not in headers:
+        headers["referer"] = headers.pop("referrer")
+    headers.setdefault("user-agent", settings.user_agent)
+    return headers
+
+
 def _request_context(request: Request) -> dict[str, Any]:
-    """Capture only what adapter resolution needs after the request returns."""
+    """Capture only what adapter resolution and HLS fetching need later."""
     return {
         "headers": dict(request.headers),
         "query_params": dict(request.query_params),
+        "upstream_headers": _safe_upstream_headers(request),
     }
 
 
@@ -483,7 +504,10 @@ async def _run_upload_job(
     try:
         await _patch_job(job_id, state="downloading", progress=5, error="")
         path = await convert_source_to_file(
-            job_id, source_url, refresh_source=refresh_source
+            job_id,
+            source_url,
+            refresh_source=refresh_source,
+            request_headers=(request_context or {}).get("upstream_headers"),
         )
         await _patch_job(job_id, state="uploading", progress=45)
 

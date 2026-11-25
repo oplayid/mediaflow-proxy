@@ -797,9 +797,11 @@ class _FakeSegmentSession:
         self.active = 0
         self.peak = 0
         self.requests: list[str] = []
+        self.header_calls: list[dict[str, str] | None] = []
 
-    def get(self, url: str, *, proxy=None, timeout=None) -> _FakeResponse:
+    def get(self, url: str, *, proxy=None, timeout=None, headers=None) -> _FakeResponse:
         self.requests.append(url)
+        self.header_calls.append(headers)
         queued = self.statuses.get(url) or []
         status = queued.pop(0) if queued else 200
         if url in self.texts:
@@ -1097,6 +1099,110 @@ async def test_encrypted_hls_download_uses_parallel_local_playlist(
     assert "key.bin" not in logged
     assert "cdn.example" not in logged
     assert SIGNED_URL not in logged
+
+
+@pytest.mark.asyncio
+async def test_hls_key_http_403_retries_with_referer_then_fails(monkeypatch, tmp_path):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    key_url = urljoin(variant_url, "key.bin")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(4)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        + "".join(f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(4))
+    )
+    bodies = {url: b"x" * 32 for url in segment_urls}
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        bodies,
+        concurrency=2,
+        keys={key_url: b"x" * 16},
+        statuses={key_url: [403, 403]},
+    )
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / job_id)
+
+    with pytest.raises(upload_util.HlsKeyFetchError, match="HLS key HTTP 403"):
+        await upload_util.download_hls_source(
+            "job-key", SIGNED_URL, request_headers={"user-agent": "UA"}
+        )
+
+    assert tracker.requests.count(key_url) == 2
+    assert not any(url.endswith(".ts") for url in tracker.requests)
+    assert tracker.header_calls[-1] == {
+        "referer": variant_url,
+        "origin": "https://mfp.oplay.id",
+    }
+
+
+@pytest.mark.asyncio
+async def test_hls_forwards_request_headers_to_session(monkeypatch, tmp_path):
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(3)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + "".join(
+        f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(3)
+    )
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        {url: b"x" * 32 for url in segment_urls},
+        concurrency=2,
+        use_tracker=False,
+    )
+    seen: dict[str, Any] = {}
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **kwargs):
+        seen["headers"] = kwargs.get("headers")
+        yield tracker, None
+
+    headers = {"user-agent": "UA", "referer": "https://mfp.oplay.id/watch"}
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / job_id)
+
+    result = await upload_util.download_hls_source(
+        "job-headers", SIGNED_URL, request_headers=headers
+    )
+
+    assert result is not None
+    assert seen["headers"] == headers
+
+
+def test_safe_upstream_headers_drops_bridge_secrets():
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/internal/earnvids/upload",
+        "raw_path": b"/internal/earnvids/upload",
+        "query_string": b"h_referer=https%3A%2F%2Fmfp.oplay.id%2Fwatch&x-secret=leak",
+        "headers": [
+            (b"host", b"mfp.oplay.id"),
+            (b"x-mfp-timestamp", b"123"),
+            (b"x-mfp-signature", b"deadbeef"),
+            (b"cookie", b"session=secret"),
+            (b"user-agent", b"Mozilla/5.0"),
+            (b"origin", b"https://movie.oplay.id"),
+        ],
+        "client": ("10.0.0.1", 12345),
+    }
+
+    headers = earnvids_routes._safe_upstream_headers(Request(scope))
+
+    assert headers["user-agent"] == "Mozilla/5.0"
+    assert headers["origin"] == "https://movie.oplay.id"
+    assert headers["referer"] == "https://mfp.oplay.id/watch"
+    assert "x-mfp-signature" not in headers
+    assert "x-mfp-timestamp" not in headers
+    assert "cookie" not in headers
+    assert "x-secret" not in headers
 
 
 @pytest.mark.asyncio

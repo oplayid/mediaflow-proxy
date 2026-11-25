@@ -1,3 +1,3 @@
 """MediaFlow Proxy server-side gateway for StreamFlix."""
 
-__version__ = "2.9.16"
+__version__ = "2.9.17"
