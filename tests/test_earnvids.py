@@ -712,8 +712,10 @@ class _FakeResponse:
         tracker: Any = None,
         url: str = "",
         status: int = 200,
+        hang: bool = False,
     ) -> None:
         self.status = status
+        self._hang = hang
         self._text = text
         self._payload = payload
         self.headers = headers or {}
@@ -735,6 +737,11 @@ class _FakeResponse:
 
     def iter_chunked(self, size: int):
         async def chunks():
+            if self._hang:
+                # A stale segment beyond the first batch must never be
+                # requested; the test proves refresh happens without it.
+                await asyncio.sleep(3600)
+                return
             if self._tracker is None:
                 if self._payload:
                     yield self._payload
@@ -775,11 +782,15 @@ class _FakeSegmentSession:
         concurrency: int,
         keys: dict[str, bytes] | None = None,
         statuses: dict[str, list[int]] | None = None,
+        hanging: set[str] | None = None,
+        use_tracker: bool = True,
     ) -> None:
         self.texts = texts
         self.bodies = bodies
         self.keys = keys or {}
         self.statuses = statuses or {}
+        self.hanging = hanging or set()
+        self.use_tracker = use_tracker
         self.concurrency = concurrency
         self.total = len(bodies)
         self.condition = asyncio.Condition()
@@ -804,9 +815,10 @@ class _FakeSegmentSession:
         return _FakeResponse(
             payload=payload,
             headers={"Content-Length": str(len(payload))},
-            tracker=self,
+            tracker=self if self.use_tracker else None,
             url=url,
             status=status,
+            hang=url in self.hanging,
         )
 
 
@@ -901,11 +913,70 @@ async def test_hls_download_resumes_after_source_refresh(monkeypatch, tmp_path, 
     assert result.read_bytes() == b"".join(bodies[url] for url in segment_urls)
     assert refreshes == [1]
     assert tracker.requests.count(segment_urls[0]) == 1
-    assert tracker.requests.count(segment_urls[2]) == 3
+    assert tracker.requests.count(segment_urls[2]) == 2
     assert tracker.requests.count(fresh_segments[2]) == 1
     assert "source refresh=1" in caplog.text
     assert "pending=2" in caplog.text
     assert SIGNED_URL not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hls_refresh_precedes_full_queue(monkeypatch, tmp_path):
+    total = 40
+    variant_url = urljoin(SIGNED_URL, "variant.m3u8")
+    segment_urls = [urljoin(variant_url, f"seg-{index}.ts") for index in range(total)]
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nvariant.m3u8\n"
+    variant = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + "".join(
+        f"#EXTINF:4,\nseg-{index}.ts\n" for index in range(total)
+    )
+    bodies = {
+        url: f"seg{index}:".encode() + bytes([65 + index % 26]) * 1024
+        for index, url in enumerate(segment_urls)
+    }
+    tracker = _FakeSegmentSession(
+        {SIGNED_URL: master, variant_url: variant},
+        bodies,
+        concurrency=2,
+        statuses={segment_urls[0]: [502, 502]},
+        hanging=set(segment_urls[16:]),
+        use_tracker=False,
+    )
+
+    fresh_master = urljoin(SIGNED_URL, "fresh2/master.m3u8")
+    fresh_variant = urljoin(SIGNED_URL, "fresh2/variant.m3u8")
+    fresh_segments = [
+        urljoin(SIGNED_URL, f"fresh2/seg-{index}.ts") for index in range(total)
+    ]
+    tracker.texts[fresh_master] = master
+    tracker.texts[fresh_variant] = variant
+    for index, url in enumerate(fresh_segments):
+        tracker.bodies[url] = bodies[segment_urls[index]]
+
+    seen_requests: list[int] = []
+
+    async def fake_refresh() -> str:
+        seen_requests.append(sum(url.endswith(".ts") for url in tracker.requests))
+        return fresh_master
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args, **_kwargs):
+        yield tracker, None
+
+    monkeypatch.setattr(upload_util, "_RETRY_DELAYS", (0,))
+    monkeypatch.setattr(settings, "earnvids_download_concurrency", 2)
+    monkeypatch.setattr(upload_util, "create_aiohttp_session", fake_session)
+    monkeypatch.setattr(upload_util, "job_dir", lambda job_id: tmp_path / job_id)
+
+    result = await asyncio.wait_for(
+        upload_util.download_hls_source(
+            "job-batch", SIGNED_URL, refresh_source=fake_refresh
+        ),
+        timeout=15.0,
+    )
+
+    assert result.read_bytes() == b"".join(bodies[url] for url in segment_urls)
+    assert seen_requests == [17]
+    assert sum(url.endswith(".ts") for url in tracker.requests) > total
 
 
 @pytest.mark.asyncio
@@ -1022,7 +1093,7 @@ async def test_encrypted_hls_download_uses_parallel_local_playlist(
     assert "stage=manifest" in logged
     assert "stage=variant" in logged
     assert "stage=key bytes=16" in logged
-    assert "stage=segment count=4 pending=4 concurrency=2 refresh=0" in logged
+    assert "stage=segment count=4 pending=4 batch=4 concurrency=2 refresh=0" in logged
     assert "key.bin" not in logged
     assert "cdn.example" not in logged
     assert SIGNED_URL not in logged

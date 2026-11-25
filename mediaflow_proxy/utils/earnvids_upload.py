@@ -37,7 +37,9 @@ _TASKS: set[asyncio.Task[Any]] = set()
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-_RETRY_DELAYS = (5.0, 15.0, 45.0)
+_RETRY_DELAYS = (2.0,)
+_BATCH_MIN = 16
+_BATCH_MAX = 32
 
 
 class SourceRefreshNeeded(RuntimeError):
@@ -396,24 +398,27 @@ async def download_hls_source(
         primary = max(1, min(32, int(settings.earnvids_download_concurrency)))
         expected_count = len(segments)
         refresh_count = 0
+        completed: set[int] = set()
 
         while True:
             pending = [
                 index
                 for index in range(len(segments))
-                if not _segment_ready(_segment_path(directory, index))
+                if index not in completed and not _segment_ready(_segment_path(directory, index))
             ]
             if not pending:
                 break
 
             concurrency = primary if refresh_count == 0 else max(1, min(primary, 4))
+            batch_size = min(_BATCH_MAX, max(_BATCH_MIN, concurrency * 2))
+            batch = pending[:batch_size]
             semaphore = asyncio.Semaphore(concurrency)
-            stats = {"retryable": 0}
             logger.info(
-                "[earnvids] job=%s stage=segment count=%d pending=%d concurrency=%d refresh=%d",
+                "[earnvids] job=%s stage=segment count=%d pending=%d batch=%d concurrency=%d refresh=%d",
                 job_id,
                 len(segments),
                 len(pending),
+                len(batch),
                 concurrency,
                 refresh_count,
             )
@@ -421,7 +426,7 @@ async def download_hls_source(
             async def grab(index: int, url: str) -> int:
                 async with semaphore:
                     target = _segment_path(directory, index)
-                    for attempt in range(3):
+                    for attempt in range(2):
                         written = 0
                         expected = 0
                         try:
@@ -445,7 +450,6 @@ async def download_hls_source(
                                     raise RuntimeError(f"segment HTTP {status}")
 
                             if status in _RETRYABLE_STATUSES:
-                                stats["retryable"] += 1
                                 logger.info(
                                     "[earnvids] job=%s segment=%d attempt=%d http=%d retry=true",
                                     job_id,
@@ -453,9 +457,9 @@ async def download_hls_source(
                                     attempt + 1,
                                     status,
                                 )
-                                if attempt == 2:
+                                if attempt == 1:
                                     raise _RetryableStatus(status)
-                                await asyncio.sleep(_RETRY_DELAYS[attempt])
+                                await asyncio.sleep(_RETRY_DELAYS[0])
                                 continue
 
                             if written == 0 or (expected and written != expected):
@@ -480,18 +484,22 @@ async def download_hls_source(
                                 attempt + 1,
                                 type(exc).__name__,
                             )
-                            if attempt == 2:
+                            if attempt == 1:
                                 raise
-                            await asyncio.sleep(_RETRY_DELAYS[attempt])
+                            await asyncio.sleep(_RETRY_DELAYS[0])
                     return 0
 
             results = await asyncio.gather(
-                *(grab(index, segments[index]) for index in pending),
+                *(grab(index, segments[index]) for index in batch),
                 return_exceptions=True,
             )
+            for index, value in zip(batch, results, strict=True):
+                if not isinstance(value, BaseException) and value > 0:
+                    completed.add(index)
             errors = [value for value in results if isinstance(value, BaseException)]
-            if not errors:
-                break
+            retry_errors = [
+                error for error in errors if isinstance(error, _RetryableStatus)
+            ]
 
             fatal = next(
                 (error for error in errors if not isinstance(error, _RetryableStatus)),
@@ -500,9 +508,7 @@ async def download_hls_source(
             if fatal is not None:
                 raise fatal
 
-            if stats["retryable"] and all(
-                isinstance(error, _RetryableStatus) for error in errors
-            ):
+            if retry_errors:
                 if refresh_source and refresh_count < max_refreshes:
                     refresh_count += 1
                     logger.info("[earnvids] job=%s source refresh=%d", job_id, refresh_count)
@@ -527,19 +533,17 @@ async def download_hls_source(
                     if len(segments) != expected_count:
                         for path in directory.glob("segment-*.ts"):
                             path.unlink(missing_ok=True)
+                        completed.clear()
                         expected_count = len(segments)
                         logger.info(
                             "[earnvids] job=%s manifest changed; restarting download", job_id
                         )
                     continue
 
-                first = errors[0]
-                status = first.status if isinstance(first, _RetryableStatus) else 0
+                status = retry_errors[0].status
                 raise SourceRefreshNeeded(
-                    f"segment HTTP {status or 'retryable'} after {refresh_count} refreshes"
+                    f"segment HTTP {status} after {refresh_count} refreshes"
                 )
-
-            raise errors[0]
 
         total = sum(_segment_path(directory, index).stat().st_size for index in range(len(segments)))
         if key_files:
